@@ -1,5 +1,7 @@
 """
-Configuration classes and automatic inference logic for CRISPRo.
+Configuration classes and automatic inference logic for TRACE.
+
+TRACE: Triple-aligner Read Analysis for CRISPR Editing
 
 Author: Kevin R. Roy
 """
@@ -8,9 +10,50 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
+import re
 import yaml
 
 from .utils.sequence import reverse_complement, find_guide_in_sequence
+
+
+# Regex to detect if string is pure DNA sequence
+DNA_PATTERN = re.compile(r'^[ACGTacgtNn]+$')
+
+
+def is_dna_sequence(s: str) -> bool:
+    """Check if string is a pure DNA sequence (not a file path)."""
+    # Must be non-empty and contain only valid DNA characters
+    return bool(s) and bool(DNA_PATTERN.match(s)) and len(s) < 1000
+
+
+def parse_sequence_input(value: str) -> str:
+    """
+    Parse sequence input - can be either a DNA string or a FASTA file path.
+
+    Args:
+        value: Either a DNA sequence string or path to a FASTA file
+
+    Returns:
+        The DNA sequence (uppercase)
+
+    Examples:
+        >>> parse_sequence_input("ATCGATCG")
+        'ATCGATCG'
+        >>> parse_sequence_input("reference.fasta")
+        'ATCG...'  # contents of file
+    """
+    value = value.strip()
+
+    # Check if it's a DNA sequence
+    if is_dna_sequence(value):
+        return value.upper()
+
+    # Otherwise treat as file path
+    path = Path(value)
+    if not path.exists():
+        raise ValueError(f"File not found: {value}")
+
+    return load_fasta(path)
 
 
 class NucleaseType(Enum):
@@ -55,13 +98,24 @@ class NucleaseConfig:
 
 @dataclass
 class EditInfo:
-    """Information about a single edit position."""
-    position: int
-    ref_base: str
-    hdr_base: str
+    """Information about a single edit at a position."""
+    position: int  # Position in reference
+    ref_bases: str  # Reference base(s) - can be multiple for deletions or empty for insertions
+    hdr_bases: str  # HDR base(s) - can be multiple for insertions or empty for deletions
+    edit_type: str = "substitution"  # 'substitution', 'insertion', or 'deletion'
+
+    @property
+    def size(self) -> int:
+        """Size of the edit (positive for insertions, negative for deletions, 0 for subs)."""
+        return len(self.hdr_bases) - len(self.ref_bases)
 
     def __str__(self) -> str:
-        return f"Position {self.position}: {self.ref_base} → {self.hdr_base}"
+        if self.edit_type == "substitution":
+            return f"Position {self.position}: {self.ref_bases} → {self.hdr_bases}"
+        elif self.edit_type == "insertion":
+            return f"Position {self.position}: insert {self.hdr_bases} ({len(self.hdr_bases)} bp)"
+        else:  # deletion
+            return f"Position {self.position}: delete {self.ref_bases} ({len(self.ref_bases)} bp)"
 
 
 @dataclass
@@ -101,6 +155,7 @@ class LocusConfig:
     guide_info: Optional[GuideInfo] = None
     edits: List[EditInfo] = field(default_factory=list)
     homology_arms: Optional[HomologyArms] = None
+    template_offset: int = 0  # Where template aligns in reference
 
     def analyze(self) -> 'LocusConfig':
         """Analyze the locus and populate inferred values."""
@@ -108,6 +163,39 @@ class LocusConfig:
         self._detect_edits()
         self._detect_homology_arms()
         return self
+
+    @property
+    def max_edit_size(self) -> int:
+        """Get the maximum edit size (absolute value of insertion or deletion)."""
+        if not self.edits:
+            return 0
+        return max(abs(e.size) for e in self.edits)
+
+    @property
+    def total_edit_span(self) -> int:
+        """Get total span of edits including insertions/deletions."""
+        if not self.edits:
+            return 0
+        # For insertions, count the inserted bases; for deletions/subs, count ref bases
+        return sum(max(len(e.ref_bases), len(e.hdr_bases)) for e in self.edits)
+
+    def recommended_kmer_size(self, min_kmer: int = 12, buffer: int = 10) -> int:
+        """
+        Calculate recommended k-mer size based on edit size.
+
+        K-mer size should be at least 10 bp larger than the maximum edit size
+        to ensure k-mers can span the edit site unambiguously.
+
+        Args:
+            min_kmer: Minimum k-mer size (default: 12)
+            buffer: Additional bp beyond max edit size (default: 10)
+
+        Returns:
+            Recommended k-mer size
+        """
+        max_edit = self.max_edit_size
+        recommended = max(min_kmer, max_edit + buffer)
+        return recommended
 
     def _find_guide_and_pam(self):
         """Find guide position and infer PAM/cleavage site."""
@@ -158,48 +246,246 @@ class LocusConfig:
         )
 
     def _detect_edits(self):
-        """Detect all edit positions by comparing reference and HDR template."""
+        """
+        Detect all edit positions by comparing reference and HDR template.
+
+        Handles:
+        - Template shorter than reference (typical: 150bp template in 250bp amplicon)
+        - Single nucleotide substitutions
+        - Insertions (HDR template has extra bases)
+        - Deletions (HDR template is missing bases from reference)
+        """
         self.edits = []
+        ref_upper = self.reference.upper()
+        hdr_upper = self.hdr_template.upper()
 
-        # Align HDR template within reference if different lengths
-        if len(self.hdr_template) < len(self.reference):
-            # Find where HDR template aligns in reference
-            hdr_upper = self.hdr_template.upper()
-            ref_upper = self.reference.upper()
+        # Find where HDR template best aligns in reference
+        self.template_offset = self._find_template_alignment(ref_upper, hdr_upper)
 
-            # Try to find a matching prefix
-            best_offset = 0
-            best_matches = 0
-            for offset in range(len(self.reference) - len(self.hdr_template) + 1):
-                matches = sum(
-                    1 for i, base in enumerate(hdr_upper)
-                    if ref_upper[offset + i] == base
-                )
-                if matches > best_matches:
-                    best_matches = matches
-                    best_offset = offset
+        # Get the reference region that should align with the template
+        # Allow extra room for potential insertions in the template
+        template_in_ref_len = len(hdr_upper)
+        ref_region_end = min(
+            self.template_offset + template_in_ref_len + 100,
+            len(ref_upper)
+        )
+        ref_region = ref_upper[self.template_offset:ref_region_end]
 
-            # Compare at best offset
-            for i, (ref_base, hdr_base) in enumerate(
-                zip(ref_upper[best_offset:best_offset + len(hdr_upper)], hdr_upper)
-            ):
-                if ref_base != hdr_base:
-                    self.edits.append(EditInfo(
-                        position=best_offset + i,
-                        ref_base=ref_base,
-                        hdr_base=hdr_base,
-                    ))
-        else:
-            # Same length, direct comparison
-            ref_upper = self.reference.upper()
-            hdr_upper = self.hdr_template.upper()
-            for i, (ref_base, hdr_base) in enumerate(zip(ref_upper, hdr_upper)):
-                if ref_base != hdr_base:
-                    self.edits.append(EditInfo(
-                        position=i,
-                        ref_base=ref_base,
-                        hdr_base=hdr_base,
-                    ))
+        # Align sequences to detect substitutions, insertions, and deletions
+        aligned_ref, aligned_hdr = self._align_sequences(ref_region, hdr_upper)
+
+        # Parse alignment to extract edits
+        self._parse_alignment_for_edits(aligned_ref, aligned_hdr)
+
+    def _find_template_alignment(self, ref: str, hdr: str) -> int:
+        """
+        Find the best position to align HDR template within reference.
+
+        Tries multiple anchors (left, middle, right) to find the best alignment.
+        This handles cases where the left portion of the template may not be unique.
+        """
+        max_offset = max(0, len(ref) - len(hdr) + 50)  # Allow some slack for indels
+
+        # Try different anchor positions
+        anchor_positions = [
+            (0, min(30, len(hdr) // 4)),                           # Left anchor
+            (len(hdr) // 4, len(hdr) // 4 + min(30, len(hdr) // 4)),    # Left-center
+            (len(hdr) // 2 - 15, len(hdr) // 2 + 15),              # Center anchor
+            (max(0, len(hdr) - 30), len(hdr)),                     # Right anchor
+        ]
+
+        best_offset = 0
+        best_score = 0
+
+        for anchor_start, anchor_end in anchor_positions:
+            anchor = hdr[anchor_start:anchor_end]
+            if len(anchor) < 10:
+                continue
+
+            # Try exact match first
+            pos = ref.find(anchor)
+            if pos != -1:
+                # Found exact match - calculate offset where template would start
+                template_start = pos - anchor_start
+                if 0 <= template_start <= max_offset:
+                    # Verify this alignment by scoring full overlap
+                    score = self._score_alignment(ref, hdr, template_start)
+                    if score > best_score:
+                        best_score = score
+                        best_offset = template_start
+
+            # Also try approximate matching for this anchor region
+            for offset in range(max_offset + 1):
+                ref_pos = offset + anchor_start
+                if ref_pos + len(anchor) > len(ref):
+                    break
+                ref_region = ref[ref_pos:ref_pos + len(anchor)]
+                matches = sum(1 for a, b in zip(anchor, ref_region) if a == b)
+                if matches > len(anchor) * 0.8:  # At least 80% match
+                    score = self._score_alignment(ref, hdr, offset)
+                    if score > best_score:
+                        best_score = score
+                        best_offset = offset
+
+        return best_offset
+
+    def _score_alignment(self, ref: str, hdr: str, offset: int) -> int:
+        """Score how well the template aligns at a given offset."""
+        compare_len = min(len(hdr), len(ref) - offset)
+        matches = sum(
+            1 for i in range(compare_len)
+            if ref[offset + i] == hdr[i]
+        )
+        return matches
+
+    def _align_sequences(self, ref: str, hdr: str) -> Tuple[str, str]:
+        """
+        Simple Needleman-Wunsch alignment for detecting indels.
+
+        Returns aligned sequences with gaps represented as '-'.
+        """
+        # Simple implementation for small sequences
+        # For large indels, we need proper alignment
+
+        # If lengths are similar (within 5bp), do direct comparison
+        if abs(len(ref) - len(hdr)) <= 5 and len(ref) < 500:
+            return self._simple_align(ref[:len(hdr)], hdr)
+
+        # For larger differences, use dynamic programming
+        return self._needleman_wunsch(ref, hdr)
+
+    def _simple_align(self, ref: str, hdr: str) -> Tuple[str, str]:
+        """Simple alignment for sequences of similar length."""
+        # Pad shorter sequence
+        max_len = max(len(ref), len(hdr))
+        ref_padded = ref.ljust(max_len, '-')
+        hdr_padded = hdr.ljust(max_len, '-')
+        return ref_padded, hdr_padded
+
+    def _needleman_wunsch(self, ref: str, hdr: str) -> Tuple[str, str]:
+        """
+        Needleman-Wunsch global alignment for indel detection.
+
+        Optimized for HDR template alignment where we expect:
+        - Long matching homology arms
+        - Short edit region in the middle (substitutions, insertions, or deletions)
+
+        Uses affine gap scoring to prefer fewer, longer gaps over many small gaps.
+        """
+        m, n = len(ref), len(hdr)
+
+        # Limit alignment length to avoid memory issues
+        max_len = min(m, len(hdr) + 100)
+        ref = ref[:max_len]
+        m = len(ref)
+
+        # Scoring - balanced for typical HDR edits
+        # Make mismatches costly so alignment prefers gaps for long insertions
+        match_score = 3
+        mismatch_score = -3  # Costly mismatches
+        gap_score = -1       # Cheaper gaps to encourage longer gaps over mismatches
+
+        # Initialize score matrix
+        score = [[0] * (n + 1) for _ in range(m + 1)]
+
+        # Initialize first row and column
+        for i in range(m + 1):
+            score[i][0] = i * gap_score
+        for j in range(n + 1):
+            score[0][j] = j * gap_score
+
+        # Fill matrix
+        for i in range(1, m + 1):
+            for j in range(1, n + 1):
+                match = score[i-1][j-1] + (match_score if ref[i-1] == hdr[j-1] else mismatch_score)
+                delete = score[i-1][j] + gap_score
+                insert = score[i][j-1] + gap_score
+                score[i][j] = max(match, delete, insert)
+
+        # Traceback
+        aligned_ref = []
+        aligned_hdr = []
+        i, j = m, n
+
+        while i > 0 or j > 0:
+            if i > 0 and j > 0:
+                current = score[i][j]
+                diag = score[i-1][j-1]
+                match = match_score if ref[i-1] == hdr[j-1] else mismatch_score
+
+                if current == diag + match:
+                    aligned_ref.append(ref[i-1])
+                    aligned_hdr.append(hdr[j-1])
+                    i -= 1
+                    j -= 1
+                elif i > 0 and current == score[i-1][j] + gap_score:
+                    aligned_ref.append(ref[i-1])
+                    aligned_hdr.append('-')
+                    i -= 1
+                else:
+                    aligned_ref.append('-')
+                    aligned_hdr.append(hdr[j-1])
+                    j -= 1
+            elif i > 0:
+                aligned_ref.append(ref[i-1])
+                aligned_hdr.append('-')
+                i -= 1
+            else:
+                aligned_ref.append('-')
+                aligned_hdr.append(hdr[j-1])
+                j -= 1
+
+        return ''.join(reversed(aligned_ref)), ''.join(reversed(aligned_hdr))
+
+    def _parse_alignment_for_edits(self, aligned_ref: str, aligned_hdr: str):
+        """Parse aligned sequences to extract edit information."""
+        ref_pos = self.template_offset  # Position in original reference
+        i = 0
+
+        while i < len(aligned_ref):
+            ref_base = aligned_ref[i]
+            hdr_base = aligned_hdr[i]
+
+            if ref_base == hdr_base:
+                # Match - no edit
+                if ref_base != '-':
+                    ref_pos += 1
+                i += 1
+            elif ref_base == '-':
+                # Insertion in HDR template
+                inserted_bases = []
+                while i < len(aligned_ref) and aligned_ref[i] == '-':
+                    inserted_bases.append(aligned_hdr[i])
+                    i += 1
+                self.edits.append(EditInfo(
+                    position=ref_pos,
+                    ref_bases='',
+                    hdr_bases=''.join(inserted_bases),
+                    edit_type='insertion'
+                ))
+            elif hdr_base == '-':
+                # Deletion in HDR template
+                deleted_bases = []
+                while i < len(aligned_ref) and aligned_hdr[i] == '-':
+                    deleted_bases.append(aligned_ref[i])
+                    i += 1
+                    ref_pos += 1
+                self.edits.append(EditInfo(
+                    position=ref_pos - len(deleted_bases),
+                    ref_bases=''.join(deleted_bases),
+                    hdr_bases='',
+                    edit_type='deletion'
+                ))
+            else:
+                # Substitution
+                self.edits.append(EditInfo(
+                    position=ref_pos,
+                    ref_bases=ref_base,
+                    hdr_bases=hdr_base,
+                    edit_type='substitution'
+                ))
+                ref_pos += 1
+                i += 1
 
     def _detect_homology_arms(self):
         """Detect homology arm boundaries from edit positions."""
@@ -230,11 +516,14 @@ class LocusConfig:
     def print_summary(self):
         """Print a human-readable summary of the locus configuration."""
         print("\n" + "=" * 60)
-        print("=== CRISPRo Analysis Configuration ===")
+        print("=== TRACE Analysis Configuration ===")
         print("=" * 60)
 
         print(f"\nReference sequence: {len(self.reference)} bp")
         print(f"HDR template: {len(self.hdr_template)} bp")
+
+        if self.template_offset > 0:
+            print(f"  - Template aligns at position {self.template_offset + 1} in reference")
 
         if self.homology_arms:
             print("\nDonor template analysis:")
@@ -246,10 +535,20 @@ class LocusConfig:
                   f"({self.homology_arms.right_length} bp)")
 
         if self.edits:
-            positions = [str(e.position + 1) for e in self.edits]  # 1-indexed for display
-            print(f"  - Donor edits detected at positions: {', '.join(positions)} on reference")
+            print(f"\n  Edits detected ({len(self.edits)} total):")
             for edit in self.edits:
-                print(f"    * Position {edit.position + 1}: {edit.ref_base} → {edit.hdr_base}")
+                if edit.edit_type == "substitution":
+                    print(f"    * Position {edit.position + 1}: {edit.ref_bases} → {edit.hdr_bases} (substitution)")
+                elif edit.edit_type == "insertion":
+                    print(f"    * Position {edit.position + 1}: +{edit.hdr_bases} ({len(edit.hdr_bases)} bp insertion)")
+                else:  # deletion
+                    print(f"    * Position {edit.position + 1}: -{edit.ref_bases} ({len(edit.ref_bases)} bp deletion)")
+
+            # Show edit summary
+            max_edit = self.max_edit_size
+            if max_edit > 0:
+                print(f"\n  Maximum edit size: {max_edit} bp")
+                print(f"  Recommended k-mer size: {self.recommended_kmer_size()} bp")
 
         if self.guide_info:
             print("\nGuide analysis:")

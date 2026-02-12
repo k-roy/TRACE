@@ -12,7 +12,7 @@ from typing import Optional
 import sys
 
 from . import __version__
-from .config import LocusConfig, NucleaseType, load_fasta
+from .config import LocusConfig, NucleaseType, parse_sequence_input
 
 
 @click.group()
@@ -23,10 +23,10 @@ def cli():
 
 
 @cli.command()
-@click.option('--reference', '-r', type=click.Path(exists=True), required=True,
-              help='Reference sequence FASTA file (amplicon)')
-@click.option('--hdr-template', '-h', type=click.Path(exists=True), required=True,
-              help='HDR template sequence FASTA file')
+@click.option('--reference', '-r', type=str, required=True,
+              help='Reference amplicon: DNA sequence or FASTA file path')
+@click.option('--hdr-template', '-h', type=str, required=True,
+              help='HDR template: DNA sequence or FASTA file path (can be shorter than reference)')
 @click.option('--guide', '-g', type=str, required=True,
               help='Guide sequence (20bp for Cas9, 20-24bp for Cas12a)')
 @click.option('--r1', type=click.Path(exists=True),
@@ -39,24 +39,44 @@ def cli():
               help='Output directory')
 @click.option('--nuclease', type=click.Choice(['cas9', 'cas12a']), default='cas9',
               help='Nuclease type (default: cas9)')
-@click.option('--contaminant', '-c', type=click.Path(exists=True),
-              help='Optional contaminant sequence FASTA for filtering')
+@click.option('--contaminant', '-c', type=str,
+              help='Optional contaminant: DNA sequence or FASTA file path')
 @click.option('--threads', '-t', type=int, default=4,
               help='Number of threads (default: 4)')
 @click.option('--crispresso/--no-crispresso', default=True,
               help='Run CRISPResso2 for comparison (default: enabled)')
 def run(reference, hdr_template, guide, r1, r2, sample_key, output,
         nuclease, contaminant, threads, crispresso):
-    """Run the full editing outcome analysis pipeline."""
+    """
+    Run the full editing outcome analysis pipeline.
+
+    REFERENCE and HDR_TEMPLATE can be provided as:
+      - DNA sequences directly (e.g., ATCGATCG...)
+      - Paths to FASTA files (e.g., reference.fasta)
+
+    \b
+    Example with DNA sequences:
+      trace run -r ATCG...250bp...ATCG -h ATCG...150bp...ATCG -g GCTGAAGCACTGCACGCCGT \\
+                --r1 reads_R1.fastq.gz -o results/
+
+    \b
+    Example with FASTA files:
+      trace run -r reference.fasta -h template.fasta -g GCTGAAGCACTGCACGCCGT \\
+                --r1 reads_R1.fastq.gz -o results/
+    """
 
     # Validate inputs
     if not r1 and not sample_key:
         click.echo("Error: Either --r1 or --sample-key must be provided", err=True)
         sys.exit(1)
 
-    # Load sequences
-    ref_seq = load_fasta(Path(reference))
-    hdr_seq = load_fasta(Path(hdr_template))
+    # Parse sequences (handles both DNA strings and file paths)
+    try:
+        ref_seq = parse_sequence_input(reference)
+        hdr_seq = parse_sequence_input(hdr_template)
+    except ValueError as e:
+        click.echo(f"Error loading sequences: {e}", err=True)
+        sys.exit(1)
 
     # Create locus configuration
     nuclease_type = NucleaseType.CAS9 if nuclease == 'cas9' else NucleaseType.CAS12A
@@ -96,7 +116,11 @@ def run(reference, hdr_template, guide, r1, r2, sample_key, output,
     # Load contaminant sequence if provided
     contaminant_seq = None
     if contaminant:
-        contaminant_seq = load_fasta(Path(contaminant))
+        try:
+            contaminant_seq = parse_sequence_input(contaminant)
+        except ValueError as e:
+            click.echo(f"Error loading contaminant sequence: {e}", err=True)
+            sys.exit(1)
 
     # Handle single sample vs batch mode
     if r1:
@@ -152,15 +176,15 @@ def run(reference, hdr_template, guide, r1, r2, sample_key, output,
 
 @cli.command()
 @click.argument('fastq', type=click.Path(exists=True), nargs=-1, required=True)
-@click.option('--reference', '-r', type=click.Path(exists=True), required=True,
-              help='Reference sequence FASTA file')
+@click.option('--reference', '-r', type=str, required=True,
+              help='Reference amplicon: DNA sequence or FASTA file path')
 @click.option('--output', '-o', type=click.Path(), required=True,
               help='Output BAM file')
 @click.option('--threads', '-t', type=int, default=4,
               help='Number of threads')
 def align(fastq, reference, output, threads):
     """Align reads using triple-aligner approach (BWA, BBMap, minimap2)."""
-    click.echo(f"Aligning {len(fastq)} FASTQ file(s) to {reference}")
+    click.echo(f"Aligning {len(fastq)} FASTQ file(s)")
     click.echo(f"Output: {output}")
     click.echo(f"Threads: {threads}")
 
@@ -170,10 +194,10 @@ def align(fastq, reference, output, threads):
 
 @cli.command()
 @click.argument('bam', type=click.Path(exists=True))
-@click.option('--reference', '-r', type=click.Path(exists=True), required=True,
-              help='Reference sequence FASTA')
-@click.option('--hdr-template', '-h', type=click.Path(exists=True), required=True,
-              help='HDR template FASTA')
+@click.option('--reference', '-r', type=str, required=True,
+              help='Reference amplicon: DNA sequence or FASTA file path')
+@click.option('--hdr-template', '-h', type=str, required=True,
+              help='HDR template: DNA sequence or FASTA file path')
 @click.option('--guide', '-g', type=str, required=True,
               help='Guide sequence')
 @click.option('--output', '-o', type=click.Path(), required=True,
@@ -185,8 +209,12 @@ def classify(bam, reference, hdr_template, guide, output, nuclease):
     click.echo(f"Classifying reads from: {bam}")
 
     # Load sequences
-    ref_seq = load_fasta(Path(reference))
-    hdr_seq = load_fasta(Path(hdr_template))
+    try:
+        ref_seq = parse_sequence_input(reference)
+        hdr_seq = parse_sequence_input(hdr_template)
+    except ValueError as e:
+        click.echo(f"Error loading sequences: {e}", err=True)
+        sys.exit(1)
 
     nuclease_type = NucleaseType.CAS9 if nuclease == 'cas9' else NucleaseType.CAS12A
 
@@ -205,22 +233,30 @@ def classify(bam, reference, hdr_template, guide, output, nuclease):
 
 
 @cli.command('extract-kmers')
-@click.argument('contaminant_fasta', type=click.Path(exists=True))
-@click.option('--reference', '-r', type=click.Path(exists=True),
-              help='Reference sequence to exclude from k-mers')
+@click.argument('contaminant', type=str)
+@click.option('--reference', '-r', type=str,
+              help='Reference sequence to exclude from k-mers (DNA or FASTA path)')
 @click.option('--kmer-size', '-k', type=int, default=12,
               help='K-mer size (default: 12)')
 @click.option('--output', '-o', type=click.Path(), required=True,
               help='Output file for k-mers')
-def extract_kmers(contaminant_fasta, reference, kmer_size, output):
+def extract_kmers(contaminant, reference, kmer_size, output):
     """Extract unique k-mers from contaminant sequence for filtering."""
     from .utils.sequence import extract_unique_kmers
 
-    contaminant_seq = load_fasta(Path(contaminant_fasta))
+    try:
+        contaminant_seq = parse_sequence_input(contaminant)
+    except ValueError as e:
+        click.echo(f"Error loading contaminant sequence: {e}", err=True)
+        sys.exit(1)
 
     exclude_seqs = []
     if reference:
-        exclude_seqs.append(load_fasta(Path(reference)))
+        try:
+            exclude_seqs.append(parse_sequence_input(reference))
+        except ValueError as e:
+            click.echo(f"Error loading reference sequence: {e}", err=True)
+            sys.exit(1)
 
     kmers = extract_unique_kmers(contaminant_seq, kmer_size, exclude_seqs)
 
@@ -278,18 +314,35 @@ crispresso: true
 
 
 @cli.command()
-@click.option('--reference', '-r', type=click.Path(exists=True), required=True,
-              help='Reference sequence FASTA')
-@click.option('--hdr-template', '-h', type=click.Path(exists=True), required=True,
-              help='HDR template FASTA')
+@click.option('--reference', '-r', type=str, required=True,
+              help='Reference amplicon: DNA sequence or FASTA file path')
+@click.option('--hdr-template', '-h', type=str, required=True,
+              help='HDR template: DNA sequence or FASTA file path')
 @click.option('--guide', '-g', type=str, required=True,
               help='Guide sequence')
 @click.option('--nuclease', type=click.Choice(['cas9', 'cas12a']), default='cas9',
               help='Nuclease type')
 def info(reference, hdr_template, guide, nuclease):
-    """Display locus analysis information without running the pipeline."""
-    ref_seq = load_fasta(Path(reference))
-    hdr_seq = load_fasta(Path(hdr_template))
+    """
+    Display locus analysis information without running the pipeline.
+
+    \b
+    Example with DNA sequences (250bp reference, 150bp template):
+      trace info \\
+        -r ATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG... \\
+        -h ATCGATCGATCGATCGATCGATCGATCGATCGATCG... \\
+        -g GCTGAAGCACTGCACGCCGT
+
+    \b
+    Example with FASTA files:
+      trace info -r reference.fasta -h template.fasta -g GCTGAAGCACTGCACGCCGT
+    """
+    try:
+        ref_seq = parse_sequence_input(reference)
+        hdr_seq = parse_sequence_input(hdr_template)
+    except ValueError as e:
+        click.echo(f"Error loading sequences: {e}", err=True)
+        sys.exit(1)
 
     nuclease_type = NucleaseType.CAS9 if nuclease == 'cas9' else NucleaseType.CAS12A
 
