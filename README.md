@@ -5,8 +5,10 @@
 ## Features
 
 - **Triple-aligner consensus**: Uses BWA-MEM, BBMap, and minimap2 for robust alignment
+- **Flexible input**: Accepts DNA sequences directly or FASTA file paths
 - **Automatic inference**: Detects PAM, cleavage site, homology arms, and edits from sequences
-- **K-mer classification**: Fast pre-alignment HDR/WT detection using 12-mers
+- **Large edit support**: Handles insertions up to 50+ bp with automatic k-mer size adjustment
+- **K-mer classification**: Fast pre-alignment HDR/WT detection (auto-sizes k-mers based on edit)
 - **Multi-nuclease support**: Cas9 and Cas12a (Cpf1) with correct cleavage geometry
 - **Auto-detection**: Library type (TruSeq/Tn5), read merging need, CRISPResso mode
 - **CRISPResso2 integration**: Validation with standard CRISPR analysis tool
@@ -35,7 +37,9 @@ pip install -e ".[dev]"
 
 ## Quick Start
 
-### Minimal run (3 required inputs)
+TRACE accepts sequences as either **DNA strings** or **FASTA file paths**.
+
+### Example 1: Using FASTA files
 
 ```bash
 trace run \
@@ -44,6 +48,32 @@ trace run \
   --guide GCTGAAGCACTGCACGCCGT \
   --r1 sample_R1.fastq.gz \
   --r2 sample_R2.fastq.gz \
+  --output results/
+```
+
+### Example 2: Using DNA sequences directly
+
+The HDR template (150 bp) is typically shorter than the reference amplicon (250 bp),
+with ~50 bp flanking each side in the reference:
+
+```bash
+# Reference amplicon (250 bp) - includes flanking regions
+REF="ATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG\
+ATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG\
+GCTGAAGCACTGCACGCCGTNGG\
+ATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG\
+ATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG"
+
+# HDR template (150 bp) - centered on edit site
+HDR="ATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG\
+GCTGAAGCACTGCACGCCGTNGA\
+ATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG"
+
+trace run \
+  -r "$REF" \
+  -h "$HDR" \
+  -g GCTGAAGCACTGCACGCCGT \
+  --r1 sample_R1.fastq.gz \
   --output results/
 ```
 
@@ -110,6 +140,26 @@ trace run \
   --nuclease cas12a \
   --sample-key samples.tsv \
   --output results/
+```
+
+## Edit Detection
+
+TRACE automatically detects edits by aligning the HDR template to the reference:
+
+- **Substitutions**: Single nucleotide changes (e.g., C → G)
+- **Insertions**: Extra bases in the HDR template (up to 50+ bp)
+- **Deletions**: Missing bases in the HDR template
+
+For large edits, TRACE automatically increases the k-mer size to ensure reliable
+classification. The k-mer size is always at least 10 bp larger than the largest edit.
+
+Example output for a 20 bp insertion:
+```
+Edits detected (1 total):
+  * Position 125: +ATCGATCGATCGATCGATCG (20 bp insertion)
+
+Maximum edit size: 20 bp
+Recommended k-mer size: 30 bp
 ```
 
 ## Nuclease Support
