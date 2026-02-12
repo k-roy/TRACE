@@ -177,6 +177,30 @@ For TruSeq libraries, TRACE detects UMIs (Unique Molecular Identifiers) by analy
 - Low diversity region = primer sequence
 - Automatically determines UMI length (typically 4-12 bp)
 
+### Preprocessing Modes
+
+Based on detection results, TRACE automatically selects the optimal preprocessing workflow:
+
+| Library | UMIs | Overlap (>=15bp) | Preprocessing | Output |
+|---------|------|------------------|---------------|--------|
+| TruSeq | Yes | Yes | dedup → trim → merge → collapse | merged FASTQ |
+| TruSeq | Yes | No | dedup → trim | paired FASTQs |
+| TruSeq | No | Yes | trim → merge → collapse | merged FASTQ |
+| TruSeq | No | No | trim | paired FASTQs |
+| Tn5 | N/A | Yes | trim → merge → collapse → align → position dedup | merged FASTQ |
+| Tn5 | N/A | No | trim → align → position dedup | paired FASTQs |
+
+Example output:
+```
+Auto-detection results:
+  - Library type: TruSeq (100% of reads cluster at fixed start position)
+  - UMI detection: UMIs of length 6 bp detected
+  - Read overlap: Enabled (~50bp overlap (25% of amplicon))
+  - Preprocessing: dedup-trim-merge-collapse -> merged
+    (UMI dedup -> trim -> merge -> collapse)
+  - CRISPResso mode: merged (merged reads from preprocessing)
+```
+
 ## Designed Edit Detection
 
 TRACE automatically detects the edits encoded in the donor by first aligning the HDR template to the reference. TRACE then classifies the intended edit as a single-nucleotide variant (SNV), multi-nucleotide variant (MNV), insertion, or deletion.

@@ -41,7 +41,8 @@ class LibraryDetectionResult:
 class MergeDetectionResult:
     """Result of merge need detection."""
     should_merge: bool
-    estimated_overlap: float
+    estimated_overlap_bp: int  # Estimated overlap in base pairs
+    estimated_overlap_fraction: float  # Overlap as fraction of amplicon
     reason: str
 
     def __str__(self) -> str:
@@ -290,15 +291,21 @@ def detect_merge_need(
     r1_path: Path,
     r2_path: Path,
     amplicon_length: int,
+    min_overlap_bp: int = 15,
     n_reads: int = 1000
 ) -> MergeDetectionResult:
     """
     Detect if R1 and R2 should be merged based on overlap.
 
+    For TruSeq libraries, we use a threshold of 15bp overlap to enable merging.
+    This allows better handling of reads that can be merged into a single
+    higher-quality sequence.
+
     Args:
         r1_path: Path to R1 FASTQ file
         r2_path: Path to R2 FASTQ file
         amplicon_length: Expected amplicon length
+        min_overlap_bp: Minimum overlap in bp to recommend merging (default: 15)
         n_reads: Number of reads to sample for length estimation
 
     Returns:
@@ -321,27 +328,30 @@ def detect_merge_need(
     if not read_lengths:
         return MergeDetectionResult(
             should_merge=False,
-            estimated_overlap=0,
+            estimated_overlap_bp=0,
+            estimated_overlap_fraction=0.0,
             reason="no reads found"
         )
 
     avg_read_length = sum(read_lengths) / len(read_lengths)
 
-    # Simple heuristic: if reads could overlap by >=20bp, merge
-    potential_overlap = (2 * avg_read_length) - amplicon_length
+    # Calculate potential overlap: 2*read_length - amplicon_length
+    potential_overlap_bp = int((2 * avg_read_length) - amplicon_length)
+    overlap_fraction = potential_overlap_bp / amplicon_length if amplicon_length > 0 else 0
 
-    if potential_overlap >= 20:
-        overlap_fraction = potential_overlap / amplicon_length
+    if potential_overlap_bp >= min_overlap_bp:
         return MergeDetectionResult(
             should_merge=True,
-            estimated_overlap=overlap_fraction,
-            reason=f"estimated {overlap_fraction:.0%} overlap based on amplicon size"
+            estimated_overlap_bp=potential_overlap_bp,
+            estimated_overlap_fraction=overlap_fraction,
+            reason=f"~{potential_overlap_bp}bp overlap ({overlap_fraction:.0%} of amplicon)"
         )
     else:
         return MergeDetectionResult(
             should_merge=False,
-            estimated_overlap=max(0, potential_overlap / amplicon_length),
-            reason="insufficient read overlap"
+            estimated_overlap_bp=max(0, potential_overlap_bp),
+            estimated_overlap_fraction=max(0, overlap_fraction),
+            reason=f"insufficient overlap ({max(0, potential_overlap_bp)}bp < {min_overlap_bp}bp threshold)"
         )
 
 
@@ -401,12 +411,38 @@ class UMIDetectionResult:
 
 
 @dataclass
+class PreprocessingMode:
+    """Preprocessing protocol to apply based on detection results."""
+    # Steps to perform (in order)
+    dedup: bool  # UMI-based deduplication (TruSeq) or position-based (Tn5, post-align)
+    trim: bool  # Adapter trimming
+    merge: bool  # Read merging (requires overlap)
+    collapse: bool  # Collapse identical sequences (post-merge)
+    # Output format
+    output_format: str  # 'merged' (single FASTQ) or 'paired' (R1+R2)
+    description: str  # Human-readable description
+
+    def __str__(self) -> str:
+        steps = []
+        if self.dedup:
+            steps.append("dedup")
+        if self.trim:
+            steps.append("trim")
+        if self.merge:
+            steps.append("merge")
+        if self.collapse:
+            steps.append("collapse")
+        return f"{'-'.join(steps)} → {self.output_format}"
+
+
+@dataclass
 class AutoDetectionResults:
     """Combined auto-detection results."""
     library: LibraryDetectionResult
     merge: Optional[MergeDetectionResult]
     crispresso: CRISPRessoModeResult
     umi: Optional[UMIDetectionResult] = None
+    preprocessing: Optional[PreprocessingMode] = None
 
     def print_summary(self):
         """Print auto-detection summary."""
@@ -414,9 +450,11 @@ class AutoDetectionResults:
         print(f"  - Library type: {self.library}")
         if self.umi and self.umi.has_umi:
             print(f"  - UMI detection: {self.umi}")
-            print(f"    --> Entering PCR deduplication mode...")
         if self.merge:
-            print(f"  - Read merging: {self.merge}")
+            print(f"  - Read overlap: {self.merge}")
+        if self.preprocessing:
+            print(f"  - Preprocessing: {self.preprocessing}")
+            print(f"    ({self.preprocessing.description})")
         print(f"  - CRISPResso mode: {self.crispresso}")
 
 
@@ -572,6 +610,91 @@ def detect_umi_length(
     )
 
 
+def _determine_preprocessing_mode(
+    library_type: str,
+    has_umi: bool,
+    should_merge: bool,
+    is_paired: bool,
+) -> PreprocessingMode:
+    """
+    Determine preprocessing protocol based on detection results.
+
+    TruSeq workflows:
+    - UMI + overlap: dedup → trim → merge → collapse → merged FASTQ
+    - UMI + no overlap: dedup → trim → paired FASTQ
+    - no UMI + overlap: trim → merge → collapse → merged FASTQ
+    - no UMI + no overlap: trim → paired FASTQ
+
+    Tn5 workflows:
+    - Always: trim → (paired or merged based on overlap) → align → position-based dedup
+    """
+    if library_type == 'TruSeq':
+        if has_umi and should_merge:
+            return PreprocessingMode(
+                dedup=True,
+                trim=True,
+                merge=True,
+                collapse=True,
+                output_format='merged',
+                description="UMI dedup → trim → merge → collapse"
+            )
+        elif has_umi and not should_merge:
+            return PreprocessingMode(
+                dedup=True,
+                trim=True,
+                merge=False,
+                collapse=False,
+                output_format='paired',
+                description="UMI dedup → trim → paired-end mapping"
+            )
+        elif not has_umi and should_merge:
+            return PreprocessingMode(
+                dedup=False,
+                trim=True,
+                merge=True,
+                collapse=True,
+                output_format='merged',
+                description="trim → merge → collapse"
+            )
+        else:  # no UMI, no overlap
+            return PreprocessingMode(
+                dedup=False,
+                trim=True,
+                merge=False,
+                collapse=False,
+                output_format='paired',
+                description="trim → paired-end mapping"
+            )
+    else:  # Tn5
+        if should_merge:
+            return PreprocessingMode(
+                dedup=False,  # Position-based dedup happens post-alignment for Tn5
+                trim=True,
+                merge=True,
+                collapse=True,
+                output_format='merged',
+                description="trim → merge → collapse → align → position dedup"
+            )
+        elif is_paired:
+            return PreprocessingMode(
+                dedup=False,
+                trim=True,
+                merge=False,
+                collapse=False,
+                output_format='paired',
+                description="trim → paired-end mapping → position dedup"
+            )
+        else:  # Single-end Tn5
+            return PreprocessingMode(
+                dedup=False,
+                trim=True,
+                merge=False,
+                collapse=False,
+                output_format='single',
+                description="trim → single-end mapping → position dedup"
+            )
+
+
 def run_auto_detection(
     r1_path: Path,
     r2_path: Optional[Path],
@@ -581,36 +704,58 @@ def run_auto_detection(
     """
     Run all auto-detection steps.
 
+    Detection order for TruSeq:
+    1. Library type (TruSeq vs Tn5)
+    2. UMI presence and length (TruSeq only)
+    3. Read overlap (>=15bp threshold)
+    4. Determine preprocessing protocol
+
     Args:
         r1_path: Path to R1 FASTQ
         r2_path: Optional path to R2 FASTQ
         amplicon_length: Expected amplicon length
-        reference: Optional reference sequence for UMI detection
+        reference: Optional reference sequence for position-based detection
 
     Returns:
         AutoDetectionResults with all detection results
     """
-    # Detect library type (use reference for position-based detection)
+    # Step 1: Detect library type (use reference for position-based detection)
     library = detect_library_type(r1_path, r2_path, reference=reference)
 
-    # Detect UMI if TruSeq library and reference provided
+    # Step 2: Detect UMI if TruSeq library and reference provided
     umi = None
+    has_umi = False
     if library.library_type == 'TruSeq' and reference:
         umi = detect_umi_length(r1_path, r2_path, reference)
+        has_umi = umi.has_umi
 
-    # Detect merge need if paired-end
+    # Step 3: Detect merge need if paired-end (using 15bp threshold)
     merge = None
     should_merge = False
     if r2_path:
-        merge = detect_merge_need(r1_path, r2_path, amplicon_length)
+        merge = detect_merge_need(r1_path, r2_path, amplicon_length, min_overlap_bp=15)
         should_merge = merge.should_merge
 
-    # Detect CRISPResso mode
-    crispresso = detect_crispresso_mode(r1_path, r2_path, should_merge)
+    # Step 4: Determine preprocessing protocol
+    preprocessing = _determine_preprocessing_mode(
+        library_type=library.library_type,
+        has_umi=has_umi,
+        should_merge=should_merge,
+        is_paired=r2_path is not None,
+    )
+
+    # Detect CRISPResso mode based on preprocessing output
+    if preprocessing.output_format == 'merged':
+        crispresso = CRISPRessoModeResult(mode='merged', reason='merged reads from preprocessing')
+    elif preprocessing.output_format == 'paired':
+        crispresso = CRISPRessoModeResult(mode='paired', reason='paired-end from preprocessing')
+    else:
+        crispresso = CRISPRessoModeResult(mode='single', reason='single-end data')
 
     return AutoDetectionResults(
         library=library,
         merge=merge,
         crispresso=crispresso,
         umi=umi,
+        preprocessing=preprocessing,
     )
