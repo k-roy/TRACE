@@ -128,8 +128,8 @@ def run(reference, hdr_template, guide, r1, r2, sample_key, output,
         r1_path = Path(r1)
         r2_path = Path(r2) if r2 else None
 
-        # Run auto-detection
-        detection = run_auto_detection(r1_path, r2_path, len(ref_seq))
+        # Run auto-detection (include reference for UMI detection)
+        detection = run_auto_detection(r1_path, r2_path, len(ref_seq), reference=ref_seq)
         detection.print_summary()
 
         # Create sample
@@ -151,7 +151,7 @@ def run(reference, hdr_template, guide, r1, r2, sample_key, output,
         # Get first sample for auto-detection preview
         if samples:
             first = samples[0]
-            detection = run_auto_detection(first.r1_path, first.r2_path, len(ref_seq))
+            detection = run_auto_detection(first.r1_path, first.r2_path, len(ref_seq), reference=ref_seq)
             detection.print_summary()
 
     # Create pipeline configuration

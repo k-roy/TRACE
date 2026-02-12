@@ -2,6 +2,8 @@
 
 **T**riple-aligner **R**ead **A**nalysis for **C**RISPR **E**diting
 
+TRACE is a comprehensive tool for quantifying CRISPR editing outcomes from amplicon sequencing data. It combines multiple alignment strategies with k-mer classification to provide robust, accurate measurements of HDR, NHEJ, and other editing outcomes.
+
 ## Features
 
 - **Triple-aligner consensus**: Uses BWA-MEM, BBMap, and minimap2 for robust alignment
@@ -10,7 +12,8 @@
 - **Large edit support**: Handles insertions up to 50+ bp with automatic k-mer size adjustment
 - **K-mer classification**: Fast pre-alignment HDR/WT detection (auto-sizes k-mers based on edit)
 - **Multi-nuclease support**: Cas9 and Cas12a (Cpf1) with correct cleavage geometry
-- **Auto-detection**: Library type (TruSeq/Tn5), read merging need, CRISPResso mode
+- **Auto-detection**: Library type (TruSeq/Tn5), UMI presence, read merging need
+- **PCR deduplication**: Automatic UMI-based (TruSeq) or position-based (Tn5) deduplication
 - **CRISPResso2 integration**: Validation with standard CRISPR analysis tool
 
 ## Installation
@@ -30,8 +33,8 @@ conda install -c bioconda -c conda-forge trace-crispr
 ### Development installation
 
 ```bash
-git clone https://github.com/k-roy/trace.git
-cd trace
+git clone https://github.com/k-roy/TRACE.git
+cd TRACE
 pip install -e ".[dev]"
 ```
 
@@ -53,20 +56,21 @@ trace run \
 
 ### Example 2: Using DNA sequences directly
 
-The HDR template (150 bp) is typically shorter than the reference amplicon (250 bp),
-with ~50 bp flanking each side in the reference:
+The reference amplicon will typically be longer than the HDR template so that the primers specifically amplify the target locus. This example shows a 250 bp reference sequence where the donor template is 150 bp long with the designed edit in the middle.
 
 ```bash
 # Reference amplicon (250 bp) - includes flanking regions
+# Guide sequence shown in lowercase for illustration
 REF="ATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG\
 ATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG\
-GCTGAAGCACTGCACGCCGTNGG\
+gctgaagcactgcacgccgttgg\
 ATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG\
 ATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG"
 
 # HDR template (150 bp) - centered on edit site
+# Guide in lowercase, designed edit (T->A) shown in UPPERCASE
 HDR="ATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG\
-GCTGAAGCACTGCACGCCGTNGA\
+gctgaagcactgcacgccgtAga\
 ATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG"
 
 trace run \
@@ -76,6 +80,8 @@ trace run \
   --r1 sample_R1.fastq.gz \
   --output results/
 ```
+
+**Note:** The guide and edit are shown here in lowercase/uppercase for illustrative purposes. This formatting is not necessary - TRACE will automatically detect guide and edit positions from the sequences.
 
 ### Check locus configuration without running
 
@@ -89,7 +95,9 @@ trace info \
 This will print:
 
 ```
+============================================================
 === TRACE Analysis Configuration ===
+============================================================
 
 Reference sequence: 500 bp
 HDR template: 500 bp
@@ -97,9 +105,10 @@ HDR template: 500 bp
 Donor template analysis:
   - Left homology arm: positions 1-245 on reference (245 bp)
   - Right homology arm: positions 255-500 on reference (245 bp)
-  - Donor edits detected at positions: 246, 247 on reference
-    * Position 246: C → G (PAM-silencing mutation)
-    * Position 247: C → T (chromophore Y66H mutation)
+
+  Edits detected (2 total):
+    * Position 246: C -> G (substitution)
+    * Position 247: C -> T (substitution)
 
 Guide analysis:
   - Guide sequence: GCTGAAGCACTGCACGCCGT
@@ -142,16 +151,37 @@ trace run \
   --output results/
 ```
 
-## Edit Detection
+## Auto-Detection
 
-TRACE automatically detects edits by aligning the HDR template to the reference:
+TRACE automatically detects library characteristics to optimize analysis:
 
-- **Substitutions**: Single nucleotide changes (e.g., C → G)
-- **Insertions**: Extra bases in the HDR template (up to 50+ bp)
-- **Deletions**: Missing bases in the HDR template
+### Library Type Detection
 
-For large edits, TRACE automatically increases the k-mer size to ensure reliable
-classification. The k-mer size is always at least 10 bp larger than the largest edit.
+TRACE distinguishes between **TruSeq** (fixed-target amplicon) and **Tn5** (tagmented locus) libraries by analyzing read alignment positions:
+
+- **TruSeq**: Reads cluster at fixed start positions (primer binding sites)
+- **Tn5**: Reads have scattered start positions (random Tn5 cutting)
+
+```
+Auto-detection results:
+  - Library type: TruSeq (100% of reads cluster at fixed start position)
+  - UMI detection: UMIs of length 6 bp detected
+    --> Entering PCR deduplication mode...
+```
+
+### UMI Detection
+
+For TruSeq libraries, TRACE detects UMIs (Unique Molecular Identifiers) by analyzing sequence diversity at read starts:
+
+- High diversity region = UMI
+- Low diversity region = primer sequence
+- Automatically determines UMI length (typically 4-12 bp)
+
+## Designed Edit Detection
+
+TRACE automatically detects the edits encoded in the donor by first aligning the HDR template to the reference. TRACE then classifies the intended edit as a single-nucleotide variant (SNV), multi-nucleotide variant (MNV), insertion, or deletion.
+
+K-mers are selected that span the designed edit and are unique to the reference and donor. For large edits, TRACE automatically increases the k-mer size to ensure reliable classification. TRACE can handle MNVs or insertions with lengths up to the read length - 50 bp (e.g., 100 bp insertions can be detected with 150 bp reads).
 
 Example output for a 20 bp insertion:
 ```
@@ -181,13 +211,18 @@ The main output is a TSV file with per-sample editing outcomes:
 |--------|-------------|
 | sample | Sample ID |
 | classifiable_reads | Total classifiable reads |
-| duplicate_rate | PCR duplicate rate (Tn5) |
+| duplicate_rate | PCR duplicate rate |
 | Dedup_WT_% | Wild-type % (deduplicated) |
 | Dedup_HDR_% | HDR % (deduplicated) |
 | Dedup_NHEJ_% | NHEJ % (deduplicated) |
 | Dedup_LgDel_% | Large deletion % |
 | kmer_hdr_rate | K-mer method HDR rate |
 | crispresso_hdr_rate | CRISPResso2 HDR rate |
+| crispresso_indel_rate | CRISPResso2 indel rate |
+
+For Tn5/tagmented data or TruSeq amplicons with UMIs, TRACE will report on the PCR duplication rate and automatically perform deduplication:
+- **TruSeq with UMIs**: Pre-alignment UMI-based deduplication
+- **Tn5**: Post-alignment position-based deduplication
 
 ## Dependencies
 
