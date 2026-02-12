@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trace-crispr"
+version = "0.1.0"
+description = "TRACE: Triple-aligner Read Analysis for CRISPR Editing"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Kevin R. Roy", email = "kevinroy@stanford.edu"}]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+requires-python = ">=3.9"
+dependencies = [
+    "click>=8.0",
+    "pysam>=0.20",
+    "pandas>=1.5",
+    "numpy>=1.20",
+    "pyyaml>=6.0",
+    "rapidfuzz>=3.0",
+    "tqdm>=4.60",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "black",
+    "ruff",
+    "mypy",
+]
+visualization = [
+    "matplotlib>=3.5",
+    "seaborn>=0.12",
+]
+
+[project.scripts]
+trace = "trace_crispr.cli:cli"
+
+[project.urls]
+Homepage = "https://github.com/k-roy/trace"
+Documentation = "https://trace-crispr.readthedocs.io"
+Repository = "https://github.com/k-roy/trace"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.setuptools.package-data]
+trace_crispr = ["templates/*"]
+
+[tool.black]
+line-length = 100
+target-version = ['py39', 'py310', 'py311']
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "I", "N", "W"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
