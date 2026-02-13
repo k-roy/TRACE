@@ -99,22 +99,22 @@ This will print:
 === TRACE Analysis Configuration ===
 ============================================================
 
-Reference sequence: 500 bp
-HDR template: 500 bp
+Reference sequence: 169 bp
+HDR template: 169 bp
 
 Donor template analysis:
-  - Left homology arm: positions 1-245 on reference (245 bp)
-  - Right homology arm: positions 255-500 on reference (245 bp)
+  - Left homology arm: positions 1-70 on reference (70 bp)
+  - Right homology arm: positions 73-169 on reference (97 bp)
 
   Edits detected (2 total):
-    * Position 246: C -> G (substitution)
-    * Position 247: C -> T (substitution)
+    * Position 71: C -> G (substitution)
+    * Position 72: C -> T (substitution)
 
 Guide analysis:
   - Guide sequence: GCTGAAGCACTGCACGCCGT
-  - Guide targets: positions 248-267 on reference (- strand)
-  - PAM: GGG at positions 245-247 on reference
-  - Cleavage site: position 248 on reference
+  - Guide targets: positions 73-92 on reference (- strand)
+  - PAM: CCC at positions 70-72 on reference
+  - Cleavage site: position 76 on reference
 ```
 
 ### Multiple samples
@@ -236,10 +236,10 @@ The main output is a TSV file with per-sample editing outcomes:
 | sample | Sample ID |
 | classifiable_reads | Total classifiable reads |
 | duplicate_rate | PCR duplicate rate |
-| Dedup_WT_% | Wild-type % (deduplicated) |
-| Dedup_HDR_% | HDR % (deduplicated) |
-| Dedup_NHEJ_% | NHEJ % (deduplicated) |
-| Dedup_LgDel_% | Large deletion % |
+| WT_% | Wild-type % |
+| HDR_% | HDR % |
+| NHEJ_% | NHEJ % |
+| LgDel_% | Large deletion % |
 | kmer_hdr_rate | K-mer method HDR rate |
 | crispresso_hdr_rate | CRISPResso2 HDR rate |
 | crispresso_indel_rate | CRISPResso2 indel rate |
