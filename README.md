@@ -99,22 +99,22 @@ This will print:
 === TRACE Analysis Configuration ===
 ============================================================
 
-Reference sequence: 169 bp
-HDR template: 169 bp
+Reference sequence: 250 bp
+HDR template: 250 bp
 
 Donor template analysis:
-  - Left homology arm: positions 1-70 on reference (70 bp)
-  - Right homology arm: positions 73-169 on reference (97 bp)
+  - Left homology arm: positions 1-110 on reference (110 bp)
+  - Right homology arm: positions 113-250 on reference (138 bp)
 
   Edits detected (2 total):
-    * Position 71: C -> G (substitution)
-    * Position 72: C -> T (substitution)
+    * Position 111: C -> G (substitution)
+    * Position 112: C -> T (substitution)
 
 Guide analysis:
   - Guide sequence: GCTGAAGCACTGCACGCCGT
-  - Guide targets: positions 73-92 on reference (- strand)
-  - PAM: CCC at positions 70-72 on reference
-  - Cleavage site: position 76 on reference
+  - Guide targets: positions 113-132 on reference (- strand)
+  - PAM: CCC at positions 110-112 on reference
+  - Cleavage site: position 116 on reference
 ```
 
 ### Multiple samples
