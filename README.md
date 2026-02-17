@@ -11,10 +11,31 @@ TRACE is a comprehensive tool for quantifying CRISPR editing outcomes from ampli
 - **Automatic inference**: Detects PAM, cleavage site, homology arms, and edits from sequences
 - **Large edit support**: Handles insertions up to 50+ bp with automatic k-mer size adjustment
 - **K-mer classification**: Fast pre-alignment HDR/WT detection (auto-sizes k-mers based on edit)
+- **Barcode-optimized k-mers**: Auto-detects barcode-style templates and generates discriminating k-mers
 - **Multi-nuclease support**: Cas9 and Cas12a (Cpf1) with correct cleavage geometry
+- **Robust UMI detection**: 3-pass algorithm handles variable primer quality and low-signal libraries
 - **Auto-detection**: Library type (TruSeq/Tn5), UMI presence, read merging need
 - **PCR deduplication**: Automatic UMI-based (TruSeq) or position-based (Tn5) deduplication
 - **CRISPResso2 integration**: Validation with standard CRISPR analysis tool
+
+## Recent Updates
+
+### Version 0.3.1 (2026-02-17)
+
+**Critical Bug Fixes:**
+- **3-pass UMI detection algorithm**: Dramatically improves merge rates for libraries with weak primer signals
+  - Pass 1: Strong signal detection (>50% consensus) - high confidence
+  - Pass 2: Weak signal detection (>30% consensus, ≥4bp UMI) - medium confidence
+  - Pass 3: Jump detection with 6bp fallback - handles poor quality data
+  - **Impact**: Merge rate improved from 35% to 92.5% on HEK293 EMX1 test dataset (80 samples)
+
+**Optimizations:**
+- **Barcode-style template auto-detection**: Automatically identifies when templates share homology arms with different barcodes
+- **Optimized k-mer generation**: Generates k-mers that span barcode boundaries for better discrimination
+- **Multi-template batch processing**: ~100x faster classification through global sequence deduplication
+
+**Dependencies:**
+- Added CRISPResso2 to optional validation dependencies (`pip install trace-crispr[validation]`)
 
 ## Installation
 
