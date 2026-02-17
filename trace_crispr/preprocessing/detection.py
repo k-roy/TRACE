@@ -521,12 +521,40 @@ def detect_umi_length(
                 top_kmers.append((pos, "", 0))
 
         # Find the position where diversity drops significantly (primer starts)
-        # Look for position where top_fraction jumps above 0.3 (30% of reads have same kmer)
+        # Use three-pass approach to handle variable primer quality
+        # Pass 1: Strong signal (>50% consensus) - high confidence
+        # Pass 2: Weak signal (>30% consensus, ≥4bp UMI) - medium confidence
+        # Pass 3: Best available signal (≥5bp position) - low confidence fallback
         umi_length = 0
+
+        # Pass 1: Strong threshold (0.5)
         for pos, diversity, top_fraction in diversity_scores:
-            if top_fraction > 0.3 and pos > 0:
+            if top_fraction > 0.5 and pos > 0:
                 umi_length = pos
                 break
+
+        # Pass 2: Weak threshold (0.3), require at least 4bp UMI
+        if umi_length == 0:
+            for pos, diversity, top_fraction in diversity_scores:
+                if top_fraction > 0.3 and pos > 3:
+                    umi_length = pos
+                    break
+
+        # Pass 3: Best available signal (for poor quality data)
+        # Find FIRST position in range 4-8 where top_fraction shows significant increase
+        if umi_length == 0:
+            prev_frac = 0
+            for pos, diversity, top_fraction in diversity_scores:
+                if 4 <= pos <= 8:
+                    # Look for jump of >10% indicating primer start
+                    if top_fraction > 0.15 and (top_fraction - prev_frac) > 0.10:
+                        umi_length = pos
+                        break
+                    prev_frac = top_fraction
+
+            # If still no detection, default to 6bp (safe fallback for failed detection)
+            if umi_length == 0 and len(diversity_scores) > 6:
+                umi_length = 6
 
         # Get the primer sequence at the detected boundary
         primer_seq = ""

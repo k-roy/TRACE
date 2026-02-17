@@ -262,14 +262,16 @@ class LocusConfig:
         # Find where HDR template best aligns in reference
         self.template_offset = self._find_template_alignment(ref_upper, hdr_upper)
 
-        # Calculate where HDR template ends in reference coordinates
-        # This is used to properly bound homology arm calculations
-        self.template_end_in_ref = self.template_offset + len(hdr_upper)
+        # For reference region extraction, we need to handle insertions in the template.
+        # If template has a net insertion of N bp, it covers len(template) - N bp of reference.
+        # Since we don't know N yet, extract more reference and let NW alignment handle gaps.
+        # Extract reference with extra padding to allow for insertions up to 50bp.
+        padding = 50  # Allow for up to 50bp net insertion in template
+        ref_region_end = min(len(ref_upper), self.template_offset + len(hdr_upper) + padding)
+        ref_region = ref_upper[self.template_offset:ref_region_end]
 
-        # Get the reference region that aligns with the template
-        # IMPORTANT: Don't extend beyond template length to avoid spurious deletions
-        # The Needleman-Wunsch alignment handles insertions within the template
-        ref_region = ref_upper[self.template_offset:self.template_end_in_ref]
+        # Calculate where HDR template ends in reference coordinates (will be refined after alignment)
+        self.template_end_in_ref = self.template_offset + len(hdr_upper)
 
         # Align sequences to detect substitutions, insertions, and deletions
         aligned_ref, aligned_hdr = self._align_sequences(ref_region, hdr_upper)
@@ -281,17 +283,32 @@ class LocusConfig:
         """
         Find the best position to align HDR template within reference.
 
-        Tries multiple anchors (left, middle, right) to find the best alignment.
-        This handles cases where the left portion of the template may not be unique.
+        Priority:
+        1. If the left anchor (template start) matches exactly, use that offset
+        2. Otherwise try other anchors with scoring
+
+        This is important for HDR templates with insertions: the template starts
+        with a matching homology arm, and after the insertion the positions shift.
+        Position-by-position scoring fails in this case, so we trust the left anchor.
         """
         max_offset = max(0, len(ref) - len(hdr) + 50)  # Allow some slack for indels
 
-        # Try different anchor positions
+        # PRIORITY 1: Try left anchor first (template start)
+        # HDR templates should start with a matching homology arm
+        left_anchor_len = min(30, len(hdr) // 4)
+        if left_anchor_len >= 10:
+            left_anchor = hdr[:left_anchor_len]
+            pos = ref.find(left_anchor)
+            if pos != -1 and 0 <= pos <= max_offset:
+                # Left anchor has exact match - use this offset
+                # This handles templates with insertions correctly
+                return pos
+
+        # PRIORITY 2: Try other anchors if left anchor didn't match
         anchor_positions = [
-            (0, min(30, len(hdr) // 4)),                           # Left anchor
             (len(hdr) // 4, len(hdr) // 4 + min(30, len(hdr) // 4)),    # Left-center
-            (len(hdr) // 2 - 15, len(hdr) // 2 + 15),              # Center anchor
-            (max(0, len(hdr) - 30), len(hdr)),                     # Right anchor
+            (len(hdr) // 2 - 15, len(hdr) // 2 + 15),                   # Center anchor
+            (max(0, len(hdr) - 30), len(hdr)),                          # Right anchor
         ]
 
         best_offset = 0
@@ -340,18 +357,16 @@ class LocusConfig:
 
     def _align_sequences(self, ref: str, hdr: str) -> Tuple[str, str]:
         """
-        Simple Needleman-Wunsch alignment for detecting indels.
+        Needleman-Wunsch alignment for detecting indels.
 
         Returns aligned sequences with gaps represented as '-'.
+
+        Always uses dynamic programming alignment to properly detect insertions,
+        even when sequences are similar length (template may have insertion
+        that offsets positions).
         """
-        # Simple implementation for small sequences
-        # For large indels, we need proper alignment
-
-        # If lengths are similar (within 5bp), do direct comparison
-        if abs(len(ref) - len(hdr)) <= 5 and len(ref) < 500:
-            return self._simple_align(ref[:len(hdr)], hdr)
-
-        # For larger differences, use dynamic programming
+        # Always use dynamic programming for proper insertion/deletion detection
+        # The simple_align approach fails when template has insertions
         return self._needleman_wunsch(ref, hdr)
 
     def _simple_align(self, ref: str, hdr: str) -> Tuple[str, str]:
@@ -598,19 +613,138 @@ class MultiTemplateLocusConfig:
         """
         Analyze all templates and populate inferred values.
 
-        For each template, detects:
-        - Template offset (where it aligns in reference)
-        - Edits (substitutions, insertions, deletions)
-        - Template end position
+        For barcode templates (same structure, different barcodes), uses a
+        simplified approach that directly identifies the barcode region.
 
         Also detects guide position and homology arms (shared across templates).
         """
         # First, find guide position (same for all templates)
         self._find_guide_and_pam()
 
-        # Process each template
+        # Check if this is a barcode-style template set (same structure, different inserts)
+        if self._is_barcode_template_set():
+            self._analyze_barcode_templates()
+        else:
+            self._analyze_general_templates()
+
+        return self
+
+    def _is_barcode_template_set(self) -> bool:
+        """
+        Check if templates share common flanking sequences (barcode-style).
+
+        Returns True if all templates have the same prefix and suffix,
+        differing only in a middle "barcode" region.
+        """
+        if len(self.hdr_templates) < 2:
+            return False
+
+        templates = list(self.hdr_templates.values())
+        first = templates[0].upper()
+
+        # Find common prefix length
+        min_prefix = len(first)
+        for t in templates[1:]:
+            t_upper = t.upper()
+            common = 0
+            for i in range(min(len(first), len(t_upper))):
+                if first[i] == t_upper[i]:
+                    common += 1
+                else:
+                    break
+            min_prefix = min(min_prefix, common)
+
+        # Find common suffix length
+        min_suffix = len(first)
+        for t in templates[1:]:
+            t_upper = t.upper()
+            common = 0
+            for i in range(1, min(len(first), len(t_upper)) + 1):
+                if first[-i] == t_upper[-i]:
+                    common += 1
+                else:
+                    break
+            min_suffix = min(min_suffix, common)
+
+        # If there's a significant common prefix and suffix, it's barcode-style
+        # Require at least 20bp on each side
+        return min_prefix >= 20 and min_suffix >= 20
+
+    def _analyze_barcode_templates(self):
+        """
+        Analyze templates with barcode-style structure.
+
+        All templates share common flanking sequences and differ only
+        in the barcode region. Generate edit positions for the barcode
+        boundaries (where discriminating k-mers should be generated).
+        """
+        templates = list(self.hdr_templates.values())
+        template_ids = list(self.hdr_templates.keys())
+        first = templates[0].upper()
+
+        # Find common prefix and suffix lengths
+        prefix_len = len(first)
+        suffix_len = len(first)
+
+        for t in templates[1:]:
+            t_upper = t.upper()
+
+            # Update prefix length
+            common = 0
+            for i in range(min(prefix_len, len(t_upper))):
+                if first[i] == t_upper[i]:
+                    common += 1
+                else:
+                    break
+            prefix_len = common
+
+            # Update suffix length
+            common = 0
+            for i in range(1, min(suffix_len, len(t_upper)) + 1):
+                if first[-i] == t_upper[-i]:
+                    common += 1
+                else:
+                    break
+            suffix_len = common
+
+        # Calculate barcode region
+        barcode_start = prefix_len
+        barcode_len = len(first) - prefix_len - suffix_len
+
+        # Find template offset in reference (using first template)
+        first_anchor = first[:min(30, prefix_len)]
+        ref_upper = self.reference.upper()
+        offset = ref_upper.find(first_anchor)
+        if offset == -1:
+            offset = 0  # Fallback
+
+        # Generate edit positions for barcode region
+        # Include positions spanning the barcode boundaries (for k-mer generation)
+        barcode_end = barcode_start + barcode_len
+
         for template_id, template_seq in self.hdr_templates.items():
-            # Create a temporary LocusConfig to leverage existing analysis
+            # Create EditInfo objects for the barcode region
+            # Each position in the barcode is an "edit" for k-mer purposes
+            edits = []
+            for pos in range(barcode_start, barcode_end):
+                edits.append(EditInfo(
+                    position=offset + pos,  # Position in reference coordinates
+                    ref_bases='',  # Reference doesn't have this insertion
+                    hdr_bases=template_seq[pos].upper(),
+                    edit_type='insertion',
+                ))
+
+            self.template_edits[template_id] = edits
+            self.template_offsets[template_id] = offset
+            self.template_ends[template_id] = offset + len(template_seq) - barcode_len  # Account for insertion
+
+    def _analyze_general_templates(self):
+        """
+        Analyze templates using the general LocusConfig approach.
+
+        For templates without a clear barcode structure.
+        """
+        for template_id, template_seq in self.hdr_templates.items():
             temp_locus = LocusConfig(
                 name=f"{self.name}_{template_id}",
                 reference=self.reference,
@@ -620,7 +754,6 @@ class MultiTemplateLocusConfig:
             )
             temp_locus.analyze()
 
-            # Extract per-template values
             self.template_edits[template_id] = temp_locus.edits
             self.template_offsets[template_id] = temp_locus.template_offset
             self.template_ends[template_id] = getattr(
@@ -628,11 +761,8 @@ class MultiTemplateLocusConfig:
                 temp_locus.template_offset + len(template_seq)
             )
 
-            # Use first template's homology arms as representative
             if self.homology_arms is None and temp_locus.homology_arms:
                 self.homology_arms = temp_locus.homology_arms
-
-        return self
 
     def _find_guide_and_pam(self):
         """Find guide position and infer PAM/cleavage site."""

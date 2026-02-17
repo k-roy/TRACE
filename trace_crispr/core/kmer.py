@@ -261,6 +261,10 @@ class MultiTemplateKmerClassifier:
         """
         Create classifier from multiple HDR templates.
 
+        For barcode-style templates (same flanking sequences, different middle),
+        generates k-mers that span the barcode boundaries to discriminate between
+        templates.
+
         Args:
             reference: Wild-type reference sequence
             hdr_templates: Dict mapping template_id → HDR template sequence
@@ -271,8 +275,218 @@ class MultiTemplateKmerClassifier:
         Returns:
             MultiTemplateKmerClassifier instance
         """
-        # Generate WT k-mers (shared across templates)
-        # Use edit positions from first template to get representative WT k-mers
+        # Detect if this is a barcode-style template set
+        is_barcode_style = cls._detect_barcode_templates(hdr_templates)
+
+        if is_barcode_style:
+            return cls._from_barcode_templates(
+                reference, hdr_templates, kmer_size, contamination_sequence
+            )
+        else:
+            return cls._from_general_templates(
+                reference, hdr_templates, edit_positions_by_template,
+                kmer_size, contamination_sequence
+            )
+
+    @classmethod
+    def _detect_barcode_templates(cls, hdr_templates: Dict[str, str]) -> bool:
+        """Check if templates have barcode-style structure (shared flanks)."""
+        if len(hdr_templates) < 2:
+            return False
+
+        templates = list(hdr_templates.values())
+        first = templates[0].upper()
+
+        # Find common prefix length
+        min_prefix = len(first)
+        for t in templates[1:]:
+            t_upper = t.upper()
+            common = 0
+            for i in range(min(len(first), len(t_upper))):
+                if first[i] == t_upper[i]:
+                    common += 1
+                else:
+                    break
+            min_prefix = min(min_prefix, common)
+
+        # Find common suffix length
+        min_suffix = len(first)
+        for t in templates[1:]:
+            t_upper = t.upper()
+            common = 0
+            for i in range(1, min(len(first), len(t_upper)) + 1):
+                if first[-i] == t_upper[-i]:
+                    common += 1
+                else:
+                    break
+            min_suffix = min(min_suffix, common)
+
+        # Barcode style if significant common prefix and suffix
+        return min_prefix >= 20 and min_suffix >= 20
+
+    @classmethod
+    def _from_barcode_templates(
+        cls,
+        reference: str,
+        hdr_templates: Dict[str, str],
+        kmer_size: int,
+        contamination_sequence: Optional[str],
+    ) -> 'MultiTemplateKmerClassifier':
+        """
+        Create classifier for barcode-style templates.
+
+        For barcoded experiments, k-mers must SPAN the entire barcode plus
+        flanking bases to ensure uniqueness. K-mer size is automatically
+        increased to barcode_size + buffer (minimum 10bp buffer).
+
+        Example: For 10bp barcodes with 20bp k-mers (10bp + 10bp buffer):
+        - 9bp_left + 10bp_barcode + 1bp_right
+        - 5bp_left + 10bp_barcode + 5bp_right
+        - 1bp_left + 10bp_barcode + 9bp_right
+        """
+        templates = list(hdr_templates.values())
+        first = templates[0].upper()
+
+        # Find common prefix and suffix lengths (shared homology arms)
+        prefix_len = len(first)
+        suffix_len = len(first)
+
+        for t in templates[1:]:
+            t_upper = t.upper()
+            # Update prefix
+            common = 0
+            for i in range(min(prefix_len, len(t_upper))):
+                if first[i] == t_upper[i]:
+                    common += 1
+                else:
+                    break
+            prefix_len = common
+
+            # Update suffix
+            common = 0
+            for i in range(1, min(suffix_len, len(t_upper)) + 1):
+                if first[-i] == t_upper[-i]:
+                    common += 1
+                else:
+                    break
+            suffix_len = common
+
+        # Barcode region in template coordinates
+        barcode_start = prefix_len
+        barcode_len = len(first) - prefix_len - suffix_len
+        barcode_end = barcode_start + barcode_len
+
+        # For barcode templates, k-mer size must span the entire barcode + buffer
+        # Minimum k-mer size = barcode_len + 10 (5bp on each side minimum)
+        min_kmer_size = barcode_len + 10
+        effective_kmer_size = max(kmer_size, min_kmer_size)
+
+        # Find where templates align in reference
+        first_anchor = first[:min(30, prefix_len)]
+        ref_upper = reference.upper()
+        ref_offset = ref_upper.find(first_anchor)
+        if ref_offset == -1:
+            ref_offset = 0
+
+        # WT k-mers: k-mers from reference spanning where barcode would be inserted
+        all_wt_kmers: Set[str] = set()
+        ref_barcode_pos = ref_offset + barcode_start
+
+        for start in range(max(0, ref_barcode_pos - effective_kmer_size + 1),
+                          min(len(reference) - effective_kmer_size + 1, ref_barcode_pos + 1)):
+            kmer = reference[start:start + effective_kmer_size].upper()
+            all_wt_kmers.add(kmer)
+            all_wt_kmers.add(reverse_complement(kmer))
+
+        # HDR k-mers per template: k-mers that SPAN the entire barcode
+        hdr_kmers_by_template: Dict[str, Set[str]] = {}
+
+        for template_id, template_seq in hdr_templates.items():
+            template_upper = template_seq.upper()
+            hdr_kmers: Set[str] = set()
+
+            # Generate k-mers that fully span the barcode
+            # K-mer must contain entire barcode: start <= barcode_start AND end >= barcode_end
+            # With k-mer size K and barcode length B:
+            # - Earliest start: barcode_end - K (so k-mer ends at barcode_end)
+            # - Latest start: barcode_start (so k-mer starts at barcode_start)
+            # Valid starts: max(0, barcode_end - K) to min(barcode_start, len - K)
+
+            earliest_start = max(0, barcode_end - effective_kmer_size)
+            latest_start = min(barcode_start, len(template_upper) - effective_kmer_size)
+
+            for start in range(earliest_start, latest_start + 1):
+                end = start + effective_kmer_size
+                # Verify this k-mer spans the entire barcode
+                if start <= barcode_start and end >= barcode_end:
+                    kmer = template_upper[start:end]
+                    hdr_kmers.add(kmer)
+                    hdr_kmers.add(reverse_complement(kmer))
+
+            # Remove any WT k-mers (shouldn't be any, but be safe)
+            hdr_kmers_by_template[template_id] = hdr_kmers - all_wt_kmers
+
+        # Verify uniqueness - if k-mers are shared, increase k-mer size dynamically
+        # Continue increasing until uniqueness is achieved or max size is reached
+        all_hdr = []
+        for kmers in hdr_kmers_by_template.values():
+            all_hdr.extend(kmers)
+        from collections import Counter
+        kmer_counts = Counter(all_hdr)
+        shared_count = sum(1 for c in kmer_counts.values() if c > 1)
+
+        # Maximum k-mer size: template length minus small buffer for flanking
+        min_template_len = min(len(t) for t in hdr_templates.values())
+        max_kmer_size = min_template_len - 4  # Leave 2bp on each side
+
+        if shared_count > 0 and effective_kmer_size < max_kmer_size:
+            # Dynamically increase k-mer size until uniqueness achieved
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.debug(
+                f"K-mer size {effective_kmer_size}bp has {shared_count} shared k-mers, "
+                f"increasing to {effective_kmer_size + 2}bp"
+            )
+            return cls._from_barcode_templates(
+                reference, hdr_templates, effective_kmer_size + 2, contamination_sequence
+            )
+
+        # Warn if uniqueness still not achieved at max size
+        if shared_count > 0:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                f"Could not achieve k-mer uniqueness even at {effective_kmer_size}bp. "
+                f"{shared_count} k-mers are shared between templates. "
+                f"Classification may have reduced accuracy."
+            )
+
+        # Contamination k-mers
+        contamination_kmers: Set[str] = set()
+        if contamination_sequence:
+            contamination_kmers = extract_unique_kmers(
+                contamination_sequence,
+                kmer_size=effective_kmer_size,
+                exclude_sequences=[reference] + list(hdr_templates.values()),
+            )
+
+        return cls(
+            wt_kmers=all_wt_kmers,
+            hdr_kmers_by_template=hdr_kmers_by_template,
+            contamination_kmers=contamination_kmers,
+            kmer_size=effective_kmer_size,
+        )
+
+    @classmethod
+    def _from_general_templates(
+        cls,
+        reference: str,
+        hdr_templates: Dict[str, str],
+        edit_positions_by_template: Dict[str, List[int]],
+        kmer_size: int,
+        contamination_sequence: Optional[str],
+    ) -> 'MultiTemplateKmerClassifier':
+        """Create classifier using general edit position approach."""
         all_wt_kmers: Set[str] = set()
         hdr_kmers_by_template: Dict[str, Set[str]] = {}
 
@@ -280,35 +494,18 @@ class MultiTemplateKmerClassifier:
             edit_positions = edit_positions_by_template.get(template_id, [])
 
             if not edit_positions:
-                # No edits detected, skip this template
                 hdr_kmers_by_template[template_id] = set()
                 continue
 
-            # Generate WT and HDR k-mers for this template
             wt_kmers, hdr_kmers = generate_edit_kmers(
                 reference, template_seq, edit_positions, kmer_size
             )
-
-            # Add WT k-mers to shared set
             all_wt_kmers.update(wt_kmers)
-
-            # Remove any WT k-mers that might appear in this template's HDR set
-            # (shouldn't happen normally, but be safe)
             hdr_only = hdr_kmers - all_wt_kmers
             hdr_kmers_by_template[template_id] = hdr_only
 
-        # Remove any HDR k-mers that appear in multiple templates
-        # These would cause ambiguous classifications
-        # (Actually, we want to keep them - the classifier will handle ambiguity)
-
-        # Generate contamination k-mers if provided
         contamination_kmers: Set[str] = set()
         if contamination_sequence:
-            # Get k-mers unique to contamination
-            all_hdr_kmers = set()
-            for kmers in hdr_kmers_by_template.values():
-                all_hdr_kmers.update(kmers)
-
             contamination_kmers = extract_unique_kmers(
                 contamination_sequence,
                 kmer_size=kmer_size,
