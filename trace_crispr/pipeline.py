@@ -12,9 +12,12 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import logging
 import pysam
 
-from .config import LocusConfig, PipelineConfig
+from .config import LocusConfig, PipelineConfig, MultiTemplateLocusConfig
 from .io.sample_key import Sample
-from .io.output import SampleResult, write_results_tsv, generate_summary_report
+from .io.output import (
+    SampleResult, write_results_tsv, generate_summary_report,
+    MultiTemplateSampleResult, write_multi_template_results
+)
 from .preprocessing.detection import run_auto_detection, AutoDetectionResults
 from .preprocessing.trimming import trim_adapters
 from .preprocessing.contamination import filter_contamination_fastq, create_contamination_filter
@@ -30,7 +33,10 @@ from .core.classification import (
     classify_read, get_hdr_signature_positions, summarize_classifications,
     EditingOutcome, ClassificationResult
 )
-from .core.kmer import KmerClassifier, classify_fastq_kmer
+from .core.kmer import (
+    KmerClassifier, classify_fastq_kmer,
+    MultiTemplateKmerClassifier, classify_fastq_multi_template
+)
 
 logger = logging.getLogger(__name__)
 
@@ -422,4 +428,230 @@ def run_pipeline(
     )
 
     pipeline = EditingPipeline(config)
+    return pipeline.run()
+
+
+@dataclass
+class MultiTemplatePipelineConfig:
+    """Configuration for multi-template pipeline."""
+    locus: MultiTemplateLocusConfig
+    samples: List[Sample]
+    output_dir: Path
+
+    # Column in sample metadata containing expected template ID
+    expected_template_column: str = "expected_barcode"
+
+    # Library type (auto-detected if None)
+    library_type: Optional[str] = None
+
+    # Contaminant filtering
+    contaminant_sequence: Optional[str] = None
+    contaminant_kmer_size: int = 12
+
+    # Processing options
+    threads: int = 4
+    kmer_size: int = 12
+    min_read_length: int = 50
+
+    # Alignment options
+    aligners: List[str] = None
+
+    # Classification thresholds
+    hdr_threshold: float = 0.8
+    large_deletion_min: int = 21
+    analysis_window: int = 20
+
+    # CRISPResso integration
+    run_crispresso: bool = True
+
+    def __post_init__(self):
+        if self.aligners is None:
+            self.aligners = ['bwa', 'bbmap', 'minimap2']
+
+
+class MultiTemplateEditingPipeline:
+    """
+    Pipeline supporting multiple HDR templates.
+
+    Used for barcode screening experiments where each sample may have
+    a different expected barcode, but we want to check for all possible
+    barcodes in each sample.
+    """
+
+    def __init__(self, config: MultiTemplatePipelineConfig):
+        self.config = config
+        self.locus = config.locus
+        self.aligner_manager = AlignerManager()
+
+        # Prepare multi-template k-mer classifier
+        self._prepare_multi_template_classifier()
+
+    def _prepare_multi_template_classifier(self):
+        """Prepare k-mer classifier for all templates."""
+        edit_positions_by_template = self.locus.get_edit_positions_by_template()
+
+        # Determine optimal k-mer size
+        kmer_size = max(self.config.kmer_size, self.locus.recommended_kmer_size())
+        if kmer_size != self.config.kmer_size:
+            logger.info(f"Adjusting k-mer size to {kmer_size} based on edit sizes")
+
+        self.kmer_classifier = MultiTemplateKmerClassifier.from_multi_template(
+            reference=self.locus.reference,
+            hdr_templates=self.locus.hdr_templates,
+            edit_positions_by_template=edit_positions_by_template,
+            contamination_sequence=self.config.contaminant_sequence,
+            kmer_size=kmer_size,
+        )
+
+        logger.info(f"Created multi-template classifier with {len(self.locus.hdr_templates)} templates")
+
+    def run(self, samples: List[Sample] = None) -> List[MultiTemplateSampleResult]:
+        """
+        Run the full multi-template pipeline.
+
+        Args:
+            samples: List of samples to process (uses config.samples if None)
+
+        Returns:
+            List of MultiTemplateSampleResult objects
+        """
+        if samples is None:
+            samples = self.config.samples
+
+        # Check aligner availability
+        missing = self.aligner_manager.check_requirements()
+        if missing:
+            logger.warning(
+                f"Missing aligners: {missing}. "
+                "Install with: conda install -c bioconda bwa bbmap minimap2"
+            )
+
+        # Create output directory
+        self.config.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create reference FASTA
+        ref_fasta = self.config.output_dir / "reference.fasta"
+        create_reference_fasta(self.locus.reference, ref_fasta)
+
+        # Process samples
+        results = []
+        for i, sample in enumerate(samples):
+            logger.info(f"Processing sample {i+1}/{len(samples)}: {sample.sample_id}")
+
+            try:
+                result = self._process_sample(sample, ref_fasta)
+                results.append(result)
+            except Exception as e:
+                logger.error(f"Error processing {sample.sample_id}: {e}")
+                import traceback
+                traceback.print_exc()
+                results.append(MultiTemplateSampleResult(
+                    sample_id=sample.sample_id,
+                    total_reads=0,
+                    aligned_reads=0,
+                    metadata=sample.metadata,
+                ))
+
+        # Write output files
+        write_multi_template_results(results, self.config.output_dir)
+
+        logger.info(f"Pipeline complete. Results in {self.config.output_dir}")
+
+        return results
+
+    def _process_sample(
+        self,
+        sample: Sample,
+        ref_fasta: Path,
+    ) -> MultiTemplateSampleResult:
+        """Process a single sample through the multi-template pipeline."""
+        sample_dir = self.config.output_dir / sample.sample_id
+        sample_dir.mkdir(parents=True, exist_ok=True)
+
+        # Step 1: Multi-template k-mer classification (pre-alignment)
+        logger.info(f"  Running multi-template k-mer classification...")
+        kmer_results = classify_fastq_multi_template(
+            sample.r1_path,
+            sample.r2_path,
+            self.kmer_classifier,
+        )
+
+        # Get expected template for this sample
+        expected_template = sample.metadata.get(
+            self.config.expected_template_column
+        )
+        if expected_template and str(expected_template).upper() in ('NA', 'NAN', ''):
+            expected_template = None
+
+        # Build result from k-mer classification
+        # (Full implementation would also do alignment-based classification)
+        result = MultiTemplateSampleResult(
+            sample_id=sample.sample_id,
+            total_reads=kmer_results.total_reads,
+            aligned_reads=kmer_results.total_reads,  # Approximation for k-mer-only
+            hdr_counts_by_template=kmer_results.hdr_counts_by_template.copy(),
+            wt_count=kmer_results.wt_count,
+            nhej_count=0,  # K-mer classification doesn't detect NHEJ
+            large_del_count=0,  # K-mer classification doesn't detect large deletions
+            ambiguous_count=kmer_results.ambiguous_count,
+            expected_template=str(expected_template) if expected_template else None,
+            metadata=sample.metadata,
+        )
+
+        return result
+
+
+def run_multi_template_pipeline(
+    reference: str,
+    hdr_templates: Dict[str, str],
+    guide: str,
+    samples: List[Sample],
+    output_dir: Path,
+    nuclease: str = 'cas9',
+    expected_template_column: str = 'expected_barcode',
+    threads: int = 4,
+    run_crispresso: bool = False,
+    contaminant: Optional[str] = None,
+) -> List[MultiTemplateSampleResult]:
+    """
+    Convenience function to run the multi-template pipeline.
+
+    Args:
+        reference: Reference sequence
+        hdr_templates: Dict mapping template_id → HDR template sequence
+        guide: Guide sequence
+        samples: List of Sample objects
+        output_dir: Output directory
+        nuclease: 'cas9' or 'cas12a'
+        expected_template_column: Column in sample metadata with expected template
+        threads: Number of threads
+        run_crispresso: Run CRISPResso2 validation (not yet implemented for multi-template)
+        contaminant: Optional contamination sequence
+
+    Returns:
+        List of MultiTemplateSampleResult objects
+    """
+    from .config import MultiTemplateLocusConfig, NucleaseType
+
+    nuclease_type = NucleaseType.CAS9 if nuclease == 'cas9' else NucleaseType.CAS12A
+
+    locus = MultiTemplateLocusConfig(
+        name="analysis",
+        reference=reference,
+        hdr_templates=hdr_templates,
+        guide=guide,
+        nuclease=nuclease_type,
+    ).analyze()
+
+    config = MultiTemplatePipelineConfig(
+        locus=locus,
+        samples=samples,
+        output_dir=output_dir,
+        expected_template_column=expected_template_column,
+        threads=threads,
+        run_crispresso=run_crispresso,
+        contaminant_sequence=contaminant,
+    )
+
+    pipeline = MultiTemplateEditingPipeline(config)
     return pipeline.run()

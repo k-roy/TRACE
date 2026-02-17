@@ -262,14 +262,14 @@ class LocusConfig:
         # Find where HDR template best aligns in reference
         self.template_offset = self._find_template_alignment(ref_upper, hdr_upper)
 
-        # Get the reference region that should align with the template
-        # Allow extra room for potential insertions in the template
-        template_in_ref_len = len(hdr_upper)
-        ref_region_end = min(
-            self.template_offset + template_in_ref_len + 100,
-            len(ref_upper)
-        )
-        ref_region = ref_upper[self.template_offset:ref_region_end]
+        # Calculate where HDR template ends in reference coordinates
+        # This is used to properly bound homology arm calculations
+        self.template_end_in_ref = self.template_offset + len(hdr_upper)
+
+        # Get the reference region that aligns with the template
+        # IMPORTANT: Don't extend beyond template length to avoid spurious deletions
+        # The Needleman-Wunsch alignment handles insertions within the template
+        ref_region = ref_upper[self.template_offset:self.template_end_in_ref]
 
         # Align sequences to detect substitutions, insertions, and deletions
         aligned_ref, aligned_hdr = self._align_sequences(ref_region, hdr_upper)
@@ -488,16 +488,26 @@ class LocusConfig:
                 i += 1
 
     def _detect_homology_arms(self):
-        """Detect homology arm boundaries from edit positions."""
+        """Detect homology arm boundaries from edit positions.
+
+        Homology arms are calculated relative to the HDR template's position
+        in the reference, not the full reference length. This properly handles
+        shorter HDR templates (e.g., 150bp template in 250bp amplicon).
+        """
+        # Use template bounds, not full reference
+        template_start = self.template_offset
+        template_end = getattr(self, 'template_end_in_ref',
+                               self.template_offset + len(self.hdr_template))
+
         if not self.edits:
-            # No edits, entire sequence is homology
+            # No edits, entire template region is homology
             self.homology_arms = HomologyArms(
-                left_start=0,
-                left_end=len(self.reference),
-                left_length=len(self.reference),
-                right_start=0,
-                right_end=len(self.reference),
-                right_length=len(self.reference),
+                left_start=template_start,
+                left_end=template_end,
+                left_length=template_end - template_start,
+                right_start=template_start,
+                right_end=template_end,
+                right_length=template_end - template_start,
             )
             return
 
@@ -505,12 +515,12 @@ class LocusConfig:
         last_edit = max(e.position for e in self.edits)
 
         self.homology_arms = HomologyArms(
-            left_start=0,
+            left_start=template_start,
             left_end=first_edit,
-            left_length=first_edit,
+            left_length=first_edit - template_start,
             right_start=last_edit + 1,
-            right_end=len(self.reference),
-            right_length=len(self.reference) - last_edit - 1,
+            right_end=template_end,  # Use template end, not reference end
+            right_length=template_end - last_edit - 1,
         )
 
     def print_summary(self):
@@ -560,6 +570,228 @@ class LocusConfig:
             print(f"  - Cleavage site: position {self.guide_info.cleavage_site + 1} on reference")
 
         print()
+
+
+@dataclass
+class MultiTemplateLocusConfig:
+    """
+    Locus configuration with multiple possible HDR templates.
+
+    Used for barcode screening experiments where each sample may have
+    a different expected barcode, but we want to check for all possible
+    barcodes in each sample (purity/sanity check).
+    """
+    name: str
+    reference: str
+    hdr_templates: Dict[str, str]  # template_id → sequence
+    guide: str
+    nuclease: NucleaseType
+
+    # Inferred per-template (populated by analyze())
+    template_edits: Dict[str, List[EditInfo]] = field(default_factory=dict)
+    template_offsets: Dict[str, int] = field(default_factory=dict)
+    template_ends: Dict[str, int] = field(default_factory=dict)
+    guide_info: Optional[GuideInfo] = None
+    homology_arms: Optional[HomologyArms] = None
+
+    def analyze(self) -> 'MultiTemplateLocusConfig':
+        """
+        Analyze all templates and populate inferred values.
+
+        For each template, detects:
+        - Template offset (where it aligns in reference)
+        - Edits (substitutions, insertions, deletions)
+        - Template end position
+
+        Also detects guide position and homology arms (shared across templates).
+        """
+        # First, find guide position (same for all templates)
+        self._find_guide_and_pam()
+
+        # Process each template
+        for template_id, template_seq in self.hdr_templates.items():
+            # Create a temporary LocusConfig to leverage existing analysis
+            temp_locus = LocusConfig(
+                name=f"{self.name}_{template_id}",
+                reference=self.reference,
+                hdr_template=template_seq,
+                guide=self.guide,
+                nuclease=self.nuclease,
+            )
+            temp_locus.analyze()
+
+            # Extract per-template values
+            self.template_edits[template_id] = temp_locus.edits
+            self.template_offsets[template_id] = temp_locus.template_offset
+            self.template_ends[template_id] = getattr(
+                temp_locus, 'template_end_in_ref',
+                temp_locus.template_offset + len(template_seq)
+            )
+
+            # Use first template's homology arms as representative
+            if self.homology_arms is None and temp_locus.homology_arms:
+                self.homology_arms = temp_locus.homology_arms
+
+        return self
+
+    def _find_guide_and_pam(self):
+        """Find guide position and infer PAM/cleavage site."""
+        guide_pos, strand = find_guide_in_sequence(self.reference, self.guide)
+
+        nuclease_config = (
+            NucleaseConfig.cas9() if self.nuclease == NucleaseType.CAS9
+            else NucleaseConfig.cas12a()
+        )
+
+        guide_len = len(self.guide)
+
+        if nuclease_config.pam_position == "3prime":
+            if strand == '+':
+                pam_start = guide_pos + guide_len
+                pam_end = pam_start + len(nuclease_config.pam_pattern)
+                cleavage = pam_start + nuclease_config.cleavage_offset
+            else:
+                pam_end = guide_pos
+                pam_start = pam_end - len(nuclease_config.pam_pattern)
+                cleavage = pam_end - nuclease_config.cleavage_offset
+        else:
+            if strand == '+':
+                pam_end = guide_pos
+                pam_start = pam_end - len(nuclease_config.pam_pattern)
+                cleavage = pam_start + nuclease_config.cleavage_offset
+            else:
+                pam_start = guide_pos + guide_len
+                pam_end = pam_start + len(nuclease_config.pam_pattern)
+                cleavage = pam_end - nuclease_config.cleavage_offset
+
+        pam_seq = self.reference[pam_start:pam_end].upper()
+
+        self.guide_info = GuideInfo(
+            sequence=self.guide,
+            start=guide_pos,
+            end=guide_pos + guide_len,
+            strand=strand,
+            pam_start=pam_start,
+            pam_end=pam_end,
+            pam_seq=pam_seq,
+            cleavage_site=cleavage,
+        )
+
+    @property
+    def max_edit_size(self) -> int:
+        """Get the maximum edit size across all templates."""
+        max_size = 0
+        for edits in self.template_edits.values():
+            for edit in edits:
+                max_size = max(max_size, abs(edit.size))
+        return max_size
+
+    def recommended_kmer_size(self, min_kmer: int = 12, buffer: int = 10) -> int:
+        """Calculate recommended k-mer size based on max edit size."""
+        return max(min_kmer, self.max_edit_size + buffer)
+
+    def get_edit_positions_by_template(self) -> Dict[str, List[int]]:
+        """Get list of edit positions for each template."""
+        result = {}
+        for template_id, edits in self.template_edits.items():
+            result[template_id] = [e.position for e in edits]
+        return result
+
+    def print_summary(self):
+        """Print a human-readable summary of the multi-template locus."""
+        print("\n" + "=" * 60)
+        print("=== TRACE Multi-Template Analysis Configuration ===")
+        print("=" * 60)
+
+        print(f"\nReference sequence: {len(self.reference)} bp")
+        print(f"Number of HDR templates: {len(self.hdr_templates)}")
+
+        # Show template lengths
+        template_lengths = [len(t) for t in self.hdr_templates.values()]
+        if len(set(template_lengths)) == 1:
+            print(f"Template length: {template_lengths[0]} bp (all same)")
+        else:
+            print(f"Template lengths: {min(template_lengths)}-{max(template_lengths)} bp")
+
+        # Show guide info
+        if self.guide_info:
+            print("\nGuide analysis:")
+            print(f"  - Guide sequence: {self.guide_info.sequence}")
+            print(f"  - Guide targets: positions {self.guide_info.start + 1}-"
+                  f"{self.guide_info.end} on reference ({self.guide_info.strand} strand)")
+            print(f"  - PAM: {self.guide_info.pam_seq} at positions "
+                  f"{self.guide_info.pam_start + 1}-{self.guide_info.pam_end}")
+            print(f"  - Cleavage site: position {self.guide_info.cleavage_site + 1}")
+
+        # Show edit summary
+        if self.template_edits:
+            print(f"\nEdits by template (showing first 5):")
+            for i, (template_id, edits) in enumerate(self.template_edits.items()):
+                if i >= 5:
+                    print(f"  ... and {len(self.template_edits) - 5} more templates")
+                    break
+                edit_summary = ", ".join(
+                    f"{e.edit_type}@{e.position + 1}"
+                    for e in edits[:3]
+                )
+                if len(edits) > 3:
+                    edit_summary += f" (+{len(edits) - 3} more)"
+                print(f"  - {template_id}: {edit_summary}")
+
+            max_edit = self.max_edit_size
+            if max_edit > 0:
+                print(f"\n  Maximum edit size: {max_edit} bp")
+                print(f"  Recommended k-mer size: {self.recommended_kmer_size()} bp")
+
+        print()
+
+    @classmethod
+    def from_fasta(
+        cls,
+        name: str,
+        reference: str,
+        hdr_templates_fasta: Path,
+        guide: str,
+        nuclease: NucleaseType,
+    ) -> 'MultiTemplateLocusConfig':
+        """
+        Create MultiTemplateLocusConfig from a FASTA file of templates.
+
+        Args:
+            name: Locus name
+            reference: Reference sequence
+            hdr_templates_fasta: Path to FASTA with HDR templates
+            guide: Guide sequence
+            nuclease: Nuclease type
+
+        Returns:
+            MultiTemplateLocusConfig with templates loaded
+        """
+        templates = {}
+        current_id = None
+        current_seq = []
+
+        with open(hdr_templates_fasta) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('>'):
+                    if current_id is not None:
+                        templates[current_id] = ''.join(current_seq).upper()
+                    current_id = line[1:].split()[0]
+                    current_seq = []
+                else:
+                    current_seq.append(line)
+
+            if current_id is not None:
+                templates[current_id] = ''.join(current_seq).upper()
+
+        return cls(
+            name=name,
+            reference=reference,
+            hdr_templates=templates,
+            guide=guide,
+            nuclease=nuclease,
+        )
 
 
 @dataclass
