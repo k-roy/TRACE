@@ -100,11 +100,12 @@ This will print:
 ============================================================
 
 Reference sequence: 250 bp
-HDR template: 250 bp
+HDR template: 150 bp
+  - Template aligns at position 36 in reference
 
 Donor template analysis:
-  - Left homology arm: positions 1-110 on reference (110 bp)
-  - Right homology arm: positions 113-250 on reference (138 bp)
+  - Left homology arm: positions 36-110 on reference (75 bp)
+  - Right homology arm: positions 113-185 on reference (73 bp)
 
   Edits detected (2 total):
     * Position 111: C -> G (substitution)
@@ -138,6 +139,22 @@ trace run \
   --output results/ \
   --threads 16
 ```
+
+### Per-sample locus sequences
+
+For multiplexed experiments with different target loci, you can specify `reference`, `hdr_template`, and `guide` per-sample in the sample key TSV:
+
+```
+sample_id	r1_path	r2_path	condition	reference	hdr_template	guide
+sample_1	/path/S1_R1.fq.gz	/path/S1_R2.fq.gz	treatment
+sample_2	/path/S2_R1.fq.gz	/path/S2_R2.fq.gz	control
+sample_3	/path/S3_R1.fq.gz	/path/S3_R2.fq.gz	treatment	locus2.fasta	locus2_hdr.fasta	ACGTACGTACGTACGTACGT
+sample_4	/path/S4_R1.fq.gz	/path/S4_R2.fq.gz	control	locus2.fasta	locus2_hdr.fasta	ACGTACGTACGTACGTACGT
+```
+
+- **Empty values**: Use CLI defaults (`--reference`, `--hdr-template`, `--guide`)
+- **Filled values**: Override CLI defaults for that sample
+- Values can be DNA sequences or FASTA file paths
 
 ### Using Cas12a
 
