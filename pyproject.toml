@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trace-crispr"
-version = "0.2.1"
+version = "0.3.0"
 description = "TRACE: Triple-aligner Read Analysis for CRISPR Editing"
 readme = "README.md"
 license = "MIT"
