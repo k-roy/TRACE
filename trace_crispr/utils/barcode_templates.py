@@ -10,8 +10,29 @@ from pathlib import Path
 from typing import Dict, Optional, List
 import pandas as pd
 import logging
+import re
 
 logger = logging.getLogger(__name__)
+
+
+def is_valid_barcode(barcode) -> bool:
+    """
+    Check if barcode is a valid DNA sequence.
+
+    Args:
+        barcode: Value to check (can be any type)
+
+    Returns:
+        True if barcode is a valid DNA sequence (only ACGT), False otherwise
+    """
+    if barcode is None or pd.isna(barcode):
+        return False
+    barcode_str = str(barcode).strip().upper()
+    # Must be non-empty and not a placeholder value
+    if not barcode_str or barcode_str in ('NA', 'EMPTY', 'NONE', 'NULL', 'CONTROL', 'N/A'):
+        return False
+    # Check that it's a valid DNA sequence (only ACGT)
+    return bool(re.match(r'^[ACGT]+$', barcode_str))
 
 
 def generate_barcoded_hdr_templates(
@@ -137,12 +158,8 @@ def load_barcodes_from_tsv(
     if barcode_column not in df.columns:
         raise ValueError(f"Column '{barcode_column}' not found in {tsv_path}")
 
-    # Filter valid barcodes
-    valid = df[
-        df[barcode_column].notna() &
-        (df[barcode_column] != 'NA') &
-        (df[barcode_column] != '')
-    ].copy()
+    # Filter valid barcodes (must be valid DNA sequences)
+    valid = df[df[barcode_column].apply(is_valid_barcode)].copy()
 
     if id_column and id_column in df.columns:
         # Use specified ID column

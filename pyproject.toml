@@ -43,6 +43,9 @@ visualization = [
     "seaborn>=0.12",
     "scipy>=1.9",
 ]
+validation = [
+    "CRISPResso2>=2.2",
+]
 
 [project.scripts]
 trace = "trace_crispr.cli:cli"
