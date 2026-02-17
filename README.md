@@ -156,6 +156,45 @@ sample_4	/path/S4_R1.fq.gz	/path/S4_R2.fq.gz	control	locus2.fasta	locus2_hdr.fas
 - **Filled values**: Override CLI defaults for that sample
 - Values can be DNA sequences or FASTA file paths
 
+### Multi-Template Analysis (Barcode Screening)
+
+For barcode screening experiments where multiple HDR templates (barcodes) are possible, use the `multi-template` command:
+
+```bash
+# Generate HDR templates FASTA from keyfiles
+trace generate-templates \
+  --sample-key keyfiles/sample_key.tsv \
+  --seq-ref keyfiles/guide_donor_and_reference_info.tsv \
+  --output templates/hdr_templates.fasta
+
+# Generate sample manifest from keyfiles
+trace generate-manifest \
+  --sample-key keyfiles/sample_key.tsv \
+  --plate-key keyfiles/plate_key.tsv \
+  --raw-data-dir raw_data/ \
+  --output trace_sample_key.tsv
+
+# Run multi-template analysis
+trace multi-template \
+  --reference templates/reference.fasta \
+  --hdr-templates templates/hdr_templates.fasta \
+  --guide GAGTCCGAGCAGAAGAAGAA \
+  --sample-key trace_sample_key.tsv \
+  --output results/ \
+  --threads 16
+```
+
+**Output tables:**
+- `per_sample_editing_outcomes_all_methods.tsv` - Summary per sample
+- `per_sample_per_template_outcomes.tsv` - Granular per-template results
+
+**Features:**
+- Detects which barcode/template is present in each read
+- Purity checking (detects unexpected barcodes)
+- AMBIGUOUS category for reads matching multiple barcodes
+- Expected template validation via `expected_barcode` column
+- Parallel processing with configurable threads
+
 ### Using Cas12a
 
 ```bash
@@ -265,9 +304,169 @@ For Tn5/tagmented data or TruSeq amplicons with UMIs, TRACE will report on the P
 - **TruSeq with UMIs**: Pre-alignment UMI-based deduplication
 - **Tn5**: Post-alignment position-based deduplication
 
+## Analysis and Visualization
+
+TRACE includes an analysis module for comparing editing outcomes across conditions with statistical testing and publication-quality visualizations.
+
+### Installation
+
+The analysis module requires additional dependencies for visualization:
+
+```bash
+pip install trace-crispr[visualization]
+```
+
+Or install scipy, matplotlib, and seaborn separately:
+
+```bash
+pip install scipy matplotlib seaborn
+```
+
+### Basic Usage
+
+#### Compare conditions from pipeline results
+
+```python
+from trace_crispr.analysis import (
+    compare_metric_by_condition,
+    results_to_dataframe,
+    get_condition_stats,
+    plot_condition_comparison,
+)
+
+# After running the TRACE pipeline
+results = pipeline.run_all(samples)
+
+# Compare HDR rates across conditions
+comparisons = compare_metric_by_condition(
+    results, samples,
+    condition_col='treatment',      # Column in sample metadata
+    metric='dedup_hdr_pct',         # Metric to compare
+    base_condition='control'        # Reference condition for t-tests
+)
+
+# View results as a DataFrame
+print(comparisons.to_dataframe())
+```
+
+Output:
+```
+     condition base_condition        metric  condition_mean  condition_std  ...  p_value  p_adjusted significance
+0  treatment_A        control  dedup_hdr_pct           25.41           2.63  ...   0.0003      0.0006          ***
+1  treatment_B        control  dedup_hdr_pct           12.15           1.89  ...   0.4521      0.4521           ns
+```
+
+#### Create bar plots with replicate points
+
+```python
+# Convert results to DataFrame and get stats
+df = results_to_dataframe(results, samples)
+stats = get_condition_stats(df, 'treatment', 'dedup_hdr_pct')
+
+# Create bar plot with individual points and significance stars
+fig = plot_condition_comparison(
+    stats, comparisons,
+    base_condition='control',
+    title='HDR Rate by Treatment',
+    ylabel='HDR Rate (%)'
+)
+fig.savefig('hdr_comparison.png', dpi=150, bbox_inches='tight')
+```
+
+This creates a bar chart showing:
+- Mean values as bars
+- Individual replicate values as overlaid points (with jitter)
+- Standard error of mean (SEM) as error bars
+- Significance stars above significantly different conditions
+
+#### Work directly with DataFrames
+
+If you already have a DataFrame (e.g., from a previous analysis):
+
+```python
+from trace_crispr.analysis import (
+    compare_dataframe_by_condition,
+    get_condition_stats,
+    plot_condition_comparison,
+)
+import pandas as pd
+
+# Load existing data
+df = pd.read_csv('editing_outcomes.tsv', sep='\t')
+
+# Compare conditions
+comparisons = compare_dataframe_by_condition(
+    df,
+    condition_col='treatment',
+    metric='dedup_hdr_pct',
+    base_condition='control'
+)
+
+# Get stats and plot
+stats = get_condition_stats(df, 'treatment', 'dedup_hdr_pct')
+fig = plot_condition_comparison(stats, comparisons)
+```
+
+#### Get summary statistics
+
+```python
+from trace_crispr.analysis import get_condition_summary
+
+# Generate summary table for all metrics
+summary = get_condition_summary(results, samples, condition_col='treatment')
+print(summary[['condition', 'n', 'dedup_hdr_pct_mean', 'dedup_hdr_pct_sem']])
+```
+
+Output:
+```
+     condition  n  dedup_hdr_pct_mean  dedup_hdr_pct_sem
+0      control  4               10.25               0.68
+1  treatment_A  4               25.41               1.32
+2  treatment_B  4               12.15               0.94
+```
+
+### Statistical Methods
+
+- **T-test**: Welch's t-test (unequal variances) comparing each condition to the base
+- **FDR correction**: Benjamini-Hochberg correction applied by default (disable with `fdr_correction=False`)
+- **Significance thresholds**: `*` (p < 0.05), `**` (p < 0.01), `***` (p < 0.001)
+
+### Available Functions
+
+| Function | Description |
+|----------|-------------|
+| `compare_metric_by_condition()` | Main entry point - compare a metric across conditions from SampleResults |
+| `compare_dataframe_by_condition()` | Compare conditions from an existing DataFrame |
+| `get_condition_summary()` | Generate summary statistics table |
+| `results_to_dataframe()` | Convert SampleResult list to DataFrame |
+| `get_condition_stats()` | Calculate mean, std, sem, n for each condition |
+| `compare_conditions()` | Perform statistical comparisons between conditions |
+| `plot_condition_comparison()` | Bar plot with points, error bars, and significance stars |
+| `plot_comparison_summary()` | Forest/bar plot of fold changes |
+| `plot_replicate_correlation()` | Scatter plot comparing two metrics |
+| `plot_multi_metric_comparison()` | Multi-panel comparison across metrics |
+
+### Plot Customization
+
+```python
+fig = plot_condition_comparison(
+    stats, comparisons,
+    base_condition='control',
+    title='HDR Rate by Treatment',
+    ylabel='HDR Rate (%)',
+    figsize=(12, 6),              # Figure size
+    bar_color='#22c55e',          # Color for treatment bars (green)
+    base_color='#888888',         # Color for base condition (gray)
+    point_alpha=0.6,              # Transparency for data points
+    jitter=0.15,                  # Horizontal spread for points
+    show_significance=True,       # Show significance stars
+    condition_order=['control', 'treatment_A', 'treatment_B'],  # Custom order
+)
+```
+
 ## Dependencies
 
-### Python
+### Python (Core)
 - click>=8.0
 - pysam>=0.20
 - pandas>=1.5
@@ -275,6 +474,13 @@ For Tn5/tagmented data or TruSeq amplicons with UMIs, TRACE will report on the P
 - pyyaml>=6.0
 - rapidfuzz>=3.0
 - tqdm>=4.60
+
+### Python (Visualization - optional)
+- matplotlib>=3.5
+- seaborn>=0.12
+- scipy>=1.9
+
+Install with: `pip install trace-crispr[visualization]`
 
 ### External tools (via conda)
 - bwa>=0.7
