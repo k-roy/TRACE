@@ -469,6 +469,61 @@ class MultiTemplatePipelineConfig:
             self.aligners = ['bwa', 'bbmap', 'minimap2']
 
 
+def _process_sample_worker(args: Dict) -> MultiTemplateSampleResult:
+    """
+    Worker function for parallel sample processing.
+
+    This is a module-level function so it can be pickled by ProcessPoolExecutor.
+    It recreates the classifier in each worker process.
+    """
+    from pathlib import Path
+
+    # Extract arguments
+    sample_id = args['sample_id']
+    r1_path = Path(args['r1_path'])
+    r2_path = Path(args['r2_path']) if args['r2_path'] else None
+    metadata = args['metadata']
+    reference = args['reference']
+    hdr_templates = args['hdr_templates']
+    edit_positions_by_template = args['edit_positions_by_template']
+    expected_template_column = args['expected_template_column']
+    kmer_size = args['kmer_size']
+    contamination_sequence = args['contamination_sequence']
+
+    # Recreate classifier in this worker process
+    classifier = MultiTemplateKmerClassifier.from_multi_template(
+        reference=reference,
+        hdr_templates=hdr_templates,
+        edit_positions_by_template=edit_positions_by_template,
+        contamination_sequence=contamination_sequence,
+        kmer_size=kmer_size,
+    )
+
+    # Run k-mer classification
+    kmer_results = classify_fastq_multi_template(r1_path, r2_path, classifier)
+
+    # Get expected template
+    expected_template = metadata.get(expected_template_column)
+    if expected_template and str(expected_template).upper() in ('NA', 'NAN', ''):
+        expected_template = None
+
+    # Build result
+    result = MultiTemplateSampleResult(
+        sample_id=sample_id,
+        total_reads=kmer_results.total_reads,
+        aligned_reads=kmer_results.total_reads,
+        hdr_counts_by_template=kmer_results.hdr_counts_by_template.copy(),
+        wt_count=kmer_results.wt_count,
+        nhej_count=0,
+        large_del_count=0,
+        ambiguous_count=kmer_results.ambiguous_count,
+        expected_template=str(expected_template) if expected_template else None,
+        metadata=metadata,
+    )
+
+    return result
+
+
 class MultiTemplateEditingPipeline:
     """
     Pipeline supporting multiple HDR templates.
@@ -533,11 +588,31 @@ class MultiTemplateEditingPipeline:
         ref_fasta = self.config.output_dir / "reference.fasta"
         create_reference_fasta(self.locus.reference, ref_fasta)
 
-        # Process samples
+        # Process samples in parallel
+        n_workers = min(self.config.threads, len(samples))
+        logger.info(f"Processing {len(samples)} samples with {n_workers} parallel workers...")
+
+        if n_workers > 1:
+            results = self._run_parallel(samples, ref_fasta, n_workers)
+        else:
+            results = self._run_sequential(samples, ref_fasta)
+
+        # Write output files
+        write_multi_template_results(results, self.config.output_dir)
+
+        logger.info(f"Pipeline complete. Results in {self.config.output_dir}")
+
+        return results
+
+    def _run_sequential(
+        self,
+        samples: List[Sample],
+        ref_fasta: Path,
+    ) -> List[MultiTemplateSampleResult]:
+        """Process samples sequentially."""
         results = []
         for i, sample in enumerate(samples):
             logger.info(f"Processing sample {i+1}/{len(samples)}: {sample.sample_id}")
-
             try:
                 result = self._process_sample(sample, ref_fasta)
                 results.append(result)
@@ -551,11 +626,66 @@ class MultiTemplateEditingPipeline:
                     aligned_reads=0,
                     metadata=sample.metadata,
                 ))
+        return results
 
-        # Write output files
-        write_multi_template_results(results, self.config.output_dir)
+    def _run_parallel(
+        self,
+        samples: List[Sample],
+        ref_fasta: Path,
+        n_workers: int,
+    ) -> List[MultiTemplateSampleResult]:
+        """Process samples in parallel using ProcessPoolExecutor."""
+        # Prepare arguments for worker function
+        # We need to pass serializable data, not the classifier object
+        worker_args = []
+        for sample in samples:
+            args = {
+                'sample_id': sample.sample_id,
+                'r1_path': str(sample.r1_path),
+                'r2_path': str(sample.r2_path) if sample.r2_path else None,
+                'metadata': sample.metadata,
+                'reference': self.locus.reference,
+                'hdr_templates': self.locus.hdr_templates,
+                'edit_positions_by_template': self.locus.get_edit_positions_by_template(),
+                'expected_template_column': self.config.expected_template_column,
+                'kmer_size': self.kmer_classifier.kmer_size,
+                'contamination_sequence': self.config.contaminant_sequence,
+                'output_dir': str(self.config.output_dir),
+            }
+            worker_args.append(args)
 
-        logger.info(f"Pipeline complete. Results in {self.config.output_dir}")
+        # Process in parallel
+        results = []
+        completed = 0
+        with ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = {
+                executor.submit(_process_sample_worker, args): args['sample_id']
+                for args in worker_args
+            }
+
+            for future in as_completed(futures):
+                sample_id = futures[future]
+                completed += 1
+                try:
+                    result = future.result()
+                    results.append(result)
+                    logger.info(f"Completed {completed}/{len(samples)}: {sample_id}")
+                except Exception as e:
+                    logger.error(f"Error processing {sample_id}: {e}")
+                    # Find the original sample metadata
+                    for args in worker_args:
+                        if args['sample_id'] == sample_id:
+                            results.append(MultiTemplateSampleResult(
+                                sample_id=sample_id,
+                                total_reads=0,
+                                aligned_reads=0,
+                                metadata=args['metadata'],
+                            ))
+                            break
+
+        # Sort results by original sample order
+        sample_order = {s.sample_id: i for i, s in enumerate(samples)}
+        results.sort(key=lambda r: sample_order.get(r.sample_id, len(samples)))
 
         return results
 
