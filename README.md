@@ -20,6 +20,23 @@ TRACE is a comprehensive tool for quantifying CRISPR editing outcomes from ampli
 
 ## Recent Updates
 
+### Version 0.4.0 (2026-02-20)
+
+**New Features:**
+- **Alignment-only classification (now default)**: Pure alignment-based classification using multi-reference FASTA (WT + all HDR variants). More accurate than k-mer classification, especially for experiments with many similar barcodes.
+- **Full-length HDR builder**: Automatically builds full amplicon sequences from short donor templates using homology arm detection
+- **Global sequence deduplication**: Filter low-count sequences across all samples with `min_global_count` parameter
+- **Primary-only alignments**: When aligning to multi-reference FASTA, secondary alignments are suppressed by default
+
+**Breaking Changes:**
+- `alignment_only` parameter now defaults to `True`. Set `alignment_only=False` for legacy k-mer mode.
+
+**Bug Fixes:**
+- Fixed BBMap subprocess deadlock caused by stderr buffer overflow
+- Fixed version mismatch between `__init__.py` and `pyproject.toml`
+
+See [CHANGELOG.md](CHANGELOG.md) for full details.
+
 ### Version 0.3.1 (2026-02-17)
 
 **Critical Bug Fixes:**
