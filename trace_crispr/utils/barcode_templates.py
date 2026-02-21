@@ -6,11 +6,12 @@ Generate HDR templates for barcoded CRISPR editing experiments.
 Author: Kevin R. Roy
 """
 
-from pathlib import Path
-from typing import Dict, Optional, List
-import pandas as pd
 import logging
 import re
+from pathlib import Path
+from typing import Dict, Optional
+
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 

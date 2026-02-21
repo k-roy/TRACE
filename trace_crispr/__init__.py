@@ -9,11 +9,11 @@ __author__ = "Kevin R. Roy"
 
 from .config import (
     LocusConfig,
-    SampleConfig,
-    PipelineConfig,
     NucleaseType,
+    PipelineConfig,
+    SampleConfig,
 )
-from .core.classification import EditingOutcome, ClassificationResult
+from .core.classification import ClassificationResult, EditingOutcome
 
 __all__ = [
     "LocusConfig",

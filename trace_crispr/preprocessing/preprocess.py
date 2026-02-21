@@ -11,15 +11,14 @@ Handles different preprocessing modes based on library type, UMI presence, and o
 Author: Kevin R. Roy
 """
 
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional, Tuple, Dict
-import subprocess
 import gzip
 import logging
-from collections import Counter
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Optional, Tuple
 
-from .detection import PreprocessingMode, AutoDetectionResults
+from .detection import AutoDetectionResults, PreprocessingMode
 
 logger = logging.getLogger(__name__)
 
@@ -267,17 +266,17 @@ def run_umi_dedup(
                 if not header1:
                     break
                 seq1 = f1.readline().strip()
-                plus1 = f1.readline().strip()
+                f1.readline()  # Skip '+' line
                 qual1 = f1.readline().strip()
 
                 # Read R2 if available
                 if f2:
                     header2 = f2.readline().strip()
                     seq2 = f2.readline().strip()
-                    plus2 = f2.readline().strip()
+                    f2.readline()  # Skip '+' line
                     qual2 = f2.readline().strip()
                 else:
-                    header2 = seq2 = plus2 = qual2 = ""
+                    header2 = seq2 = qual2 = ""
 
                 total_reads += 1
 
@@ -453,7 +452,7 @@ def run_collapse(
                 if not header:
                     break
                 seq = f.readline().strip()
-                plus = f.readline().strip()
+                f.readline()  # Skip '+' line
                 qual = f.readline().strip()
 
                 total += 1

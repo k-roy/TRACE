@@ -4,14 +4,13 @@ Aligner wrappers for BWA-MEM, BBMap, and minimap2.
 Author: Kevin R. Roy
 """
 
+import logging
 import os
 import subprocess
 import tempfile
-import shutil
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
-import logging
+from pathlib import Path
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -41,28 +40,28 @@ class AlignerManager:
         """Check which aligners are available."""
         # Check BWA
         try:
-            result = subprocess.run(['bwa'], capture_output=True, timeout=5)
+            subprocess.run(['bwa'], capture_output=True, timeout=5)
             self.available['bwa'] = True
         except (FileNotFoundError, subprocess.TimeoutExpired):
             self.available['bwa'] = False
 
         # Check BBMap
         try:
-            result = subprocess.run(['bbmap.sh', '--version'], capture_output=True, timeout=5)
+            subprocess.run(['bbmap.sh', '--version'], capture_output=True, timeout=5)
             self.available['bbmap'] = True
         except (FileNotFoundError, subprocess.TimeoutExpired):
             self.available['bbmap'] = False
 
         # Check minimap2
         try:
-            result = subprocess.run(['minimap2', '--version'], capture_output=True, timeout=5)
+            subprocess.run(['minimap2', '--version'], capture_output=True, timeout=5)
             self.available['minimap2'] = True
         except (FileNotFoundError, subprocess.TimeoutExpired):
             self.available['minimap2'] = False
 
         # Check samtools
         try:
-            result = subprocess.run(['samtools', '--version'], capture_output=True, timeout=5)
+            subprocess.run(['samtools', '--version'], capture_output=True, timeout=5)
             self.available['samtools'] = True
         except (FileNotFoundError, subprocess.TimeoutExpired):
             self.available['samtools'] = False
@@ -127,7 +126,7 @@ def run_bwa_mem(
 
         # Run BWA
         with open(sam_path, 'w') as sam_out:
-            result = subprocess.run(cmd, stdout=sam_out, stderr=subprocess.PIPE, check=True)
+            subprocess.run(cmd, stdout=sam_out, stderr=subprocess.PIPE, check=True)
 
         # Convert to BAM and sort
         subprocess.run(
@@ -209,7 +208,7 @@ def run_bbmap(
         # BBMap generates large verbose output that can overflow the 64KB pipe buffer
         # causing the subprocess to block indefinitely
         with open(os.devnull, 'w') as devnull:
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=devnull, check=True)
+            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=devnull, check=True)
 
         return AlignerResult(
             aligner='bbmap',
@@ -280,7 +279,7 @@ def run_minimap2(
             sam_path = Path(sam_file.name)
 
         with open(sam_path, 'w') as sam_out:
-            result = subprocess.run(cmd, stdout=sam_out, stderr=subprocess.PIPE, check=True)
+            subprocess.run(cmd, stdout=sam_out, stderr=subprocess.PIPE, check=True)
 
         # Convert to BAM
         subprocess.run(

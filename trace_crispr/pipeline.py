@@ -4,39 +4,40 @@ Main pipeline orchestration for CRISPRo.
 Author: Kevin R. Roy
 """
 
-import tempfile
-from pathlib import Path
-from typing import List, Dict, Optional, Set
-from dataclasses import dataclass
-from concurrent.futures import ProcessPoolExecutor, as_completed
 import logging
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Set
+
 import pysam
 
-from .config import LocusConfig, PipelineConfig, MultiTemplateLocusConfig
-from .io.sample_key import Sample
-from .io.output import (
-    SampleResult, write_results_tsv, generate_summary_report,
-    MultiTemplateSampleResult, write_multi_template_results
-)
-from .preprocessing.detection import run_auto_detection, AutoDetectionResults
-from .preprocessing.trimming import trim_adapters
-from .preprocessing.contamination import filter_contamination_fastq, create_contamination_filter
-from .integrations.aligners import (
-    run_triple_alignment, create_reference_fasta, AlignerManager
-)
-from .integrations.crispresso import CRISPRessoRunner
-from .core.scoring import (
-    score_alignment, select_best_alignment, select_best_alignment_paired,
-    get_dedup_signature, DeduplicationSignature
-)
+from .config import LocusConfig, MultiTemplateLocusConfig, PipelineConfig
 from .core.classification import (
-    classify_read, get_hdr_signature_positions, summarize_classifications,
-    EditingOutcome, ClassificationResult
+    EditingOutcome,
+    classify_read,
+    get_hdr_signature_positions,
+    summarize_classifications,
 )
 from .core.kmer import (
-    KmerClassifier, classify_fastq_kmer,
-    MultiTemplateKmerClassifier, classify_fastq_multi_template
+    KmerClassifier,
+    MultiTemplateKmerClassifier,
+    classify_fastq_kmer,
+    classify_fastq_multi_template,
 )
+from .core.scoring import DeduplicationSignature, score_alignment
+from .integrations.aligners import AlignerManager, create_reference_fasta, run_triple_alignment
+from .integrations.crispresso import CRISPRessoRunner
+from .io.output import (
+    MultiTemplateSampleResult,
+    SampleResult,
+    generate_summary_report,
+    write_multi_template_results,
+    write_results_tsv,
+)
+from .io.sample_key import Sample
+from .preprocessing.contamination import create_contamination_filter
+from .preprocessing.trimming import trim_adapters
 
 logger = logging.getLogger(__name__)
 
@@ -164,7 +165,7 @@ class EditingPipeline:
         state = PipelineState(sample=sample)
 
         # Step 1: K-mer classification (pre-alignment)
-        logger.info(f"  Running k-mer classification...")
+        logger.info("  Running k-mer classification...")
         kmer_results = classify_fastq_kmer(
             sample.r1_path,
             sample.r2_path,
@@ -172,7 +173,7 @@ class EditingPipeline:
         )
 
         # Step 2: Adapter trimming
-        logger.info(f"  Trimming adapters...")
+        logger.info("  Trimming adapters...")
         trim_dir = sample_dir / "trimmed"
         trim_result = trim_adapters(
             sample.r1_path,
@@ -192,11 +193,12 @@ class EditingPipeline:
 
         # Step 3: Contamination filtering (if configured)
         if self.config.contaminant_sequence:
-            logger.info(f"  Filtering contamination...")
+            logger.info("  Filtering contamination...")
             clean_dir = sample_dir / "cleaned"
             clean_dir.mkdir(exist_ok=True)
 
-            contamination_kmers = create_contamination_filter(
+            # Create contamination filter (currently unused, skip if not a path)
+            _ = create_contamination_filter(
                 Path(self.config.contaminant_sequence) if isinstance(
                     self.config.contaminant_sequence, str
                 ) else None,
@@ -211,7 +213,7 @@ class EditingPipeline:
             state.cleaned_r2 = state.trimmed_r2
 
         # Step 4: Triple alignment
-        logger.info(f"  Running triple alignment...")
+        logger.info("  Running triple alignment...")
         align_dir = sample_dir / "alignments"
         alignment_results = run_triple_alignment(
             state.cleaned_r1,
@@ -225,7 +227,7 @@ class EditingPipeline:
         state.alignment_dir = align_dir
 
         # Step 5: Select best alignments and classify
-        logger.info(f"  Classifying reads...")
+        logger.info("  Classifying reads...")
         classification_result = self._classify_from_alignments(
             alignment_results,
             sample_dir,
@@ -235,7 +237,7 @@ class EditingPipeline:
         crispresso_hdr = None
         crispresso_nhej = None
         if self.config.run_crispresso:
-            logger.info(f"  Running CRISPResso2...")
+            logger.info("  Running CRISPResso2...")
             crispresso_result = self._run_crispresso(sample, sample_dir)
             if crispresso_result:
                 crispresso_hdr = crispresso_result.hdr_rate
@@ -406,7 +408,7 @@ def run_pipeline(
     Returns:
         List of SampleResult objects
     """
-    from .config import LocusConfig, NucleaseType
+    from .config import NucleaseType
 
     nuclease_type = NucleaseType.CAS9 if nuclease == 'cas9' else NucleaseType.CAS12A
 
@@ -699,7 +701,7 @@ class MultiTemplateEditingPipeline:
         sample_dir.mkdir(parents=True, exist_ok=True)
 
         # Step 1: Multi-template k-mer classification (pre-alignment)
-        logger.info(f"  Running multi-template k-mer classification...")
+        logger.info("  Running multi-template k-mer classification...")
         kmer_results = classify_fastq_multi_template(
             sample.r1_path,
             sample.r2_path,

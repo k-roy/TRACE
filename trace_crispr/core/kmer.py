@@ -7,16 +7,16 @@ classify reads without alignment.
 Author: Kevin R. Roy
 """
 
-from dataclasses import dataclass, field
-from typing import Set, Tuple, Optional, List, Dict
-from enum import Enum
 import gzip
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
+from typing import Dict, List, Optional, Set
 
 from ..utils.sequence import (
-    reverse_complement,
-    generate_edit_kmers,
     extract_unique_kmers,
+    generate_edit_kmers,
+    reverse_complement,
 )
 
 

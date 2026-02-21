@@ -7,7 +7,7 @@ Author: Kevin R. Roy
 """
 
 import re
-from typing import List, Tuple, Set
+from typing import List, Set, Tuple
 
 
 def reverse_complement(seq: str) -> str:

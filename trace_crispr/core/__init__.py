@@ -8,46 +8,41 @@ from .cigar import (
     CigarOperation,
     Deletion,
     Insertion,
-    parse_cigar_to_operations,
+    count_mismatches_in_region,
     get_deletions_from_cigar,
     get_insertions_from_cigar,
-    count_mismatches_in_region,
+    parse_cigar_to_operations,
 )
-
-from .scoring import (
-    AlignmentScore,
-    score_alignment,
-    select_best_alignment,
-    select_best_alignment_paired,
-    DeduplicationSignature,
-    get_dedup_signature,
-)
-
 from .classification import (
-    EditingOutcome,
     ClassificationResult,
+    EditingOutcome,
     classify_read,
-    summarize_classifications,
     get_hdr_signature_positions,
+    summarize_classifications,
 )
-
 from .kmer import (
     KmerClassification,
     KmerClassifier,
     KmerResults,
     classify_fastq_kmer,
 )
-
 from .models import (
     EditingTemplate,
 )
-
 from .multi_ref_classifier import (
-    Indel,
     AlignmentClassification,
     ClassificationSummary,
+    Indel,
     MultiRefClassifier,
     classify_sample,
+)
+from .scoring import (
+    AlignmentScore,
+    DeduplicationSignature,
+    get_dedup_signature,
+    score_alignment,
+    select_best_alignment,
+    select_best_alignment_paired,
 )
 
 __all__ = [

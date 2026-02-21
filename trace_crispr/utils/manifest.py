@@ -6,10 +6,11 @@ Generate TRACE-compatible sample manifests from project keyfiles.
 Author: Kevin R. Roy
 """
 
-from pathlib import Path
-from typing import Optional, Dict, List
-import pandas as pd
 import logging
+from pathlib import Path
+from typing import Dict, Optional
+
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 

@@ -4,11 +4,12 @@ Sample key parsing and validation.
 Author: Kevin R. Roy
 """
 
-from pathlib import Path
-from typing import List, Dict, Optional
-from dataclasses import dataclass
-import pandas as pd
 import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 

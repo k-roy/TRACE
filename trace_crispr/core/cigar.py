@@ -4,10 +4,10 @@ CIGAR string parsing utilities for editing outcome analysis.
 Author: Kevin R. Roy
 """
 
-from typing import List, Tuple, Optional
 from dataclasses import dataclass
-import pysam
+from typing import List, Optional, Tuple
 
+import pysam
 
 # CIGAR operation codes (from pysam/SAM spec)
 CIGAR_OPS = {

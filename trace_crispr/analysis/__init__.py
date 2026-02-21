@@ -41,38 +41,35 @@ Example usage:
     fig.savefig('comparison.png')
 """
 
-from .types import (
-    ConditionStats,
-    ComparisonResult,
-    ComparisonSet,
-)
-
 from .aggregation import (
-    results_to_dataframe,
-    get_condition_stats,
     aggregate_by_group,
+    get_condition_stats,
+    results_to_dataframe,
 )
-
+from .comparison import (
+    compare_dataframe_by_condition,
+    compare_metric_by_condition,
+    get_condition_summary,
+)
 from .statistics import (
-    ttest_vs_base,
-    p_value_to_stars,
     benjamini_hochberg,
     compare_conditions,
+    p_value_to_stars,
+    ttest_vs_base,
 )
-
-from .comparison import (
-    compare_metric_by_condition,
-    compare_dataframe_by_condition,
-    get_condition_summary,
+from .types import (
+    ComparisonResult,
+    ComparisonSet,
+    ConditionStats,
 )
 
 # Plotting functions - import only if visualization deps available
 try:
     from .plotting import (
-        plot_condition_comparison,
         plot_comparison_summary,
-        plot_replicate_correlation,
+        plot_condition_comparison,
         plot_multi_metric_comparison,
+        plot_replicate_correlation,
     )
 
     _PLOTTING_AVAILABLE = True

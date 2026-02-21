@@ -4,12 +4,12 @@ CRISPResso2 integration wrapper.
 Author: Kevin R. Roy
 """
 
-import subprocess
 import json
-from pathlib import Path
-from typing import Dict, Optional, Any
-from dataclasses import dataclass
 import logging
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +111,7 @@ class CRISPRessoRunner:
 
         try:
             logger.info(f"Running CRISPResso2: {' '.join(cmd[:5])}...")
-            result = subprocess.run(
+            subprocess.run(
                 cmd,
                 capture_output=True,
                 check=True,
@@ -196,8 +196,7 @@ class CRISPRessoRunner:
                     error_message="CRISPResso output directory not found"
                 )
 
-        # Try to read quantification file
-        quant_file = crispresso_dir / "Quantification_window_nucleotide_frequency_table.txt"
+        # Try to read mapping statistics
         mapping_stats = crispresso_dir / "Mapping_statistics.txt"
 
         raw_results = {}
