@@ -1,5 +1,5 @@
 {% set name = "trace-crispr" %}
-{% set version = "0.3.0" %}
+{% set version = "0.4.0" %}
 
 package:
   name: {{ name|lower }}
@@ -7,7 +7,7 @@ package:
 
 source:
   url: https://pypi.io/packages/source/t/trace-crispr/trace_crispr-{{ version }}.tar.gz
-  sha256: 605e863d2dda24a05796da8699ca623873561796664e72322c1fd97facf64244
+  sha256: 5ca1a53495f54eee50e05691020d344aaca6be40901f731a21f916c1f6329b8f
 
 build:
   number: 0
@@ -44,6 +44,7 @@ test:
     - trace_crispr.core
     - trace_crispr.preprocessing
     - trace_crispr.utils
+    - trace_crispr.multi_template
   commands:
     - trace --help
     - trace --version
