@@ -38,6 +38,18 @@ from .kmer import (
     classify_fastq_kmer,
 )
 
+from .models import (
+    EditingTemplate,
+)
+
+from .multi_ref_classifier import (
+    Indel,
+    AlignmentClassification,
+    ClassificationSummary,
+    MultiRefClassifier,
+    classify_sample,
+)
+
 __all__ = [
     # CIGAR
     'CigarOperation',
@@ -65,4 +77,12 @@ __all__ = [
     'KmerClassifier',
     'KmerResults',
     'classify_fastq_kmer',
+    # Models
+    'EditingTemplate',
+    # Multi-reference alignment classifier
+    'Indel',
+    'AlignmentClassification',
+    'ClassificationSummary',
+    'MultiRefClassifier',
+    'classify_sample',
 ]

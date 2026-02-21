@@ -11,6 +11,7 @@ from .aligners import (
     run_bbmap,
     run_minimap2,
     run_triple_alignment,
+    run_multi_ref_alignment,
     create_reference_fasta,
 )
 
@@ -27,6 +28,7 @@ __all__ = [
     'run_bbmap',
     'run_minimap2',
     'run_triple_alignment',
+    'run_multi_ref_alignment',
     'create_reference_fasta',
     'CRISPRessoRunner',
     'CRISPRessoResult',

@@ -4,6 +4,7 @@ Aligner wrappers for BWA-MEM, BBMap, and minimap2.
 Author: Kevin R. Roy
 """
 
+import os
 import subprocess
 import tempfile
 import shutil
@@ -166,6 +167,7 @@ def run_bbmap(
     output_bam: Path,
     threads: int = 4,
     max_indel: int = 600,
+    primary_only: bool = True,
 ) -> AlignerResult:
     """
     Run BBMap alignment.
@@ -177,6 +179,7 @@ def run_bbmap(
         output_bam: Path for output BAM file
         threads: Number of threads
         max_indel: Maximum indel size to allow
+        primary_only: If True, report only best alignment (ambiguous=best)
 
     Returns:
         AlignerResult with alignment info
@@ -195,11 +198,18 @@ def run_bbmap(
             'local=t',
         ]
 
+        # Report only best alignment for multi-reference alignment
+        if primary_only:
+            cmd.append('ambiguous=best')
+
         if r2_fastq:
             cmd.append(f'in2={r2_fastq}')
 
-        # Run BBMap
-        result = subprocess.run(cmd, capture_output=True, check=True)
+        # Run BBMap - redirect stderr to avoid pipe buffer deadlock
+        # BBMap generates large verbose output that can overflow the 64KB pipe buffer
+        # causing the subprocess to block indefinitely
+        with open(os.devnull, 'w') as devnull:
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=devnull, check=True)
 
         return AlignerResult(
             aligner='bbmap',
@@ -230,6 +240,7 @@ def run_minimap2(
     output_bam: Path,
     threads: int = 4,
     end_bonus: int = 50,
+    primary_only: bool = True,
 ) -> AlignerResult:
     """
     Run minimap2 alignment.
@@ -241,6 +252,7 @@ def run_minimap2(
         output_bam: Path for output BAM file
         threads: Number of threads
         end_bonus: Bonus for extending alignments to ends
+        primary_only: If True, suppress secondary alignments (--secondary=no)
 
     Returns:
         AlignerResult with alignment info
@@ -252,9 +264,13 @@ def run_minimap2(
             '-ax', 'sr',  # Short reads preset
             '-t', str(threads),
             f'--end-bonus={end_bonus}',
-            str(reference),
-            str(r1_fastq),
         ]
+
+        # Suppress secondary alignments for multi-reference alignment
+        if primary_only:
+            cmd.append('--secondary=no')
+
+        cmd.extend([str(reference), str(r1_fastq)])
 
         if r2_fastq:
             cmd.append(str(r2_fastq))
@@ -304,6 +320,7 @@ def run_triple_alignment(
     output_dir: Path,
     threads: int = 4,
     aligners: List[str] = None,
+    primary_only: bool = True,
 ) -> Dict[str, AlignerResult]:
     """
     Run all three aligners and return results.
@@ -315,6 +332,7 @@ def run_triple_alignment(
         output_dir: Directory for output files
         threads: Number of threads per aligner
         aligners: List of aligners to run (default: all three)
+        primary_only: If True, report only best alignment per read
 
     Returns:
         Dict mapping aligner name to AlignerResult
@@ -325,27 +343,40 @@ def run_triple_alignment(
     output_dir.mkdir(parents=True, exist_ok=True)
     results = {}
 
-    aligner_funcs = {
-        'bwa': run_bwa_mem,
-        'bbmap': run_bbmap,
-        'minimap2': run_minimap2,
-    }
-
     for aligner in aligners:
-        if aligner not in aligner_funcs:
-            logger.warning(f"Unknown aligner: {aligner}")
-            continue
-
         output_bam = output_dir / f"{aligner}.bam"
         logger.info(f"Running {aligner}...")
 
-        result = aligner_funcs[aligner](
-            r1_fastq=r1_fastq,
-            r2_fastq=r2_fastq,
-            reference=reference,
-            output_bam=output_bam,
-            threads=threads,
-        )
+        if aligner == 'bwa':
+            # BWA-MEM reports primary only by default
+            result = run_bwa_mem(
+                r1_fastq=r1_fastq,
+                r2_fastq=r2_fastq,
+                reference=reference,
+                output_bam=output_bam,
+                threads=threads,
+            )
+        elif aligner == 'bbmap':
+            result = run_bbmap(
+                r1_fastq=r1_fastq,
+                r2_fastq=r2_fastq,
+                reference=reference,
+                output_bam=output_bam,
+                threads=threads,
+                primary_only=primary_only,
+            )
+        elif aligner == 'minimap2':
+            result = run_minimap2(
+                r1_fastq=r1_fastq,
+                r2_fastq=r2_fastq,
+                reference=reference,
+                output_bam=output_bam,
+                threads=threads,
+                primary_only=primary_only,
+            )
+        else:
+            logger.warning(f"Unknown aligner: {aligner}")
+            continue
 
         results[aligner] = result
 
@@ -355,6 +386,54 @@ def run_triple_alignment(
             logger.warning(f"{aligner} failed: {result.error_message}")
 
     return results
+
+
+def run_multi_ref_alignment(
+    query_fastq: Path,
+    reference_fasta: Path,
+    output_dir: Path,
+    threads: int = 16,
+    aligners: List[str] = None,
+) -> Dict[str, Path]:
+    """
+    Run all aligners against a multi-sequence reference FASTA.
+
+    This is designed for alignment-based classification where the reference
+    contains multiple related sequences (e.g., WT + all HDR variants).
+
+    Args:
+        query_fastq: Path to query FASTQ (collapsed reads)
+        reference_fasta: Path to multi-sequence reference FASTA
+        output_dir: Directory for output BAM files
+        threads: Number of threads per aligner
+        aligners: List of aligners to run (default: all three)
+
+    Returns:
+        Dict mapping aligner name to BAM path (only successful alignments)
+    """
+    if aligners is None:
+        aligners = ['bwa', 'bbmap', 'minimap2']
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Run triple alignment with primary_only=True
+    results = run_triple_alignment(
+        r1_fastq=query_fastq,
+        r2_fastq=None,
+        reference=reference_fasta,
+        output_dir=output_dir,
+        threads=threads,
+        aligners=aligners,
+        primary_only=True,
+    )
+
+    # Return only successful BAM paths
+    bam_paths = {}
+    for aligner, result in results.items():
+        if result.success and result.bam_path.exists():
+            bam_paths[aligner] = result.bam_path
+
+    return bam_paths
 
 
 def create_reference_fasta(sequence: str, output_path: Path, name: str = "reference") -> Path:

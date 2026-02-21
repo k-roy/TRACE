@@ -19,6 +19,13 @@ from .sequence import (
     find_guide_in_sequence,
 )
 
+from .multi_ref_builder import (
+    build_multi_reference_fasta,
+    load_multi_reference_fasta,
+    calculate_cut_site,
+    build_emx1_multi_reference,
+)
+
 __all__ = [
     'reverse_complement',
     'rev_comp',
@@ -32,4 +39,9 @@ __all__ = [
     'extract_unique_kmers',
     'translate_codon',
     'find_guide_in_sequence',
+    # Multi-reference builder
+    'build_multi_reference_fasta',
+    'load_multi_reference_fasta',
+    'calculate_cut_site',
+    'build_emx1_multi_reference',
 ]
