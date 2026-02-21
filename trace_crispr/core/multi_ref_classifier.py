@@ -11,12 +11,13 @@ Author: Kevin R. Roy
 Date: 2026-02-19
 """
 
-import pysam
+import logging
+from collections import defaultdict
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, field
-from collections import defaultdict
-import logging
+
+import pysam
 
 logger = logging.getLogger(__name__)
 

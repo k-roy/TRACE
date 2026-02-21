@@ -6,10 +6,10 @@ TRACE: Triple-aligner Read Analysis for CRISPR Editing
 Author: Kevin R. Roy
 """
 
-import click
-from pathlib import Path
-from typing import Optional
 import sys
+from pathlib import Path
+
+import click
 
 from . import __version__
 from .config import LocusConfig, NucleaseType, parse_sequence_input
@@ -70,11 +70,12 @@ def run(reference, hdr_template, guide, r1, r2, sample_key, output,
     Example with per-sample loci (sample key with reference/hdr_template/guide columns):
       trace run --sample-key samples.tsv -o results/
     """
-    from .io.sample_key import Sample, load_sample_key
-    from .preprocessing import run_auto_detection
-    from .pipeline import EditingPipeline
-    from .config import PipelineConfig
     import logging
+
+    from .config import PipelineConfig
+    from .io.sample_key import Sample, load_sample_key
+    from .pipeline import EditingPipeline
+    from .preprocessing import run_auto_detection
 
     # Set up logging
     logging.basicConfig(
@@ -226,7 +227,7 @@ def run(reference, hdr_template, guide, r1, r2, sample_key, output,
     pipeline = EditingPipeline(config)
     results = pipeline.run()
 
-    click.echo(f"\nPipeline complete!")
+    click.echo("\nPipeline complete!")
     click.echo(f"Processed {len(results)} samples")
     click.echo(f"Results written to: {output_path / 'per_sample_editing_outcomes_all_methods.tsv'}")
 
@@ -447,8 +448,9 @@ def generate_manifest(sample_key, plate_key, raw_data_dir, output, locus_filter,
         --raw-data-dir raw_data/ \\
         --output trace_sample_key.tsv
     """
-    from .utils.manifest import generate_trace_manifest
     import logging
+
+    from .utils.manifest import generate_trace_manifest
 
     logging.basicConfig(level=logging.INFO)
 
@@ -502,12 +504,13 @@ def generate_templates(sample_key, seq_ref, left_arm, right_arm, barcode_column,
         --right-arm "GCTAGCTA..." \\
         --output hdr_templates.fasta
     """
+    import logging
+
     from .utils.barcode_templates import (
-        generate_templates_from_keyfiles,
         generate_barcoded_hdr_templates,
+        generate_templates_from_keyfiles,
         load_barcodes_from_tsv,
     )
-    import logging
 
     logging.basicConfig(level=logging.INFO)
 
@@ -585,10 +588,11 @@ def multi_template(reference, hdr_templates, guide, sample_key, output,
         --expected-template-column expected_barcode \\
         --output results/
     """
+    import logging
+
+    from .config import MultiTemplateLocusConfig, NucleaseType
     from .io.sample_key import load_sample_key
     from .pipeline import run_multi_template_pipeline
-    from .config import MultiTemplateLocusConfig, NucleaseType
-    import logging
 
     logging.basicConfig(
         level=logging.INFO,
@@ -670,7 +674,7 @@ def multi_template(reference, hdr_templates, guide, sample_key, output,
         threads=threads,
     )
 
-    click.echo(f"\nPipeline complete!")
+    click.echo("\nPipeline complete!")
     click.echo(f"Processed {len(results)} samples")
     click.echo(f"Results written to: {output_path}")
 

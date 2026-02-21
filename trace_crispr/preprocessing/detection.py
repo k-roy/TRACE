@@ -4,12 +4,11 @@ Auto-detection of library type, read merging need, CRISPResso mode, and UMI leng
 Author: Kevin R. Roy
 """
 
+import gzip
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple, Optional, List, Dict
-from collections import Counter
-import gzip
-
+from typing import Dict, List, Optional, Tuple
 
 # Adapter signatures
 TN5_ADAPTER = "CTGTCTCTTATACACATCT"
@@ -258,7 +257,6 @@ def _find_read_start_positions(
         if len(read) < kmer_size + 20:
             continue
 
-        found = False
         # Check every position from 0 to max_offset for comprehensive coverage
         for offset in range(0, min(max_offset, len(read) - kmer_size)):
             read_kmer = read[offset:offset + kmer_size].upper()
@@ -275,7 +273,6 @@ def _find_read_start_positions(
 
                 if 0 <= read_start < len(ref_upper):
                     start_positions.append(read_start)
-                    found = True
                     break
 
     return start_positions

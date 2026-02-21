@@ -7,9 +7,10 @@ for statistical comparison and visualization.
 Author: Kevin R. Roy
 """
 
-from typing import List, Dict, Optional, Union, Callable
-import pandas as pd
+from typing import Callable, Dict, List, Optional, Union
+
 import numpy as np
+import pandas as pd
 
 from ..io.output import SampleResult
 from ..io.sample_key import Sample

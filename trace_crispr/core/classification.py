@@ -12,16 +12,17 @@ Classifies reads into:
 Author: Kevin R. Roy
 """
 
-from typing import Dict, List, Tuple, Optional
+from collections import Counter
 from dataclasses import dataclass, field
 from enum import Enum
-from collections import Counter
+from typing import Dict, List, Tuple
+
 import pysam
 
 from .cigar import (
+    count_mismatches_in_region,
     get_deletions_from_cigar,
     get_insertions_from_cigar,
-    count_mismatches_in_region,
 )
 
 

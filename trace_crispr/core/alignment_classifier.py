@@ -10,18 +10,18 @@ CRISPR editing outcome classification including:
 Author: Kevin R. Roy
 """
 
+import logging
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
-from collections import defaultdict
-import logging
-import tempfile
+from typing import Dict, Optional, Set, Tuple
+
 import pysam
 
-from ..integrations.aligners import run_triple_alignment, create_reference_fasta
-from .scoring import score_alignment, AlignmentScore
-from .cigar import get_deletions_from_cigar, get_insertions_from_cigar
-from .classification import check_indels_at_cut_site, EditingOutcome
+from ..integrations.aligners import create_reference_fasta, run_triple_alignment
+from .cigar import get_deletions_from_cigar
+from .classification import EditingOutcome, check_indels_at_cut_site
+from .scoring import AlignmentScore, score_alignment
 
 logger = logging.getLogger(__name__)
 

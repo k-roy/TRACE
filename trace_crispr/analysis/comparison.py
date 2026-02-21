@@ -6,14 +6,15 @@ Provides high-level functions for comparing editing outcomes across conditions.
 Author: Kevin R. Roy
 """
 
-from typing import List, Optional, Union
+from typing import List, Optional
+
 import pandas as pd
 
 from ..io.output import SampleResult
 from ..io.sample_key import Sample
-from .types import ComparisonSet
-from .aggregation import results_to_dataframe, get_condition_stats
+from .aggregation import get_condition_stats, results_to_dataframe
 from .statistics import compare_conditions
+from .types import ComparisonSet
 
 
 def compare_metric_by_condition(

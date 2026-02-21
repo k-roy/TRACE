@@ -5,12 +5,12 @@ Author: Kevin R. Roy
 """
 
 import gzip
-from pathlib import Path
-from typing import Set, Optional, Tuple
-from dataclasses import dataclass
 import logging
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Set
 
-from ..utils.sequence import extract_unique_kmers, reverse_complement
+from ..utils.sequence import extract_unique_kmers
 
 logger = logging.getLogger(__name__)
 

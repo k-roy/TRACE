@@ -4,11 +4,11 @@ Adapter trimming using BBDuk.
 Author: Kevin R. Roy
 """
 
-import subprocess
-from pathlib import Path
-from typing import Optional, Tuple
-from dataclasses import dataclass
 import logging
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 

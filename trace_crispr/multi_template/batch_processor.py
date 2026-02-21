@@ -14,18 +14,18 @@ Workflow:
 Author: Kevin R. Roy
 """
 
+import gzip
+import logging
+import tempfile
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple, Any
-from collections import Counter
-import logging
-import gzip
-import tempfile
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional, Set, Tuple
 
-from ..preprocessing.detection import run_auto_detection, AutoDetectionResults
-from ..preprocessing.preprocess import run_preprocessing, PreprocessingResult
-from ..integrations.crispresso import CRISPRessoRunner, CRISPRessoResult
+from ..integrations.crispresso import CRISPRessoResult, CRISPRessoRunner
+from ..preprocessing.detection import run_auto_detection
+from ..preprocessing.preprocess import run_preprocessing
 
 logger = logging.getLogger(__name__)
 
@@ -975,9 +975,9 @@ class BatchMultiTemplateProcessor:
         Returns:
             Dict mapping sequence → Classification
         """
-        from ..utils.multi_ref_builder import build_multi_reference_fasta
-        from ..core.multi_ref_classifier import MultiRefClassifier, classify_sample
+        from ..core.multi_ref_classifier import MultiRefClassifier
         from ..integrations.aligners import run_multi_ref_alignment
+        from ..utils.multi_ref_builder import build_multi_reference_fasta
 
         logger.info(f"Running alignment-only classification on {len(sequences)} sequences")
 

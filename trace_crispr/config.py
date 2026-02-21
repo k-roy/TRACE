@@ -6,15 +6,15 @@ TRACE: Triple-aligner Read Analysis for CRISPR Editing
 Author: Kevin R. Roy
 """
 
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
-import re
+from typing import Any, Dict, List, Optional, Tuple
+
 import yaml
 
-from .utils.sequence import reverse_complement, find_guide_in_sequence
-
+from .utils.sequence import find_guide_in_sequence
 
 # Regex to detect if string is pure DNA sequence
 DNA_PATTERN = re.compile(r'^[ACGTacgtNn]+$')
@@ -679,7 +679,6 @@ class MultiTemplateLocusConfig:
         boundaries (where discriminating k-mers should be generated).
         """
         templates = list(self.hdr_templates.values())
-        template_ids = list(self.hdr_templates.keys())
         first = templates[0].upper()
 
         # Find common prefix and suffix lengths
@@ -855,7 +854,7 @@ class MultiTemplateLocusConfig:
 
         # Show edit summary
         if self.template_edits:
-            print(f"\nEdits by template (showing first 5):")
+            print("\nEdits by template (showing first 5):")
             for i, (template_id, edits) in enumerate(self.template_edits.items()):
                 if i >= 5:
                     print(f"  ... and {len(self.template_edits) - 5} more templates")

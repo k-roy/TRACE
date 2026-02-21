@@ -4,11 +4,12 @@ Output generation for TRACE results.
 Author: Kevin R. Roy
 """
 
-from pathlib import Path
-from typing import Dict, List, Optional, Any
-from dataclasses import dataclass, field
-import pandas as pd
 import logging
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 

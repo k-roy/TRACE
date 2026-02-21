@@ -7,7 +7,8 @@ Author: Kevin R. Roy
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
+
 import pysam
 
 from .cigar import get_soft_clip_count, get_total_indel_size

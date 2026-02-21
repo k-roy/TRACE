@@ -7,11 +7,12 @@ Requires optional dependencies: matplotlib, seaborn
 Author: Kevin R. Roy
 """
 
-from typing import List, Dict, Optional, Tuple, Any
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
 
-from .types import ConditionStats, ComparisonSet
+from .types import ComparisonSet, ConditionStats
 
 
 def _check_plotting_deps():
@@ -108,7 +109,7 @@ def plot_condition_comparison(
             bar_colors.append(bar_color)
 
     # Plot bars
-    bars = ax.bar(
+    ax.bar(
         x_positions,
         means,
         yerr=sems,

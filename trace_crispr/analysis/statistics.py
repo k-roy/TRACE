@@ -6,11 +6,12 @@ Provides t-tests, ANOVA, and multiple testing correction (FDR).
 Author: Kevin R. Roy
 """
 
-from typing import List, Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
 
-from .types import ConditionStats, ComparisonResult, ComparisonSet
+from .types import ComparisonResult, ComparisonSet, ConditionStats
 
 
 def ttest_vs_base(

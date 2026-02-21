@@ -8,9 +8,9 @@ Author: Kevin R. Roy
 Date: 2026-02-19
 """
 
-from pathlib import Path
-from typing import Dict, Optional, Tuple
 import logging
+from pathlib import Path
+from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +114,7 @@ def calculate_cut_site(sequence: str, guide_seq: str) -> Optional[int]:
         guide_rc = reverse_complement(guide_upper)
         guide_pos = sequence_upper.find(guide_rc)
         if guide_pos == -1:
-            logger.warning(f"Guide not found in sequence")
+            logger.warning("Guide not found in sequence")
             return None
         # For antisense guide, cut site is at guide_pos + 3
         return guide_pos + 3
@@ -166,7 +166,7 @@ def build_full_length_hdr(wt_reference: str, hdr_donor: str, min_anchor: int = 2
                 break
 
     if left_pos == -1:
-        logger.warning(f"Could not align HDR donor to WT reference (left anchor)")
+        logger.warning("Could not align HDR donor to WT reference (left anchor)")
         return donor  # Return donor as-is
 
     # Find right anchor (end of donor in WT)
@@ -182,7 +182,7 @@ def build_full_length_hdr(wt_reference: str, hdr_donor: str, min_anchor: int = 2
                 break
 
     if right_pos == -1:
-        logger.warning(f"Could not align HDR donor to WT reference (right anchor)")
+        logger.warning("Could not align HDR donor to WT reference (right anchor)")
         return donor  # Return donor as-is
 
     # Calculate the region to replace
