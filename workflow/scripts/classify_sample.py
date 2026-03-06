@@ -107,7 +107,7 @@ def main():
                         results.append({
                             'read_name': read.query_name,
                             'outcome': result.outcome.name,
-                            'hdr_fraction': result.details.get('hdr_fraction', 0.0)
+                            'hdr_match_fraction': result.details.get('hdr_match_fraction', 0.0)
                         })
 
                 aligner_used = aligner_name
