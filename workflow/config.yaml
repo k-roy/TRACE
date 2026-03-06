@@ -1,0 +1,21 @@
+# TRACE Snakemake workflow configuration
+
+# Sample manifest (TSV with columns: sample_id, r1_path, r2_path, reference, guide, hdr_template)
+manifest: "trace_manifest.tsv"
+
+# Output directory for all results
+output_dir: "results/trace_snakemake"
+
+# Number of threads per sample (for alignment)
+threads_per_sample: 4
+
+# Default sequences (used if per-sample columns are empty)
+# Can be DNA sequences or FASTA file paths
+default_reference: ""
+default_guide: ""
+default_hdr_template: ""
+
+# Analysis parameters
+analysis_window: 10
+large_deletion_min: 50
+hdr_threshold: 0.8

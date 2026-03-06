@@ -1,0 +1,225 @@
+"""
+Snakemake workflow for TRACE analysis using script: directive.
+
+This workflow uses external Python scripts for rules to avoid subprocess import issues.
+
+Usage:
+    snakemake --cores 24 --configfile config.yaml
+    snakemake --cores 24 --config manifest=samples.tsv output_dir=results/
+
+Author: Kevin R. Roy
+"""
+
+import pandas as pd
+from pathlib import Path
+
+# Load configuration
+MANIFEST = config.get("manifest", "trace_manifest.tsv")
+OUTPUT_DIR = Path(config.get("output_dir", "results/trace_snakemake"))
+THREADS_PER_SAMPLE = config.get("threads_per_sample", 4)
+
+# Load sample manifest
+manifest_df = pd.read_csv(MANIFEST, sep='\t')
+SAMPLES = manifest_df['sample_id'].tolist()
+
+# Create sample info lookup
+sample_info = {}
+for _, row in manifest_df.iterrows():
+    sample_info[row['sample_id']] = {
+        'r1_path': row['r1_path'],
+        'r2_path': row['r2_path'],
+        'reference': row.get('reference', ''),
+        'guide': row.get('guide', ''),
+        'hdr_template': row.get('hdr_template', ''),
+    }
+
+# Default reference/guide/donor (if not in manifest)
+DEFAULT_REF = config.get("default_reference", "")
+DEFAULT_GUIDE = config.get("default_guide", "")
+DEFAULT_HDR = config.get("default_hdr_template", "")
+
+# Analysis parameters
+ANALYSIS_WINDOW = config.get("analysis_window", 10)
+LARGE_DELETION_MIN = config.get("large_deletion_min", 50)
+HDR_THRESHOLD = config.get("hdr_threshold", 0.8)
+
+# Get workflow directory for script paths
+# workflow.basedir gives the directory containing the Snakefile
+# Our scripts are in /oak/.../trace/workflow/scripts/
+WORKFLOW_DIR = Path("/oak/stanford/groups/larsms/Users/kevinroy/software/trace/workflow")
+
+
+rule all:
+    input:
+        expand(OUTPUT_DIR / "{sample}" / "classification.tsv", sample=SAMPLES),
+        OUTPUT_DIR / "summary" / "all_samples_results.tsv"
+
+
+rule create_reference_fasta:
+    """
+    Create reference FASTA for aligners.
+    Uses first sample's reference or default.
+    """
+    output:
+        fasta = OUTPUT_DIR / "reference.fasta"
+    run:
+        from trace_crispr.config import parse_sequence_input
+
+        # Get reference sequence (from first sample or default)
+        ref_seq = None
+        for sample_id in SAMPLES:
+            ref = sample_info[sample_id]['reference']
+            if ref and not pd.isna(ref):
+                ref_seq = parse_sequence_input(ref)
+                break
+
+        if ref_seq is None and DEFAULT_REF:
+            ref_seq = parse_sequence_input(DEFAULT_REF)
+
+        if ref_seq is None:
+            raise ValueError("No reference sequence found in manifest or config")
+
+        # Write FASTA
+        output_path = Path(output.fasta)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(f">reference\n{ref_seq}\n")
+
+
+rule trim_adapters:
+    """
+    Trim adapters using cutadapt directly.
+    TruSeq adapter sequences for paired-end Illumina data.
+    """
+    input:
+        r1 = lambda w: sample_info[w.sample]['r1_path'],
+        r2 = lambda w: sample_info[w.sample]['r2_path']
+    output:
+        r1 = OUTPUT_DIR / "{sample}" / "trimmed" / "R1_trimmed.fastq.gz",
+        r2 = OUTPUT_DIR / "{sample}" / "trimmed" / "R2_trimmed.fastq.gz"
+    log:
+        OUTPUT_DIR / "{sample}" / "logs" / "trim.log"
+    threads: 2
+    shell:
+        """
+        mkdir -p $(dirname {output.r1})
+        cutadapt \
+            -a AGATCGGAAGAGCACACGTCTGAACTCCAGTCA \
+            -A AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT \
+            -j {threads} \
+            -m 20 \
+            -o {output.r1} \
+            -p {output.r2} \
+            {input.r1} {input.r2} \
+            > {log} 2>&1
+        """
+
+
+rule align_bwa:
+    """
+    Align with BWA-MEM.
+    """
+    input:
+        r1 = OUTPUT_DIR / "{sample}" / "trimmed" / "R1_trimmed.fastq.gz",
+        r2 = OUTPUT_DIR / "{sample}" / "trimmed" / "R2_trimmed.fastq.gz",
+        ref = OUTPUT_DIR / "reference.fasta"
+    output:
+        bam = OUTPUT_DIR / "{sample}" / "alignments" / "bwa.bam"
+    log:
+        OUTPUT_DIR / "{sample}" / "logs" / "bwa.log"
+    threads: THREADS_PER_SAMPLE
+    shell:
+        """
+        mkdir -p $(dirname {output.bam})
+        bwa mem -t {threads} {input.ref} {input.r1} {input.r2} 2>{log} | \
+        samtools view -@ 2 -b -o {output.bam} - 2>>{log}
+        """
+
+
+rule align_bbmap:
+    """
+    Align with BBMap.
+    """
+    input:
+        r1 = OUTPUT_DIR / "{sample}" / "trimmed" / "R1_trimmed.fastq.gz",
+        r2 = OUTPUT_DIR / "{sample}" / "trimmed" / "R2_trimmed.fastq.gz",
+        ref = OUTPUT_DIR / "reference.fasta"
+    output:
+        bam = OUTPUT_DIR / "{sample}" / "alignments" / "bbmap.bam"
+    log:
+        OUTPUT_DIR / "{sample}" / "logs" / "bbmap.log"
+    threads: THREADS_PER_SAMPLE
+    shell:
+        """
+        mkdir -p $(dirname {output.bam})
+        bbmap.sh \
+            in={input.r1} \
+            in2={input.r2} \
+            ref={input.ref} \
+            out={output.bam} \
+            threads={threads} \
+            nodisk \
+            2>{log}
+        """
+
+
+rule align_minimap2:
+    """
+    Align with minimap2.
+    """
+    input:
+        r1 = OUTPUT_DIR / "{sample}" / "trimmed" / "R1_trimmed.fastq.gz",
+        r2 = OUTPUT_DIR / "{sample}" / "trimmed" / "R2_trimmed.fastq.gz",
+        ref = OUTPUT_DIR / "reference.fasta"
+    output:
+        bam = OUTPUT_DIR / "{sample}" / "alignments" / "minimap2.bam"
+    log:
+        OUTPUT_DIR / "{sample}" / "logs" / "minimap2.log"
+    threads: THREADS_PER_SAMPLE
+    shell:
+        """
+        mkdir -p $(dirname {output.bam})
+        minimap2 -ax sr -t {threads} {input.ref} {input.r1} {input.r2} 2>{log} | \
+        samtools view -@ 2 -b -o {output.bam} - 2>>{log}
+        """
+
+
+rule classify_reads:
+    """
+    Classify reads using per-sample guide/donor sequences.
+    Uses external Python script to avoid subprocess import issues.
+    Requires all three aligners (BWA, BBMap, minimap2) for triple-aligner consensus.
+    """
+    input:
+        bwa = OUTPUT_DIR / "{sample}" / "alignments" / "bwa.bam",
+        bbmap = OUTPUT_DIR / "{sample}" / "alignments" / "bbmap.bam",
+        minimap2 = OUTPUT_DIR / "{sample}" / "alignments" / "minimap2.bam",
+        manifest = MANIFEST
+    output:
+        tsv = OUTPUT_DIR / "{sample}" / "classification.tsv"
+    log:
+        OUTPUT_DIR / "{sample}" / "logs" / "classify.log"
+    params:
+        reference = lambda w: sample_info[w.sample]['reference'] if sample_info[w.sample]['reference'] and not pd.isna(sample_info[w.sample]['reference']) else DEFAULT_REF,
+        guide = lambda w: sample_info[w.sample]['guide'] if sample_info[w.sample]['guide'] and not pd.isna(sample_info[w.sample]['guide']) else DEFAULT_GUIDE,
+        hdr_template = lambda w: sample_info[w.sample]['hdr_template'] if sample_info[w.sample]['hdr_template'] and not pd.isna(sample_info[w.sample]['hdr_template']) else DEFAULT_HDR,
+        analysis_window = ANALYSIS_WINDOW,
+        large_deletion_min = LARGE_DELETION_MIN,
+        hdr_threshold = HDR_THRESHOLD
+    script:
+        str(WORKFLOW_DIR / "scripts" / "classify_sample.py")
+
+
+rule aggregate_results:
+    """
+    Aggregate per-sample classification results into summary table.
+    Uses external Python script.
+    """
+    input:
+        expand(OUTPUT_DIR / "{sample}" / "classification.tsv", sample=SAMPLES)
+    output:
+        tsv = OUTPUT_DIR / "summary" / "all_samples_results.tsv"
+    params:
+        samples = SAMPLES,
+        output_dir = OUTPUT_DIR
+    script:
+        str(WORKFLOW_DIR / "scripts" / "aggregate_results.py")
