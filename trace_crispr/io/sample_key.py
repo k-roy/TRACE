@@ -40,6 +40,7 @@ class Sample:
     reference: Optional[str] = None
     hdr_template: Optional[str] = None
     guide: Optional[str] = None
+    nuclease: Optional[str] = None  # "cas9" or "cas12a"
 
     def __post_init__(self):
         if self.metadata is None:

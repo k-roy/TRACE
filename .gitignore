@@ -79,3 +79,10 @@ test_data/
 *.fastq.gz
 *.fq
 *.fq.gz
+
+# Snakemake
+.snakemake/
+
+# Test files
+test_*.png
+test_*.log

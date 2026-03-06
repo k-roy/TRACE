@@ -171,38 +171,77 @@ def run(reference, hdr_template, guide, r1, r2, sample_key, output,
 
         # Check if samples have per-sample loci or need CLI defaults
         samples_with_custom = [s for s in samples if s.has_custom_locus()]
+        samples_without_custom = [s for s in samples if not s.has_custom_locus()]
 
         if samples_with_custom:
-            # Per-sample loci detected - not yet fully supported in pipeline
-            click.echo(f"\nNote: {len(samples_with_custom)} samples have per-sample locus overrides")
-            click.echo("  Per-sample loci will be used for those samples.")
+            click.echo(f"\n✓ {len(samples_with_custom)}/{n_samples} samples have per-sample sequences")
 
-        # Need CLI defaults for samples without per-sample loci, or for the pipeline default
-        if not all([default_ref_seq, default_hdr_seq, default_guide]):
-            samples_without_custom = [s for s in samples if not s.has_custom_locus()]
-            if samples_without_custom:
-                missing_samples = [s.sample_id for s in samples_without_custom[:5]]
-                click.echo(f"Error: {len(samples_without_custom)} samples need defaults", err=True)
-                click.echo(f"  Provide --reference, --hdr-template, --guide for samples: {', '.join(missing_samples)}{'...' if len(samples_without_custom) > 5 else ''}", err=True)
+            # Validate that per-sample sequences are complete
+            incomplete = []
+            for s in samples_with_custom:
+                missing_fields = []
+                if not s.reference and not default_ref_seq:
+                    missing_fields.append('reference')
+                if not s.guide and not default_guide:
+                    missing_fields.append('guide')
+                if not s.hdr_template and not default_hdr_seq:
+                    missing_fields.append('hdr_template')
+
+                if missing_fields:
+                    incomplete.append(f"{s.sample_id}: missing {', '.join(missing_fields)}")
+
+            if incomplete:
+                click.echo("\nERROR: Samples with incomplete per-sample sequences:", err=True)
+                for msg in incomplete[:10]:  # Show first 10
+                    click.echo(f"  - {msg}", err=True)
+                if len(incomplete) > 10:
+                    click.echo(f"  ... and {len(incomplete)-10} more", err=True)
                 sys.exit(1)
+        else:
+            click.echo(f"\nUsing global sequences for all {n_samples} samples")
 
-        # Use CLI defaults for locus config
+        # Check if defaults are needed
+        if samples_without_custom and not all([default_ref_seq, default_hdr_seq, default_guide]):
+            missing_samples = [s.sample_id for s in samples_without_custom[:5]]
+            click.echo(
+                f"\nERROR: {len(samples_without_custom)} samples don't have per-sample sequences, "
+                "but no defaults provided via --reference, --guide, --hdr-template",
+                err=True
+            )
+            click.echo(f"  Samples needing defaults: {', '.join(missing_samples)}{'...' if len(samples_without_custom) > 5 else ''}", err=True)
+            sys.exit(1)
+
+        # Use CLI defaults for locus config (may be None if all samples have custom sequences)
         ref_seq = default_ref_seq
         hdr_seq = default_hdr_seq
 
-        try:
+        # Create default locus config (if defaults provided)
+        if ref_seq and hdr_seq and default_guide:
+            try:
+                locus = LocusConfig(
+                    name="analysis",
+                    reference=ref_seq,
+                    hdr_template=hdr_seq,
+                    guide=default_guide,
+                    nuclease=nuclease_type,
+                ).analyze()
+            except ValueError as e:
+                click.echo(f"Error analyzing locus: {e}", err=True)
+                sys.exit(1)
+
+            locus.print_summary()
+        else:
+            # All samples must have per-sample sequences
+            # Create a dummy locus using the first sample's sequences for initialization
+            first_custom_sample = samples_with_custom[0]
             locus = LocusConfig(
-                name="analysis",
-                reference=ref_seq,
-                hdr_template=hdr_seq,
-                guide=default_guide,
+                name="default",
+                reference=first_custom_sample.reference or "ATCG",  # Dummy if needed
+                hdr_template=first_custom_sample.hdr_template or "ATCG",
+                guide=first_custom_sample.guide or "ATCGATCGATCGATCGATCG",
                 nuclease=nuclease_type,
             ).analyze()
-        except ValueError as e:
-            click.echo(f"Error analyzing locus: {e}", err=True)
-            sys.exit(1)
-
-        locus.print_summary()
+            click.echo("\nNo global defaults - all samples use per-sample sequences")
 
         click.echo(f"\nProcessing {n_samples} samples with {threads} threads...")
 

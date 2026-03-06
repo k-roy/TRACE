@@ -20,6 +20,39 @@ TRACE is a comprehensive tool for quantifying CRISPR editing outcomes from ampli
 
 ## Recent Updates
 
+### Version 0.5.0 (2026-03-05)
+
+**New Features:**
+- **Per-sample guide/donor/reference sequences**: Each sample can now use different guide RNAs, donor templates, and reference sequences from the manifest file
+- **Snakemake workflow**: Official workflow for parallel processing with automatic dependency tracking and resumability
+- **Flexible sequence input**: Specify per-sample sequences in manifest columns or use CLI defaults for all samples
+- **Locus config caching**: Per-sample configurations are cached by sequence content to optimize processing of biological replicates
+
+**Usage:**
+```bash
+# All samples with per-sample sequences (no CLI defaults needed)
+trace run --sample-key manifest.tsv --output results/
+
+# Mix of per-sample and default sequences
+trace run \
+  --reference "ATCG..." \
+  --guide "AGAG..." \
+  --hdr-template "ATCG..." \
+  --sample-key manifest.tsv \
+  --output results/
+```
+
+**Snakemake Workflow:**
+```bash
+# Full pipeline (trim → triple-align → classify)
+snakemake --configfile config.yaml --cores 24
+
+# Classification only (if alignments exist)
+snakemake --forcerun classify_reads aggregate_results --cores 24
+```
+
+The Snakemake workflow runs all three aligners (BWA-MEM, BBMap, minimap2) and uses the first successful aligner for classification, matching the core TRACE triple-aligner approach. See [workflow/README.md](workflow/README.md) for detailed documentation.
+
 ### Version 0.4.0 (2026-02-20)
 
 **New Features:**
@@ -178,21 +211,50 @@ trace run \
   --threads 16
 ```
 
-### Per-sample locus sequences
+### Per-sample locus sequences (NEW in v0.5.0)
 
-For multiplexed experiments with different target loci, you can specify `reference`, `hdr_template`, and `guide` per-sample in the sample key TSV:
+**TRACE now supports heterogeneous experiments where different samples use different guide RNAs, donor templates, or reference sequences.**
+
+For experiments with different target loci, editing strategies, or guides across samples, you can specify `reference`, `hdr_template`, `guide`, and optionally `nuclease` per-sample in the sample key TSV:
 
 ```
-sample_id	r1_path	r2_path	condition	reference	hdr_template	guide
-sample_1	/path/S1_R1.fq.gz	/path/S1_R2.fq.gz	treatment
-sample_2	/path/S2_R1.fq.gz	/path/S2_R2.fq.gz	control
-sample_3	/path/S3_R1.fq.gz	/path/S3_R2.fq.gz	treatment	locus2.fasta	locus2_hdr.fasta	ACGTACGTACGTACGTACGT
-sample_4	/path/S4_R1.fq.gz	/path/S4_R2.fq.gz	control	locus2.fasta	locus2_hdr.fasta	ACGTACGTACGTACGTACGT
+sample_id	r1_path	r2_path	reference	guide	hdr_template
+sample_1	S1_R1.fq.gz	S1_R2.fq.gz	ATCG...	AGAGAAACACACTGTACTCCGT	ATCG...
+sample_2	S2_R1.fq.gz	S2_R2.fq.gz	ATCG...	TTGGTTACAACTCTGACCCA	ATCG...
+sample_3	S3_R1.fq.gz	S3_R2.fq.gz	locus2.fasta	ACGTACGTACGTACGTACGT	locus2_hdr.fasta
 ```
 
-- **Empty values**: Use CLI defaults (`--reference`, `--hdr-template`, `--guide`)
-- **Filled values**: Override CLI defaults for that sample
-- Values can be DNA sequences or FASTA file paths
+**Flexible usage patterns:**
+
+#### Option 1: All samples with per-sample sequences
+```bash
+trace run \
+  --sample-key manifest_with_sequences.tsv \
+  --output results/ \
+  --threads 16
+```
+No CLI defaults needed if all samples have complete sequence columns.
+
+#### Option 2: Mix of per-sample and default sequences
+```bash
+trace run \
+  --reference default_ref.fasta \      # Default for samples without custom reference
+  --guide GCTGAAGCACTGCACGCCGT \       # Default for samples without custom guide
+  --hdr-template default_hdr.fasta \   # Default for samples without custom template
+  --sample-key manifest.tsv \
+  --output results/
+```
+Samples with per-sample columns use those sequences; others use CLI defaults.
+
+**Sequence input formats:**
+- **DNA strings**: `ATCGATCGATCG...` (case-insensitive, converted to uppercase)
+- **FASTA files**: Path to `.fa` or `.fasta` file (first sequence used)
+
+**Performance note:**
+TRACE caches per-sample locus configurations. Samples with identical sequences (e.g., biological replicates) share the same locus config, k-mer classifier, and HDR signature for efficiency.
+
+**Example use case:**
+Testing sgRNA_1 vs sgRNA_2 on the same locus, or comparing 125bp vs 346bp donors across samples in a single analysis run.
 
 ### Multi-Template Analysis (Barcode Screening)
 

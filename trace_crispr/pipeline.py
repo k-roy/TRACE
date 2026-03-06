@@ -59,46 +59,116 @@ class EditingPipeline:
 
     def __init__(self, config: PipelineConfig):
         self.config = config
-        self.locus = config.locus
+        self.default_locus = config.locus  # Default for samples without custom locus
         self.aligner_manager = AlignerManager()
 
-        # Prepare HDR signature for classification
+        # Prepare default HDR signature for classification
         self._prepare_hdr_signature()
 
-        # Prepare k-mer classifier
+        # Prepare default k-mer classifier
         self._prepare_kmer_classifier()
 
+        # Cache for per-sample locus configs (to avoid recomputing for replicates)
+        self._sample_locus_cache: Dict[str, LocusConfig] = {}
+        self._sample_kmer_cache: Dict[str, KmerClassifier] = {}
+        self._sample_signature_cache: Dict[str, List[int]] = {}
+
     def _prepare_hdr_signature(self):
-        """Prepare HDR signature positions for classification."""
-        if not self.locus.edits:
-            self.hdr_signature = []
+        """Prepare default HDR signature positions for classification."""
+        if not self.default_locus.edits:
+            self.default_hdr_signature = []
             return
 
         # Create aligned reference and HDR sequences
-        ref = self.locus.reference
-        hdr = self.locus.hdr_template
+        ref = self.default_locus.reference
+        hdr = self.default_locus.hdr_template
 
         # Ensure same length for signature detection
         min_len = min(len(ref), len(hdr))
-        self.hdr_signature = get_hdr_signature_positions(
+        self.default_hdr_signature = get_hdr_signature_positions(
             ref[:min_len], hdr[:min_len]
         )
 
-        logger.info(f"HDR signature: {len(self.hdr_signature)} positions")
+        logger.info(f"Default HDR signature: {len(self.default_hdr_signature)} positions")
 
     def _prepare_kmer_classifier(self):
-        """Prepare k-mer classifier."""
-        edit_positions = [e.position for e in self.locus.edits]
+        """Prepare default k-mer classifier."""
+        edit_positions = [e.position for e in self.default_locus.edits]
 
         contamination_seq = self.config.contaminant_sequence
 
-        self.kmer_classifier = KmerClassifier.from_sequences(
-            reference=self.locus.reference,
-            hdr_template=self.locus.hdr_template,
+        self.default_kmer_classifier = KmerClassifier.from_sequences(
+            reference=self.default_locus.reference,
+            hdr_template=self.default_locus.hdr_template,
             edit_positions=edit_positions,
             contamination_sequence=contamination_seq,
             kmer_size=self.config.contaminant_kmer_size,
         )
+
+    def _get_sample_locus(self, sample: Sample):
+        """
+        Get locus config, kmer classifier, and HDR signature for a sample.
+
+        Uses per-sample sequences if available, otherwise uses defaults.
+        Caches results to avoid recomputing for samples with same sequences.
+
+        Returns:
+            Tuple of (LocusConfig, KmerClassifier, List[int])
+        """
+        from .config import NucleaseType, parse_sequence_input
+
+        if not sample.has_custom_locus():
+            return (self.default_locus, self.default_kmer_classifier, self.default_hdr_signature)
+
+        # Create cache key from sample's custom sequences
+        cache_key = f"{sample.reference}|{sample.guide}|{sample.hdr_template}|{sample.nuclease}"
+
+        if cache_key in self._sample_locus_cache:
+            return (
+                self._sample_locus_cache[cache_key],
+                self._sample_kmer_cache[cache_key],
+                self._sample_signature_cache[cache_key]
+            )
+
+        # Parse per-sample sequences
+        reference = parse_sequence_input(sample.reference) if sample.reference else self.default_locus.reference
+        guide = sample.guide.upper() if sample.guide else self.default_locus.guide
+        hdr_template = parse_sequence_input(sample.hdr_template) if sample.hdr_template else self.default_locus.hdr_template
+        nuclease = NucleaseType[sample.nuclease.upper()] if sample.nuclease else self.default_locus.nuclease
+
+        # Create sample-specific LocusConfig
+        locus_config = LocusConfig(
+            name=f"{sample.sample_id}_locus",
+            reference=reference,
+            hdr_template=hdr_template,
+            guide=guide,
+            nuclease=nuclease
+        )
+        locus_config.analyze()  # Find guide, detect edits, etc.
+
+        # Create sample-specific KmerClassifier
+        edit_positions = [e.position for e in locus_config.edits]
+        kmer_classifier = KmerClassifier.from_sequences(
+            reference=reference,
+            hdr_template=hdr_template,
+            edit_positions=edit_positions,
+            contamination_sequence=self.config.contaminant_sequence,
+            kmer_size=self.config.contaminant_kmer_size,
+        )
+
+        # Create sample-specific HDR signature
+        min_len = min(len(reference), len(hdr_template))
+        hdr_signature = get_hdr_signature_positions(
+            reference[:min_len],
+            hdr_template[:min_len]
+        )
+
+        # Cache results
+        self._sample_locus_cache[cache_key] = locus_config
+        self._sample_kmer_cache[cache_key] = kmer_classifier
+        self._sample_signature_cache[cache_key] = hdr_signature
+
+        return (locus_config, kmer_classifier, hdr_signature)
 
     def run(self, samples: List[Sample] = None) -> List[SampleResult]:
         """
@@ -124,17 +194,24 @@ class EditingPipeline:
         # Create output directory
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Create reference FASTA
+        # Create reference FASTA (using default locus)
         ref_fasta = self.config.output_dir / "reference.fasta"
-        create_reference_fasta(self.locus.reference, ref_fasta)
+        create_reference_fasta(self.default_locus.reference, ref_fasta)
 
         # Process samples
         results = []
         for i, sample in enumerate(samples):
             logger.info(f"Processing sample {i+1}/{len(samples)}: {sample.sample_id}")
 
+            # Get sample-specific or default locus config
+            locus_config, kmer_classifier, hdr_signature = self._get_sample_locus(sample)
+
+            # Log if using custom sequences
+            if sample.has_custom_locus():
+                logger.info(f"  Using per-sample sequences for {sample.sample_id}")
+
             try:
-                result = self._process_sample(sample, ref_fasta)
+                result = self._process_sample(sample, ref_fasta, locus_config, kmer_classifier, hdr_signature)
                 results.append(result)
             except Exception as e:
                 logger.error(f"Error processing {sample.sample_id}: {e}")
@@ -157,6 +234,9 @@ class EditingPipeline:
         self,
         sample: Sample,
         ref_fasta: Path,
+        locus_config: LocusConfig,
+        kmer_classifier: KmerClassifier,
+        hdr_signature: List[int],
     ) -> SampleResult:
         """Process a single sample through the pipeline."""
         sample_dir = self.config.output_dir / sample.sample_id
@@ -169,7 +249,7 @@ class EditingPipeline:
         kmer_results = classify_fastq_kmer(
             sample.r1_path,
             sample.r2_path,
-            self.kmer_classifier,
+            kmer_classifier,
         )
 
         # Step 2: Adapter trimming
@@ -231,6 +311,8 @@ class EditingPipeline:
         classification_result = self._classify_from_alignments(
             alignment_results,
             sample_dir,
+            locus_config,
+            hdr_signature,
         )
 
         # Step 6: CRISPResso (if enabled)
@@ -238,7 +320,7 @@ class EditingPipeline:
         crispresso_nhej = None
         if self.config.run_crispresso:
             logger.info("  Running CRISPResso2...")
-            crispresso_result = self._run_crispresso(sample, sample_dir)
+            crispresso_result = self._run_crispresso(sample, sample_dir, locus_config)
             if crispresso_result:
                 crispresso_hdr = crispresso_result.hdr_rate
                 crispresso_nhej = crispresso_result.nhej_rate
@@ -268,6 +350,8 @@ class EditingPipeline:
         self,
         alignment_results: Dict,
         sample_dir: Path,
+        locus_config: LocusConfig,
+        hdr_signature: List[int],
     ) -> Dict:
         """Classify reads from alignment results."""
         # Find successful alignments
@@ -278,7 +362,7 @@ class EditingPipeline:
             return {}
 
         # Get cut site from locus config
-        cut_site = self.locus.guide_info.cleavage_site if self.locus.guide_info else 0
+        cut_site = locus_config.guide_info.cleavage_site if locus_config.guide_info else 0
 
         # Process reads from all aligners and select best
         classifications = []
@@ -307,7 +391,7 @@ class EditingPipeline:
                     # Classify read
                     result = classify_read(
                         read,
-                        self.hdr_signature,
+                        hdr_signature,
                         cut_site,
                         window_size=self.config.analysis_window,
                         large_del_min_size=self.config.large_deletion_min,
@@ -359,7 +443,7 @@ class EditingPipeline:
             'nondedup_nhej_count': nondedup_nhej,
         }
 
-    def _run_crispresso(self, sample: Sample, sample_dir: Path):
+    def _run_crispresso(self, sample: Sample, sample_dir: Path, locus_config: LocusConfig):
         """Run CRISPResso2 for a sample."""
         runner = CRISPRessoRunner()
 
@@ -372,10 +456,10 @@ class EditingPipeline:
         return runner.run(
             r1_fastq=sample.r1_path,
             r2_fastq=sample.r2_path,
-            amplicon_seq=self.locus.reference,
-            guide_seq=self.locus.guide,
+            amplicon_seq=locus_config.reference,
+            guide_seq=locus_config.guide,
             output_dir=crispresso_dir,
-            hdr_seq=self.locus.hdr_template,
+            hdr_seq=locus_config.hdr_template,
             name=sample.sample_id,
         )
 
