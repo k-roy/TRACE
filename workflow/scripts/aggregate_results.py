@@ -31,7 +31,13 @@ def main():
                     'HDR_PERFECT': 0,
                     'HDR_IMPERFECT': 0,
                     'HDR_total': 0,
-                    'PARTIAL_HDR': 0,
+                    'ANY_HDR': 0,
+                    'SNV_0': 0,
+                    'SNV_1': 0,
+                    'SNV_2': 0,
+                    'SNV_3': 0,
+                    'SNV_4': 0,
+                    'SNV_5': 0,
                     'NHEJ_DELETION': 0,
                     'NHEJ_INSERTION': 0,
                     'NHEJ_total': 0,
@@ -39,9 +45,9 @@ def main():
                     'LARGE_DELETION': 0,
                     'UNCLASSIFIED': 0,
                     'HDR_pct': 0.0,
+                    'ANY_HDR_pct': 0.0,
                     'NHEJ_pct': 0.0,
-                    'WT_pct': 0.0,
-                    'PARTIAL_HDR_pct': 0.0
+                    'WT_pct': 0.0
                 })
             else:
                 # Count outcomes (using correct outcome names from classifier)
@@ -67,12 +73,30 @@ def main():
                 # Unclassified
                 unclassified = outcome_counts.get('UNCLASSIFIED', 0)
 
-                # Partial HDR: reads with any hdr_match_fraction > 0 but not classified as HDR
-                # This captures reads where some donor SNVs are incorporated
-                partial_hdr = 0
+                # Per-SNV incorporation levels (based on hdr_match_fraction)
+                # With 5 signature positions: 0.2=1SNV, 0.4=2SNV, 0.6=3SNV, 0.8=4SNV, 1.0=5SNV
+                snv_counts = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+                any_hdr = 0
+
                 if 'hdr_match_fraction' in df.columns:
-                    partial_hdr = len(df[(df['hdr_match_fraction'] > 0) &
-                                          (~df['outcome'].isin(['HDR_PERFECT', 'HDR_IMPERFECT']))])
+                    # Any HDR = reads with at least 1 donor SNV incorporated
+                    any_hdr = len(df[df['hdr_match_fraction'] > 0])
+
+                    # Count reads at each SNV level
+                    # Using bins: 0, 0.2, 0.4, 0.6, 0.8, 1.0 (assuming 5 signature positions)
+                    for frac, count in df['hdr_match_fraction'].value_counts().items():
+                        if frac == 0.0:
+                            snv_counts[0] += count
+                        elif frac <= 0.2:
+                            snv_counts[1] += count
+                        elif frac <= 0.4:
+                            snv_counts[2] += count
+                        elif frac <= 0.6:
+                            snv_counts[3] += count
+                        elif frac <= 0.8:
+                            snv_counts[4] += count
+                        else:  # > 0.8 (including 1.0)
+                            snv_counts[5] += count
 
                 results.append({
                     'sample_id': sample_id,
@@ -80,7 +104,13 @@ def main():
                     'HDR_PERFECT': hdr_perfect,
                     'HDR_IMPERFECT': hdr_imperfect,
                     'HDR_total': hdr_total,
-                    'PARTIAL_HDR': partial_hdr,
+                    'ANY_HDR': any_hdr,
+                    'SNV_0': snv_counts[0],
+                    'SNV_1': snv_counts[1],
+                    'SNV_2': snv_counts[2],
+                    'SNV_3': snv_counts[3],
+                    'SNV_4': snv_counts[4],
+                    'SNV_5': snv_counts[5],
                     'NHEJ_DELETION': nhej_del,
                     'NHEJ_INSERTION': nhej_ins,
                     'NHEJ_total': nhej_total,
@@ -88,9 +118,9 @@ def main():
                     'LARGE_DELETION': large_del,
                     'UNCLASSIFIED': unclassified,
                     'HDR_pct': 100.0 * hdr_total / total if total > 0 else 0.0,
+                    'ANY_HDR_pct': 100.0 * any_hdr / total if total > 0 else 0.0,
                     'NHEJ_pct': 100.0 * nhej_total / total if total > 0 else 0.0,
-                    'WT_pct': 100.0 * wt / total if total > 0 else 0.0,
-                    'PARTIAL_HDR_pct': 100.0 * partial_hdr / total if total > 0 else 0.0
+                    'WT_pct': 100.0 * wt / total if total > 0 else 0.0
                 })
 
     # Write summary
