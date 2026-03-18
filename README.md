@@ -2,111 +2,130 @@
 
 **T**riple-aligner **R**ead **A**nalysis for **C**RISPR **E**diting
 
-TRACE is a comprehensive tool for quantifying CRISPR editing outcomes from amplicon sequencing data. It combines multiple alignment strategies with k-mer classification to provide robust, accurate measurements of HDR, NHEJ, and other editing outcomes.
+Robust quantification of CRISPR editing outcomes from amplicon sequencing data using consensus alignment across BWA-MEM, BBMap, and minimap2.
 
-## Features
+[![PyPI version](https://badge.fury.io/py/trace-crispr.svg)](https://pypi.org/project/trace-crispr/)
+[![Bioconda](https://img.shields.io/conda/vn/bioconda/trace-crispr.svg)](https://bioconda.github.io/recipes/trace-crispr/README.html)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-- **Triple-aligner consensus**: Uses BWA-MEM, BBMap, and minimap2 for robust alignment
-- **Flexible input**: Accepts DNA sequences directly or FASTA file paths
-- **Automatic inference**: Detects PAM, cleavage site, homology arms, and edits from sequences
-- **Large edit support**: Handles insertions up to 50+ bp with automatic k-mer size adjustment
-- **K-mer classification**: Fast pre-alignment HDR/WT detection (auto-sizes k-mers based on edit)
-- **Barcode-optimized k-mers**: Auto-detects barcode-style templates and generates discriminating k-mers
-- **Multi-nuclease support**: Cas9 and Cas12a (Cpf1) with correct cleavage geometry
-- **Robust UMI detection**: 3-pass algorithm handles variable primer quality and low-signal libraries
-- **Auto-detection**: Library type (TruSeq/Tn5), UMI presence, read merging need
-- **PCR deduplication**: Automatic UMI-based (TruSeq) or position-based (Tn5) deduplication
-- **CRISPResso2 integration**: Validation with standard CRISPR analysis tool
+## Quick Start
 
-## Recent Updates
-
-### Version 0.6.0 (2026-03-07)
-
-**New Features:**
-- **Edit distance HDR detection**: New default classification method that handles clustered SNVs correctly
-  - Checks if each read mismatch brings the sequence closer to the donor template
-  - Filters to "core edit region" (±30bp from cut site) to exclude flanking sequence variations
-  - Tracks per-SNV integration for conversion tract analysis
-  - Handles cases where aligners represent clustered SNVs as indels
-
-- **Conversion tract analysis**: Per-SNV integration frequencies by distance from cut site
-  - Outputs `hdr_snv_detail.tsv` with integration frequency at each donor SNV position
-  - Enables analysis of how far HDR extends from the cut site
-  - Useful for understanding donor template design and nickase strand effects
-
-**Classification outcomes:**
-- `HDR_COMPLETE`: All expected donor SNVs present, no additional edits
-- `HDR_PARTIAL`: Subset of donor SNVs present, no additional edits
-- `NHEJ`: Indels near cut site, no donor SNVs
-- `MIXED`: Both donor SNVs and non-donor edits (potential NHEJ + partial HDR)
-- `WT`: No edits detected
-
-### Version 0.5.0 (2026-03-05)
-
-**New Features:**
-- **Per-sample guide/donor/reference sequences**: Each sample can now use different guide RNAs, donor templates, and reference sequences from the manifest file
-- **Snakemake workflow**: Official workflow for parallel processing with automatic dependency tracking and resumability
-- **Flexible sequence input**: Specify per-sample sequences in manifest columns or use CLI defaults for all samples
-- **Locus config caching**: Per-sample configurations are cached by sequence content to optimize processing of biological replicates
-
-**Usage:**
 ```bash
-# All samples with per-sample sequences (no CLI defaults needed)
-trace run --sample-key manifest.tsv --output results/
+# Install
+pip install trace-crispr
 
-# Mix of per-sample and default sequences
+# Run on a single sample
 trace run \
-  --reference "ATCG..." \
-  --guide "AGAG..." \
-  --hdr-template "ATCG..." \
-  --sample-key manifest.tsv \
+  --reference amplicon.fasta \
+  --hdr-template donor.fasta \
+  --guide GCTGAAGCACTGCACGCCGT \
+  --r1 sample_R1.fastq.gz \
+  --r2 sample_R2.fastq.gz \
   --output results/
+
+# Run on multiple samples
+trace run \
+  --reference amplicon.fasta \
+  --hdr-template donor.fasta \
+  --guide GCTGAAGCACTGCACGCCGT \
+  --sample-key samples.tsv \
+  --output results/ \
+  --threads 16
 ```
 
-**Snakemake Workflow:**
-```bash
-# Full pipeline (trim → triple-align → classify)
-snakemake --configfile config.yaml --cores 24
+## Output
 
-# Classification only (if alignments exist)
-snakemake --forcerun classify_reads aggregate_results --cores 24
+### Editing Summary
+
+TRACE produces a per-sample summary table with editing outcomes:
+
+```
+sample          total_reads  HDR_%   NHEJ_%  WT_%   LgDel_%
+─────────────────────────────────────────────────────────────
+sample_01       125,432      45.2    12.3    38.1   4.4
+sample_02       98,765       52.1    8.7     35.8   3.4
+sample_03       112,890      48.9    15.2    31.2   4.7
 ```
 
-The Snakemake workflow runs all three aligners (BWA-MEM, BBMap, minimap2) and uses the first successful aligner for classification, matching the core TRACE triple-aligner approach. See [workflow/README.md](workflow/README.md) for detailed documentation.
+**Classification categories:**
+| Outcome | Description |
+|---------|-------------|
+| `HDR_COMPLETE` | All donor SNVs integrated, no additional edits |
+| `HDR_PARTIAL` | Subset of donor SNVs, no additional edits |
+| `NHEJ` | Indels near cut site, no donor sequence |
+| `MIXED` | Both donor SNVs and non-donor edits |
+| `WT` | No edits detected |
+| `LARGE_DELETION` | Deletions spanning >50bp |
 
-### Version 0.4.0 (2026-02-20)
+### Conversion Tract Analysis
 
-**New Features:**
-- **Alignment-only classification (now default)**: Pure alignment-based classification using multi-reference FASTA (WT + all HDR variants). More accurate than k-mer classification, especially for experiments with many similar barcodes.
-- **Full-length HDR builder**: Automatically builds full amplicon sequences from short donor templates using homology arm detection
-- **Global sequence deduplication**: Filter low-count sequences across all samples with `min_global_count` parameter
-- **Primary-only alignments**: When aligning to multi-reference FASTA, secondary alignments are suppressed by default
+For HDR samples, TRACE outputs per-SNV integration frequencies showing how donor sequence propagates from the cut site:
 
-**Breaking Changes:**
-- `alignment_only` parameter now defaults to `True`. Set `alignment_only=False` for legacy k-mer mode.
+```
+position  distance_to_cut  ref  donor  frequency  count
+────────────────────────────────────────────────────────
+125       -3               T    A      0.95       1,234
+127       -1               G    C      0.92       1,198
+130       +2               A    T      0.87       1,132
+135       +7               C    G      0.71       923
+142       +14              T    A      0.45       585
+```
 
-**Bug Fixes:**
-- Fixed BBMap subprocess deadlock caused by stderr buffer overflow
-- Fixed version mismatch between `__init__.py` and `pyproject.toml`
+**Interpretation:** SNVs near the cut site show high integration (>90%), decreasing with distance. This reveals conversion tract length and strand bias in HDR repair.
 
-See [CHANGELOG.md](CHANGELOG.md) for full details.
+### Pooled Summary (Technical Replicates)
 
-### Version 0.3.1 (2026-02-17)
+For experiments with technical replicates, TRACE generates a pooled summary with weighted statistics:
 
-**Critical Bug Fixes:**
-- **3-pass UMI detection algorithm**: Dramatically improves merge rates for libraries with weak primer signals
-  - Pass 1: Strong signal detection (>50% consensus) - high confidence
-  - Pass 2: Weak signal detection (>30% consensus, ≥4bp UMI) - medium confidence
-  - Pass 3: Jump detection with 6bp fallback - handles poor quality data
-  - **Impact**: Merge rate improved from 35% to 92.5% on HEK293 EMX1 test dataset (80 samples)
+```
+bio_sample  n_reps  HDR_pct_mean  HDR_pct_sem  NHEJ_pct_mean  total_reads_sum
+──────────────────────────────────────────────────────────────────────────────
+gene_A      3       45.2          1.3          12.1           356,087
+gene_B      3       52.8          0.9          8.4            312,456
+gene_C      3       38.1          2.1          18.7           298,234
+```
 
-**Optimizations:**
-- **Barcode-style template auto-detection**: Automatically identifies when templates share homology arms with different barcodes
-- **Optimized k-mer generation**: Generates k-mers that span barcode boundaries for better discrimination
-- **Multi-template batch processing**: ~100x faster classification through global sequence deduplication
+## How It Works
 
-**Dependencies:**
-- Added CRISPResso2 to optional validation dependencies (`pip install trace-crispr[validation]`)
+### Triple-Aligner Consensus
+
+TRACE uses three independent aligners to maximize accuracy:
+
+```
+                    ┌─────────────┐
+     Raw Reads ────►│   BWA-MEM   │────┐
+                    └─────────────┘    │
+                    ┌─────────────┐    │     ┌───────────────┐     ┌────────────┐
+     Raw Reads ────►│   BBMap     │────┼────►│   Consensus   │────►│  Classify  │
+                    └─────────────┘    │     └───────────────┘     └────────────┘
+                    ┌─────────────┐    │
+     Raw Reads ────►│  minimap2   │────┘
+                    └─────────────┘
+```
+
+Each aligner has different strengths—BWA-MEM for accuracy, BBMap for gapped alignments, minimap2 for speed. TRACE takes the consensus to reduce aligner-specific artifacts.
+
+### Edit Distance Classification
+
+TRACE classifies reads by measuring edit distance to both reference and donor sequences:
+
+1. **Align** read to reference amplicon
+2. **Extract** mismatches in core edit region (±30bp from cut site)
+3. **Check** if each mismatch brings sequence closer to donor template
+4. **Classify** based on SNV pattern and presence of indels
+
+This handles complex cases where aligners represent clustered SNVs as indels.
+
+### Automatic Detection
+
+TRACE auto-detects library characteristics:
+
+| Detection | Method |
+|-----------|--------|
+| **Library type** | TruSeq (fixed primers) vs Tn5 (tagmented) based on read start clustering |
+| **UMI presence** | Sequence diversity analysis at read starts |
+| **Read overlap** | Determines if R1/R2 can be merged |
+| **PCR duplicates** | UMI-based (TruSeq) or position-based (Tn5) deduplication |
 
 ## Installation
 
@@ -116,13 +135,15 @@ See [CHANGELOG.md](CHANGELOG.md) for full details.
 pip install trace-crispr
 ```
 
-### conda (includes external aligners)
+### conda (includes aligners)
 
 ```bash
 conda install -c bioconda -c conda-forge trace-crispr
 ```
 
-### Development installation
+This installs BWA, BBMap, minimap2, and samtools automatically.
+
+### Development
 
 ```bash
 git clone https://github.com/k-roy/TRACE.git
@@ -130,65 +151,23 @@ cd TRACE
 pip install -e ".[dev]"
 ```
 
-## Quick Start
+## Usage
 
-TRACE accepts sequences as either **DNA strings** or **FASTA file paths**.
+### Check Locus Configuration
 
-### Example 1: Using FASTA files
-
-```bash
-trace run \
-  --reference amplicon.fasta \
-  --hdr-template hdr_template.fasta \
-  --guide GCTGAAGCACTGCACGCCGT \
-  --r1 sample_R1.fastq.gz \
-  --r2 sample_R2.fastq.gz \
-  --output results/
-```
-
-### Example 2: Using DNA sequences directly
-
-The reference amplicon will typically be longer than the HDR template so that the primers specifically amplify the target locus. This example shows a 250 bp reference sequence where the donor template is 150 bp long with the designed edit in the middle.
-
-```bash
-# Reference amplicon (250 bp) - includes flanking regions
-# Guide sequence shown in lowercase for illustration
-REF="ATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG\
-ATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG\
-gctgaagcactgcacgccgttgg\
-ATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG\
-ATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG"
-
-# HDR template (150 bp) - centered on edit site
-# Guide in lowercase, designed edit (T->A) shown in UPPERCASE
-HDR="ATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG\
-gctgaagcactgcacgccgtAga\
-ATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCGATCG"
-
-trace run \
-  -r "$REF" \
-  -h "$HDR" \
-  -g GCTGAAGCACTGCACGCCGT \
-  --r1 sample_R1.fastq.gz \
-  --output results/
-```
-
-**Note:** The guide and edit are shown here in lowercase/uppercase for illustrative purposes. This formatting is not necessary - TRACE will automatically detect guide and edit positions from the sequences.
-
-### Check locus configuration without running
+Before running, verify TRACE correctly detects your editing design:
 
 ```bash
 trace info \
   --reference amplicon.fasta \
-  --hdr-template hdr_template.fasta \
+  --hdr-template donor.fasta \
   --guide GCTGAAGCACTGCACGCCGT
 ```
 
-This will print:
-
+Output:
 ```
 ============================================================
-=== TRACE Analysis Configuration ===
+TRACE Analysis Configuration
 ============================================================
 
 Reference sequence: 231 bp
@@ -196,445 +175,149 @@ HDR template: 127 bp
   - Template aligns at position 53 in reference
 
 Donor template analysis:
-  - Left homology arm: positions 53-124 on reference (72 bp)
-  - Right homology arm: positions 128-179 on reference (52 bp)
+  - Left homology arm: positions 53-124 (72 bp)
+  - Right homology arm: positions 128-179 (52 bp)
 
   Edits detected (2 total):
     * Position 125: T -> A (substitution)
     * Position 127: G -> A (substitution)
 
 Guide analysis:
-  - Guide sequence: GCTGAAGCACTGCACGCCGT
-  - Guide targets: positions 105-124 on reference (+ strand)
-  - PAM: TGG at positions 125-127 on reference
-  - Cleavage site: position 122 on reference
+  - Guide: GCTGAAGCACTGCACGCCGT
+  - Target: positions 105-124 (+ strand)
+  - PAM: TGG at positions 125-127
+  - Cleavage site: position 122
 ```
 
-### Multiple samples
+### Sample Key Format
 
-Create a sample key TSV:
+Create a TSV file with sample information:
 
 ```
-sample_id	r1_path	r2_path	condition
-sample_1	/path/to/S1_R1.fastq.gz	/path/to/S1_R2.fastq.gz	treatment
-sample_2	/path/to/S2_R1.fastq.gz	/path/to/S2_R2.fastq.gz	control
+sample_id    r1_path                  r2_path                  condition
+sample_01    /path/to/S1_R1.fastq.gz  /path/to/S1_R2.fastq.gz  treatment
+sample_02    /path/to/S2_R1.fastq.gz  /path/to/S2_R2.fastq.gz  treatment
+sample_03    /path/to/S3_R1.fastq.gz  /path/to/S3_R2.fastq.gz  control
 ```
 
-Then run:
+### Per-Sample Sequences
+
+For experiments with different guides/donors per sample:
+
+```
+sample_id  r1_path      r2_path      reference      guide                   hdr_template
+sample_01  S1_R1.fq.gz  S1_R2.fq.gz  locus1.fasta   AGAGAAACACACTGTACTCCGT  donor1.fasta
+sample_02  S2_R1.fq.gz  S2_R2.fq.gz  locus2.fasta   TTGGTTACAACTCTGACCCA    donor2.fasta
+```
 
 ```bash
-trace run \
-  --reference amplicon.fasta \
-  --hdr-template hdr_template.fasta \
-  --guide GCTGAAGCACTGCACGCCGT \
-  --sample-key samples.tsv \
-  --output results/ \
-  --threads 16
+trace run --sample-key manifest.tsv --output results/
 ```
-
-### Per-sample locus sequences (NEW in v0.5.0)
-
-**TRACE now supports heterogeneous experiments where different samples use different guide RNAs, donor templates, or reference sequences.**
-
-For experiments with different target loci, editing strategies, or guides across samples, you can specify `reference`, `hdr_template`, `guide`, and optionally `nuclease` per-sample in the sample key TSV:
-
-```
-sample_id	r1_path	r2_path	reference	guide	hdr_template
-sample_1	S1_R1.fq.gz	S1_R2.fq.gz	ATCG...	AGAGAAACACACTGTACTCCGT	ATCG...
-sample_2	S2_R1.fq.gz	S2_R2.fq.gz	ATCG...	TTGGTTACAACTCTGACCCA	ATCG...
-sample_3	S3_R1.fq.gz	S3_R2.fq.gz	locus2.fasta	ACGTACGTACGTACGTACGT	locus2_hdr.fasta
-```
-
-**Flexible usage patterns:**
-
-#### Option 1: All samples with per-sample sequences
-```bash
-trace run \
-  --sample-key manifest_with_sequences.tsv \
-  --output results/ \
-  --threads 16
-```
-No CLI defaults needed if all samples have complete sequence columns.
-
-#### Option 2: Mix of per-sample and default sequences
-```bash
-trace run \
-  --reference default_ref.fasta \      # Default for samples without custom reference
-  --guide GCTGAAGCACTGCACGCCGT \       # Default for samples without custom guide
-  --hdr-template default_hdr.fasta \   # Default for samples without custom template
-  --sample-key manifest.tsv \
-  --output results/
-```
-Samples with per-sample columns use those sequences; others use CLI defaults.
-
-**Sequence input formats:**
-- **DNA strings**: `ATCGATCGATCG...` (case-insensitive, converted to uppercase)
-- **FASTA files**: Path to `.fa` or `.fasta` file (first sequence used)
-
-**Performance note:**
-TRACE caches per-sample locus configurations. Samples with identical sequences (e.g., biological replicates) share the same locus config, k-mer classifier, and HDR signature for efficiency.
-
-**Example use case:**
-Testing sgRNA_1 vs sgRNA_2 on the same locus, or comparing 125bp vs 346bp donors across samples in a single analysis run.
 
 ### Multi-Template Analysis (Barcode Screening)
 
-For barcode screening experiments where multiple HDR templates (barcodes) are possible, use the `multi-template` command:
+For experiments with multiple possible HDR templates:
 
 ```bash
-# Generate HDR templates FASTA from keyfiles
-trace generate-templates \
-  --sample-key keyfiles/sample_key.tsv \
-  --seq-ref keyfiles/guide_donor_and_reference_info.tsv \
-  --output templates/hdr_templates.fasta
-
-# Generate sample manifest from keyfiles
-trace generate-manifest \
-  --sample-key keyfiles/sample_key.tsv \
-  --plate-key keyfiles/plate_key.tsv \
-  --raw-data-dir raw_data/ \
-  --output trace_sample_key.tsv
-
-# Run multi-template analysis
 trace multi-template \
-  --reference templates/reference.fasta \
-  --hdr-templates templates/hdr_templates.fasta \
+  --reference amplicon.fasta \
+  --hdr-templates all_barcodes.fasta \
   --guide GAGTCCGAGCAGAAGAAGAA \
-  --sample-key trace_sample_key.tsv \
-  --output results/ \
-  --threads 16
+  --sample-key samples.tsv \
+  --output results/
 ```
 
-**Output tables:**
-- `per_sample_editing_outcomes_all_methods.tsv` - Summary per sample
-- `per_sample_per_template_outcomes.tsv` - Granular per-template results
-
-**Features:**
-- Detects which barcode/template is present in each read
-- Purity checking (detects unexpected barcodes)
-- AMBIGUOUS category for reads matching multiple barcodes
-- Expected template validation via `expected_barcode` column
-- Parallel processing with configurable threads
-
-### Using Cas12a
+### Cas12a Support
 
 ```bash
 trace run \
   --reference amplicon.fasta \
-  --hdr-template hdr_template.fasta \
+  --hdr-template donor.fasta \
   --guide GCTGAAGCACTGCACGCCGTAA \
   --nuclease cas12a \
   --sample-key samples.tsv \
   --output results/
 ```
 
-## Auto-Detection
+| Nuclease | PAM | Cleavage |
+|----------|-----|----------|
+| Cas9 | NGG (3' of guide) | Blunt, 3bp from PAM |
+| Cas12a | TTTN (5' of guide) | Staggered, 18-23bp from PAM |
 
-TRACE automatically detects library characteristics to optimize analysis:
+### Snakemake Workflow
 
-### Library Type Detection
-
-TRACE distinguishes between **TruSeq** (fixed-target amplicon) and **Tn5** (tagmented locus) libraries by analyzing read alignment positions:
-
-- **TruSeq**: Reads cluster at fixed start positions (primer binding sites)
-- **Tn5**: Reads have scattered start positions (random Tn5 cutting)
-
-```
-Auto-detection results:
-  - Library type: TruSeq (100% of reads cluster at fixed start position)
-  - UMI detection: UMIs of length 6 bp detected
-    --> Entering PCR deduplication mode...
-```
-
-### UMI Detection
-
-For TruSeq libraries, TRACE detects UMIs (Unique Molecular Identifiers) by analyzing sequence diversity at read starts:
-
-- High diversity region = UMI
-- Low diversity region = primer sequence
-- Automatically determines UMI length (typically 4-12 bp)
-
-### Preprocessing Modes
-
-Based on detection results, TRACE automatically selects the optimal preprocessing workflow:
-
-| Library | UMIs | Overlap (>=15bp) | Preprocessing | Output |
-|---------|------|------------------|---------------|--------|
-| TruSeq | Yes | Yes | dedup → trim → merge → collapse | merged FASTQ |
-| TruSeq | Yes | No | dedup → trim | paired FASTQs |
-| TruSeq | No | Yes | trim → merge → collapse | merged FASTQ |
-| TruSeq | No | No | trim | paired FASTQs |
-| Tn5 | N/A | Yes | trim → merge → collapse → align → position dedup | merged FASTQ |
-| Tn5 | N/A | No | trim → align → position dedup | paired FASTQs |
-
-Example output:
-```
-Auto-detection results:
-  - Library type: TruSeq (100% of reads cluster at fixed start position)
-  - UMI detection: UMIs of length 6 bp detected
-  - Read overlap: Enabled (~50bp overlap (25% of amplicon))
-  - Preprocessing: dedup-trim-merge-collapse -> merged
-    (UMI dedup -> trim -> merge -> collapse)
-  - CRISPResso mode: merged (merged reads from preprocessing)
-```
-
-## Designed Edit Detection
-
-TRACE automatically detects the edits encoded in the donor by first aligning the HDR template to the reference. TRACE then classifies the intended edit as a single-nucleotide variant (SNV), multi-nucleotide variant (MNV), insertion, or deletion.
-
-K-mers are selected that span the designed edit and are unique to the reference and donor. For large edits, TRACE automatically increases the k-mer size to ensure reliable classification. TRACE can handle MNVs or insertions with lengths up to the read length - 50 bp (e.g., 100 bp insertions can be detected with 150 bp reads).
-
-Example output for a 20 bp insertion:
-```
-Edits detected (1 total):
-  * Position 125: +ATCGATCGATCGATCGATCG (20 bp insertion)
-
-Maximum edit size: 20 bp
-Recommended k-mer size: 30 bp
-```
-
-## Nuclease Support
-
-### Cas9 (SpCas9)
-- PAM: NGG (3' of protospacer)
-- Cleavage: 3 bp upstream of PAM (blunt ends)
-
-### Cas12a (LbCpf1)
-- PAM: TTTN (5' of protospacer)
-- Cleavage: 18-19 bp downstream on target strand, 23 bp on non-target
-- Creates 4-5 nt 5' overhang (staggered cut)
-
-## Output
-
-### Per-sample classification
-
-The main output is a TSV file with per-sample editing outcomes:
-
-| Column | Description |
-|--------|-------------|
-| sample | Sample ID |
-| classifiable_reads | Total classifiable reads |
-| duplicate_rate | PCR duplicate rate |
-| WT_% | Wild-type % |
-| HDR_% | HDR % (complete + partial) |
-| HDR_COMPLETE_% | HDR with all donor SNVs |
-| HDR_PARTIAL_% | HDR with subset of donor SNVs |
-| NHEJ_% | NHEJ % |
-| MIXED_% | Mixed HDR + NHEJ events |
-| LgDel_% | Large deletion % |
-
-### Per-SNV integration detail (conversion tract analysis)
-
-For samples with HDR templates, TRACE outputs `hdr_snv_detail.tsv` tracking integration at each donor SNV position:
-
-| Column | Description |
-|--------|-------------|
-| position | Genomic position of SNV |
-| distance_to_cut | Signed distance from cut site (negative = 5' of cut) |
-| ref_base | Base in reference sequence |
-| donor_base | Base in donor template |
-| frequency | Integration frequency among HDR reads |
-| count | Number of reads with this SNV |
-
-**Interpretation**: This file reveals **conversion tract patterns** - how far donor sequence gets incorporated from the cut site. Typical findings:
-- SNVs near the cut site have higher integration frequency
-- Integration frequency decreases with distance from cut
-- Nickase strand preference affects the gradient (5' vs 3' of cut)
-
-**Note**: The frequencies are among reads already classified as HDR (complete, partial, or mixed) - not overall HDR rates.
-
-For Tn5/tagmented data or TruSeq amplicons with UMIs, TRACE will report on the PCR duplication rate and automatically perform deduplication:
-- **TruSeq with UMIs**: Pre-alignment UMI-based deduplication
-- **Tn5**: Post-alignment position-based deduplication
-
-## Analysis and Visualization
-
-TRACE includes an analysis module for comparing editing outcomes across conditions with statistical testing and publication-quality visualizations.
-
-### Installation
-
-The analysis module requires additional dependencies for visualization:
+For large-scale processing:
 
 ```bash
-pip install trace-crispr[visualization]
+snakemake --configfile config.yaml --cores 24
 ```
 
-Or install scipy, matplotlib, and seaborn separately:
+See [workflow/README.md](workflow/README.md) for details.
 
-```bash
-pip install scipy matplotlib seaborn
-```
+## Analysis Module
 
-### Basic Usage
-
-#### Compare conditions from pipeline results
+Compare editing outcomes across conditions with statistical testing:
 
 ```python
 from trace_crispr.analysis import (
     compare_metric_by_condition,
     results_to_dataframe,
-    get_condition_stats,
     plot_condition_comparison,
 )
 
-# After running the TRACE pipeline
-results = pipeline.run_all(samples)
-
-# Compare HDR rates across conditions
+# Compare HDR rates
 comparisons = compare_metric_by_condition(
     results, samples,
-    condition_col='treatment',      # Column in sample metadata
-    metric='dedup_hdr_pct',         # Metric to compare
-    base_condition='control'        # Reference condition for t-tests
+    condition_col='treatment',
+    metric='dedup_hdr_pct',
+    base_condition='control'
 )
 
-# View results as a DataFrame
+# View statistics
 print(comparisons.to_dataframe())
 ```
 
-Output:
 ```
-     condition base_condition        metric  condition_mean  condition_std  ...  p_value  p_adjusted significance
-0  treatment_A        control  dedup_hdr_pct           25.41           2.63  ...   0.0003      0.0006          ***
-1  treatment_B        control  dedup_hdr_pct           12.15           1.89  ...   0.4521      0.4521           ns
+     condition        metric  mean   std   p_value  significance
+0  treatment_A  dedup_hdr_pct  25.4  2.63   0.0003          ***
+1  treatment_B  dedup_hdr_pct  12.1  1.89   0.4521           ns
 ```
 
-#### Create bar plots with replicate points
+### Visualization
 
 ```python
-# Convert results to DataFrame and get stats
-df = results_to_dataframe(results, samples)
-stats = get_condition_stats(df, 'treatment', 'dedup_hdr_pct')
-
-# Create bar plot with individual points and significance stars
 fig = plot_condition_comparison(
     stats, comparisons,
     base_condition='control',
     title='HDR Rate by Treatment',
     ylabel='HDR Rate (%)'
 )
-fig.savefig('hdr_comparison.png', dpi=150, bbox_inches='tight')
+fig.savefig('hdr_comparison.png', dpi=150)
 ```
 
-This creates a bar chart showing:
-- Mean values as bars
-- Individual replicate values as overlaid points (with jitter)
-- Standard error of mean (SEM) as error bars
-- Significance stars above significantly different conditions
+Install visualization dependencies:
 
-#### Work directly with DataFrames
-
-If you already have a DataFrame (e.g., from a previous analysis):
-
-```python
-from trace_crispr.analysis import (
-    compare_dataframe_by_condition,
-    get_condition_stats,
-    plot_condition_comparison,
-)
-import pandas as pd
-
-# Load existing data
-df = pd.read_csv('editing_outcomes.tsv', sep='\t')
-
-# Compare conditions
-comparisons = compare_dataframe_by_condition(
-    df,
-    condition_col='treatment',
-    metric='dedup_hdr_pct',
-    base_condition='control'
-)
-
-# Get stats and plot
-stats = get_condition_stats(df, 'treatment', 'dedup_hdr_pct')
-fig = plot_condition_comparison(stats, comparisons)
-```
-
-#### Get summary statistics
-
-```python
-from trace_crispr.analysis import get_condition_summary
-
-# Generate summary table for all metrics
-summary = get_condition_summary(results, samples, condition_col='treatment')
-print(summary[['condition', 'n', 'dedup_hdr_pct_mean', 'dedup_hdr_pct_sem']])
-```
-
-Output:
-```
-     condition  n  dedup_hdr_pct_mean  dedup_hdr_pct_sem
-0      control  4               10.25               0.68
-1  treatment_A  4               25.41               1.32
-2  treatment_B  4               12.15               0.94
-```
-
-### Statistical Methods
-
-- **T-test**: Welch's t-test (unequal variances) comparing each condition to the base
-- **FDR correction**: Benjamini-Hochberg correction applied by default (disable with `fdr_correction=False`)
-- **Significance thresholds**: `*` (p < 0.05), `**` (p < 0.01), `***` (p < 0.001)
-
-### Available Functions
-
-| Function | Description |
-|----------|-------------|
-| `compare_metric_by_condition()` | Main entry point - compare a metric across conditions from SampleResults |
-| `compare_dataframe_by_condition()` | Compare conditions from an existing DataFrame |
-| `get_condition_summary()` | Generate summary statistics table |
-| `results_to_dataframe()` | Convert SampleResult list to DataFrame |
-| `get_condition_stats()` | Calculate mean, std, sem, n for each condition |
-| `compare_conditions()` | Perform statistical comparisons between conditions |
-| `plot_condition_comparison()` | Bar plot with points, error bars, and significance stars |
-| `plot_comparison_summary()` | Forest/bar plot of fold changes |
-| `plot_replicate_correlation()` | Scatter plot comparing two metrics |
-| `plot_multi_metric_comparison()` | Multi-panel comparison across metrics |
-
-### Plot Customization
-
-```python
-fig = plot_condition_comparison(
-    stats, comparisons,
-    base_condition='control',
-    title='HDR Rate by Treatment',
-    ylabel='HDR Rate (%)',
-    figsize=(12, 6),              # Figure size
-    bar_color='#22c55e',          # Color for treatment bars (green)
-    base_color='#888888',         # Color for base condition (gray)
-    point_alpha=0.6,              # Transparency for data points
-    jitter=0.15,                  # Horizontal spread for points
-    show_significance=True,       # Show significance stars
-    condition_order=['control', 'treatment_A', 'treatment_B'],  # Custom order
-)
+```bash
+pip install trace-crispr[visualization]
 ```
 
 ## Dependencies
 
-### Python (Core)
-- click>=8.0
-- pysam>=0.20
-- pandas>=1.5
-- numpy>=1.20
-- pyyaml>=6.0
-- rapidfuzz>=3.0
-- tqdm>=4.60
+**Python (core):** click, pysam, pandas, numpy, pyyaml, rapidfuzz, tqdm
 
-### Python (Visualization - optional)
-- matplotlib>=3.5
-- seaborn>=0.12
-- scipy>=1.9
+**Python (visualization):** matplotlib, seaborn, scipy
 
-Install with: `pip install trace-crispr[visualization]`
+**External (via conda):** bwa, bbmap, minimap2, samtools
 
-### External tools (via conda)
-- bwa>=0.7
-- bbmap>=39
-- minimap2>=2.24
-- samtools>=1.16
-- crispresso2 (optional, but enabled by default)
+## Citation
+
+If you use TRACE in your research, please cite:
+
+> Roy, K.R. et al. (2026). TRACE: Triple-aligner Read Analysis for CRISPR Editing. *In preparation.*
 
 ## Author
 
-Kevin R. Roy
+Kevin R. Roy (kevinrjroy@gmail.com)
 
 ## License
 
