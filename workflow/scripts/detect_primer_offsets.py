@@ -6,11 +6,12 @@ For merged paired-end reads, the structure is:
   5' end: [R1_UMI][R1_primer][amplicon_core][R2_primer_RC][R2_UMI_RC] :3' end
 
 This script:
-1. Samples merged reads from each primer pair
-2. Detects UMI presence/length on BOTH 5' and 3' ends (by diversity analysis)
-3. Compares primer pairs to find common amplicon core
-4. Calculates trim lengths for both ends to produce identical core sequences
-5. Outputs configuration for the collapse step
+1. Detects library type (TruSeq vs Tn5) based on read start position clustering
+2. For TruSeq: Detects UMI presence/length on BOTH 5' and 3' ends
+3. For Tn5: Skips UMI detection (Tn5 libraries don't have UMIs)
+4. Compares primer pairs to find common amplicon core
+5. Calculates trim lengths for both ends to produce identical core sequences
+6. Outputs configuration for the collapse step
 
 This enables cache sharing across all primer pairs.
 """
@@ -22,6 +23,135 @@ from collections import Counter
 from difflib import SequenceMatcher
 
 import pandas as pd
+
+
+# Adapter signatures for library type detection
+TN5_ADAPTER = "CTGTCTCTTATACACATCT"
+TRUSEQ_ADAPTER = "AGATCGGAAGAGC"
+
+
+def detect_library_type(r1_reads, r2_reads, reference=None, n_reads=1000):
+    """
+    Auto-detect TruSeq vs Tn5 based on adapter signatures and position clustering.
+
+    Primary detection: Adapter signatures in reads
+    - Tn5: CTGTCTCTTATACACATCT (Nextera/Tn5 transposase)
+    - TruSeq: AGATCGGAAGAGC
+
+    Secondary detection: Position clustering (if reference provided)
+    - TruSeq: Reads cluster at fixed start positions (fixed primers)
+    - Tn5: Reads have scattered start positions (random tagmentation)
+
+    Returns: dict with library_type, confidence, and detection_reason
+    """
+    if not r1_reads:
+        return {
+            'library_type': 'TruSeq',
+            'confidence': 'low',
+            'detection_reason': 'no reads found, defaulting to TruSeq'
+        }
+
+    # Count adapter signatures
+    tn5_count = sum(1 for r in r1_reads[:n_reads] if TN5_ADAPTER in r.upper())
+    truseq_count = sum(1 for r in r1_reads[:n_reads] if TRUSEQ_ADAPTER in r.upper())
+    reads_checked = min(len(r1_reads), n_reads)
+
+    tn5_fraction = tn5_count / reads_checked if reads_checked > 0 else 0
+    truseq_fraction = truseq_count / reads_checked if reads_checked > 0 else 0
+
+    # Primary detection: adapter signatures
+    if tn5_fraction > 0.1 and tn5_fraction > truseq_fraction * 2:
+        return {
+            'library_type': 'Tn5',
+            'confidence': 'high' if tn5_fraction > 0.3 else 'medium',
+            'detection_reason': f'Nextera adapter in {tn5_fraction:.1%} of reads',
+            'tn5_adapter_fraction': tn5_fraction,
+            'truseq_adapter_fraction': truseq_fraction
+        }
+    elif truseq_fraction > 0.1 and truseq_fraction > tn5_fraction * 2:
+        return {
+            'library_type': 'TruSeq',
+            'confidence': 'high' if truseq_fraction > 0.3 else 'medium',
+            'detection_reason': f'TruSeq adapter in {truseq_fraction:.1%} of reads',
+            'tn5_adapter_fraction': tn5_fraction,
+            'truseq_adapter_fraction': truseq_fraction
+        }
+
+    # Secondary detection: position clustering (if reference provided)
+    if reference:
+        position_clustering, n_unique = _calculate_position_clustering(r1_reads, reference)
+
+        if position_clustering >= 0.7:
+            return {
+                'library_type': 'TruSeq',
+                'confidence': 'high' if position_clustering >= 0.85 else 'medium',
+                'detection_reason': f'{position_clustering:.0%} of reads cluster at fixed start position',
+                'position_clustering': position_clustering,
+                'n_unique_positions': n_unique
+            }
+        elif n_unique >= 20 and position_clustering < 0.5:
+            return {
+                'library_type': 'Tn5',
+                'confidence': 'high' if position_clustering < 0.3 else 'medium',
+                'detection_reason': f'scattered start positions ({n_unique} unique positions)',
+                'position_clustering': position_clustering,
+                'n_unique_positions': n_unique
+            }
+
+    # Default to TruSeq if ambiguous
+    return {
+        'library_type': 'TruSeq',
+        'confidence': 'low',
+        'detection_reason': 'ambiguous, defaulting to TruSeq'
+    }
+
+
+def _calculate_position_clustering(reads, reference, kmer_size=15):
+    """Calculate position clustering for library type detection."""
+    ref_upper = reference.upper()
+    ref_rc = reverse_complement(ref_upper)
+
+    # Build k-mer index
+    ref_kmers = {}
+    for i in range(len(ref_upper) - kmer_size + 1):
+        kmer = ref_upper[i:i + kmer_size]
+        if kmer not in ref_kmers:
+            ref_kmers[kmer] = i
+    for i in range(len(ref_rc) - kmer_size + 1):
+        kmer = ref_rc[i:i + kmer_size]
+        if kmer not in ref_kmers:
+            ref_kmers[kmer] = len(ref_upper) - i - kmer_size
+
+    # Find start positions
+    start_positions = []
+    for read in reads[:500]:
+        if len(read) < kmer_size + 20:
+            continue
+        for offset in range(0, min(60, len(read) - kmer_size)):
+            read_kmer = read[offset:offset + kmer_size].upper()
+            if read_kmer in ref_kmers:
+                ref_pos = ref_kmers[read_kmer]
+                read_start = ref_pos - offset
+                if 0 <= read_start < len(ref_upper):
+                    start_positions.append(read_start)
+                    break
+
+    if not start_positions:
+        return 0.0, 0
+
+    position_counts = Counter(start_positions)
+    n_unique = len(position_counts)
+
+    if position_counts:
+        dominant_pos, dominant_count = position_counts.most_common(1)[0]
+        clustered_count = sum(
+            count for pos, count in position_counts.items()
+            if abs(pos - dominant_pos) <= 5
+        )
+        position_clustering = clustered_count / len(start_positions)
+        return position_clustering, n_unique
+
+    return 0.0, 0
 
 
 def sample_reads(fastq_path, n_reads=1000):
@@ -305,6 +435,7 @@ def analyze_primer_pairs(manifest_df, n_samples_per_pp=5, n_reads=1000):
     Analyze all primer pairs in the manifest.
 
     Returns configuration dict with:
+    - Library type (TruSeq or Tn5)
     - Per primer pair: UMI info (both ends), trim lengths
     - Common core sequence
     - Cache sharing statistics
@@ -336,6 +467,8 @@ def analyze_primer_pairs(manifest_df, n_samples_per_pp=5, n_reads=1000):
     read_sets = {}
     umi_info_5prime = {}
     umi_info_3prime = {}
+    all_r1_for_libtype = []
+    all_r2_for_libtype = []
 
     for pp in primer_pairs:
         pp_samples = manifest_df[manifest_df['primer_pair'] == pp]
@@ -353,24 +486,52 @@ def analyze_primer_pairs(manifest_df, n_samples_per_pp=5, n_reads=1000):
                 all_r2_reads.extend(r2_reads)
 
         read_sets[pp] = all_r1_reads  # Use R1 for core finding
+        all_r1_for_libtype.extend(all_r1_reads[:500])
+        all_r2_for_libtype.extend(all_r2_reads[:500])
 
-        # Detect UMI on 5' end (from R1)
-        has_umi_5, umi_len_5 = detect_umi_5prime(all_r1_reads)
-        umi_info_5prime[pp] = {'has_umi': has_umi_5, 'umi_length': umi_len_5}
+        # We'll detect UMI after library type is known
+        umi_info_5prime[pp] = {'has_umi': False, 'umi_length': 0}
+        umi_info_3prime[pp] = {'has_umi': False, 'umi_length': 0}
 
-        # Detect UMI on 3' end (from R2's 5' end - this becomes 3' after merging)
-        # Use detect_umi_5prime on R2 since UMI is at R2's 5' end
-        if all_r2_reads:
-            has_umi_3, umi_len_3 = detect_umi_5prime(all_r2_reads)
-        else:
-            has_umi_3, umi_len_3 = False, 0
-        umi_info_3prime[pp] = {'has_umi': has_umi_3, 'umi_length': umi_len_3}
+    # Detect library type FIRST (before UMI detection)
+    library_info = detect_library_type(all_r1_for_libtype, all_r2_for_libtype, reference)
+    library_type = library_info['library_type']
+
+    # For TruSeq: detect UMIs
+    # For Tn5: skip UMI detection (Tn5 libraries don't have UMIs)
+    if library_type == 'TruSeq':
+        for pp in primer_pairs:
+            pp_samples = manifest_df[manifest_df['primer_pair'] == pp]
+
+            all_r1_reads = []
+            all_r2_reads = []
+            for _, sample in pp_samples.head(n_samples_per_pp).iterrows():
+                r1_reads = sample_reads(sample['r1_path'], n_reads=n_reads)
+                all_r1_reads.extend(r1_reads)
+
+                if 'r2_path' in sample and pd.notna(sample['r2_path']):
+                    r2_reads = sample_reads(sample['r2_path'], n_reads=n_reads)
+                    all_r2_reads.extend(r2_reads)
+
+            # Detect UMI on 5' end (from R1)
+            has_umi_5, umi_len_5 = detect_umi_5prime(all_r1_reads)
+            umi_info_5prime[pp] = {'has_umi': has_umi_5, 'umi_length': umi_len_5}
+
+            # Detect UMI on 3' end (from R2's 5' end)
+            if all_r2_reads:
+                has_umi_3, umi_len_3 = detect_umi_5prime(all_r2_reads)
+            else:
+                has_umi_3, umi_len_3 = False, 0
+            umi_info_3prime[pp] = {'has_umi': has_umi_3, 'umi_length': umi_len_3}
+    # For Tn5: UMI info stays as False/0 (already set above)
 
     # Find common core across all primer pairs
     core_result = find_common_core(read_sets, umi_info_5prime, umi_info_3prime, reference=reference)
 
     # Build final configuration
     config = {
+        'library_type': library_type,
+        'library_detection': library_info,
         'primer_pairs': {},
         'common_core': {
             'sequence': core_result['common_core'][:50] + '...' if len(core_result['common_core']) > 50 else core_result['common_core'],
@@ -431,16 +592,28 @@ def main():
         json.dump(config, f, indent=2)
 
     # Generate detailed log
+    lib_info = config['library_detection']
     log_lines = [
         "=" * 70,
         "Primer Pair Offset Detection Results",
         "=" * 70,
         "",
+        f"Library type: {config['library_type']} ({lib_info['detection_reason']})",
+        f"  Confidence: {lib_info['confidence']}",
+        "",
         f"Number of primer pairs: {config['cache_sharing']['num_primer_pairs']}",
         f"Common core length: {config['common_core']['length']} bp",
         "",
-        "Per-primer-pair configuration:",
     ]
+
+    if config['library_type'] == 'Tn5':
+        log_lines.extend([
+            "NOTE: Tn5 library detected - UMI detection skipped",
+            "  Tn5 libraries use position-based deduplication (post-alignment)",
+            "",
+        ])
+
+    log_lines.append("Per-primer-pair configuration:")
 
     for pp, pp_config in config['primer_pairs'].items():
         umi_5_str = f"Yes ({pp_config['umi_5prime']['length']}bp)" if pp_config['umi_5prime']['has_umi'] else "No"

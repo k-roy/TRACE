@@ -137,9 +137,21 @@ def main():
     except Exception as e:
         config = {}
 
+    # Check library type - Tn5 libraries don't have UMIs
+    library_type = config.get('library_type', 'TruSeq')
+    is_tn5 = library_type == 'Tn5'
+
     # Detect primer pair and get trim parameters
     primer_pair = detect_primer_pair(sample_id, config)
     umi_5prime_len, umi_3prime_len, r1_trim, r2_trim = get_trim_params(config, primer_pair)
+
+    # For Tn5: force UMI detection off (Tn5 libraries don't have UMIs)
+    if is_tn5:
+        umi_5prime_len = 0
+        umi_3prime_len = 0
+        r1_trim = 0  # No UMI trimming for Tn5
+        r2_trim = 0
+
     has_umi = (umi_5prime_len > 0) or (umi_3prime_len > 0)
 
     # Create output directory
@@ -279,6 +291,9 @@ def main():
     cache_sharing = config.get('cache_sharing', {})
     num_primer_pairs = cache_sharing.get('num_primer_pairs', 1)
     mode_str = "single-end (R1 only)" if single_end_mode else "paired-end (R1 + R2)"
+    library_str = f"{library_type} library"
+    if is_tn5:
+        library_str += " (position-based dedup will be applied post-alignment)"
 
     if has_umi:
         total_unique_molecules = df['count'].sum() if len(df) > 0 else 0
@@ -287,6 +302,7 @@ def main():
         log_msg = (
             f"Collapsed reads (PAIRED-END MODE - NO MERGING):\n"
             f"  Sample: {sample_id}\n"
+            f"  Library: {library_str}\n"
             f"  Mode: {mode_str}\n"
             f"  Primer pair: {primer_pair}\n"
             f"  Config: UMI({umi_str}), R1_trim={r1_trim}bp, R2_trim={r2_trim}bp\n"
@@ -302,16 +318,20 @@ def main():
         )
     else:
         compression = total_reads / len(df) if len(df) > 0 else 1
+        dedup_note = ""
+        if is_tn5:
+            dedup_note = "\n  📌 Tn5 library: Position-based deduplication will be applied after alignment"
         log_msg = (
             f"Collapsed reads (PAIRED-END MODE - NO MERGING):\n"
             f"  Sample: {sample_id}\n"
+            f"  Library: {library_str}\n"
             f"  Mode: {mode_str}\n"
             f"  Primer pair: {primer_pair}\n"
             f"  Config: R1_trim={r1_trim}bp, R2_trim={r2_trim}bp\n"
             f"  Total reads: {total_reads}\n"
             f"  Too short: {too_short}\n"
             f"  Unique R1/R2 pairs: {len(df)}\n"
-            f"  Compression: {compression:.1f}x\n"
+            f"  Compression: {compression:.1f}x{dedup_note}\n"
             f"  \n"
             f"  ⚠️  NO READ MERGING - R1 and R2 stored separately\n"
             f"  Cache sharing: {num_primer_pairs} primer pairs detected\n"
