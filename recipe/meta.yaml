@@ -1,12 +1,13 @@
-{% set name = "trace" %}
-{% set version = "0.1.0" %}
+{% set name = "trace-crispr" %}
+{% set version = "0.6.0" %}
 
 package:
   name: {{ name }}
   version: {{ version }}
 
 source:
-  path: ..
+  url: https://pypi.io/packages/source/t/trace-crispr/trace_crispr-{{ version }}.tar.gz
+  sha256: 889a1731bd1c9fdbfec39dfc52ba3a03f549d87ab7b184b16ba7637158d94701
 
 build:
   number: 0
@@ -19,7 +20,7 @@ requirements:
   host:
     - python >=3.9
     - pip
-    - setuptools
+    - setuptools >=61.0
   run:
     - python >=3.9
     - click >=8.0
@@ -34,8 +35,6 @@ requirements:
     - bbmap >=39
     - minimap2 >=2.24
     - samtools >=1.16
-    # CRISPResso2 (optional but recommended)
-    - crispresso2
 
 test:
   imports:
@@ -58,6 +57,7 @@ about:
     including HDR, NHEJ, and large deletions using a triple-aligner
     consensus approach (BWA-MEM, BBMap, minimap2).
   dev_url: https://github.com/k-roy/trace
+  doc_url: https://trace-crispr.readthedocs.io
 
 extra:
   recipe-maintainers:
