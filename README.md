@@ -20,6 +20,27 @@ TRACE is a comprehensive tool for quantifying CRISPR editing outcomes from ampli
 
 ## Recent Updates
 
+### Version 0.6.0 (2026-03-07)
+
+**New Features:**
+- **Edit distance HDR detection**: New default classification method that handles clustered SNVs correctly
+  - Checks if each read mismatch brings the sequence closer to the donor template
+  - Filters to "core edit region" (±30bp from cut site) to exclude flanking sequence variations
+  - Tracks per-SNV integration for conversion tract analysis
+  - Handles cases where aligners represent clustered SNVs as indels
+
+- **Conversion tract analysis**: Per-SNV integration frequencies by distance from cut site
+  - Outputs `hdr_snv_detail.tsv` with integration frequency at each donor SNV position
+  - Enables analysis of how far HDR extends from the cut site
+  - Useful for understanding donor template design and nickase strand effects
+
+**Classification outcomes:**
+- `HDR_COMPLETE`: All expected donor SNVs present, no additional edits
+- `HDR_PARTIAL`: Subset of donor SNVs present, no additional edits
+- `NHEJ`: Indels near cut site, no donor SNVs
+- `MIXED`: Both donor SNVs and non-donor edits (potential NHEJ + partial HDR)
+- `WT`: No edits detected
+
 ### Version 0.5.0 (2026-03-05)
 
 **New Features:**
@@ -385,6 +406,8 @@ Recommended k-mer size: 30 bp
 
 ## Output
 
+### Per-sample classification
+
 The main output is a TSV file with per-sample editing outcomes:
 
 | Column | Description |
@@ -393,12 +416,32 @@ The main output is a TSV file with per-sample editing outcomes:
 | classifiable_reads | Total classifiable reads |
 | duplicate_rate | PCR duplicate rate |
 | WT_% | Wild-type % |
-| HDR_% | HDR % |
+| HDR_% | HDR % (complete + partial) |
+| HDR_COMPLETE_% | HDR with all donor SNVs |
+| HDR_PARTIAL_% | HDR with subset of donor SNVs |
 | NHEJ_% | NHEJ % |
+| MIXED_% | Mixed HDR + NHEJ events |
 | LgDel_% | Large deletion % |
-| kmer_hdr_rate | K-mer method HDR rate |
-| crispresso_hdr_rate | CRISPResso2 HDR rate |
-| crispresso_indel_rate | CRISPResso2 indel rate |
+
+### Per-SNV integration detail (conversion tract analysis)
+
+For samples with HDR templates, TRACE outputs `hdr_snv_detail.tsv` tracking integration at each donor SNV position:
+
+| Column | Description |
+|--------|-------------|
+| position | Genomic position of SNV |
+| distance_to_cut | Signed distance from cut site (negative = 5' of cut) |
+| ref_base | Base in reference sequence |
+| donor_base | Base in donor template |
+| frequency | Integration frequency among HDR reads |
+| count | Number of reads with this SNV |
+
+**Interpretation**: This file reveals **conversion tract patterns** - how far donor sequence gets incorporated from the cut site. Typical findings:
+- SNVs near the cut site have higher integration frequency
+- Integration frequency decreases with distance from cut
+- Nickase strand preference affects the gradient (5' vs 3' of cut)
+
+**Note**: The frequencies are among reads already classified as HDR (complete, partial, or mixed) - not overall HDR rates.
 
 For Tn5/tagmented data or TruSeq amplicons with UMIs, TRACE will report on the PCR duplication rate and automatically perform deduplication:
 - **TruSeq with UMIs**: Pre-alignment UMI-based deduplication

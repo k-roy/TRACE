@@ -37,11 +37,16 @@ for _, row in manifest_df.iterrows():
 DEFAULT_REF = config.get("default_reference", "")
 DEFAULT_GUIDE = config.get("default_guide", "")
 DEFAULT_HDR = config.get("default_hdr_template", "")
+# For contamination checking: use this template when sample lacks HDR template
+CONTAMINATION_CHECK_TEMPLATE = config.get("contamination_check_template", "")
 
 # Analysis parameters
 ANALYSIS_WINDOW = config.get("analysis_window", 10)
 LARGE_DELETION_MIN = config.get("large_deletion_min", 50)
 HDR_THRESHOLD = config.get("hdr_threshold", 0.8)
+
+# CRISPResso2 path (default to conda environment path)
+CRISPRESSO_BIN = config.get("crispresso_bin", "/home/groups/larsms/users/kevinroy/anaconda3/envs/crispresso2/bin/CRISPResso")
 
 # Get workflow directory for script paths
 # workflow.basedir gives the directory containing the Snakefile
@@ -49,10 +54,16 @@ HDR_THRESHOLD = config.get("hdr_threshold", 0.8)
 WORKFLOW_DIR = Path("/oak/stanford/groups/larsms/Users/kevinroy/software/trace/workflow")
 
 
+SAMPLES_DIR = OUTPUT_DIR / "samples"
+
 rule all:
     input:
-        expand(OUTPUT_DIR / "{sample}" / "classification.tsv", sample=SAMPLES),
-        OUTPUT_DIR / "summary" / "all_samples_results.tsv"
+        expand(SAMPLES_DIR / "{sample}" / "classification.tsv", sample=SAMPLES),
+        expand(SAMPLES_DIR / "{sample}" / "hdr_snv_detail.tsv", sample=SAMPLES),
+        expand(SAMPLES_DIR / "{sample}" / "alignments" / "bwa_sorted.bam", sample=SAMPLES),
+        OUTPUT_DIR / "summary" / "all_samples_results.tsv",
+        OUTPUT_DIR / "summary" / "crispresso2_results.tsv",
+        OUTPUT_DIR / "summary" / "combined_trace_crispresso2.tsv"
 
 
 rule create_reference_fasta:
@@ -94,10 +105,10 @@ rule trim_adapters:
         r1 = lambda w: sample_info[w.sample]['r1_path'],
         r2 = lambda w: sample_info[w.sample]['r2_path']
     output:
-        r1 = OUTPUT_DIR / "{sample}" / "trimmed" / "R1_trimmed.fastq.gz",
-        r2 = OUTPUT_DIR / "{sample}" / "trimmed" / "R2_trimmed.fastq.gz"
+        r1 = SAMPLES_DIR / "{sample}" / "trimmed" / "R1_trimmed.fastq.gz",
+        r2 = SAMPLES_DIR / "{sample}" / "trimmed" / "R2_trimmed.fastq.gz"
     log:
-        OUTPUT_DIR / "{sample}" / "logs" / "trim.log"
+        SAMPLES_DIR / "{sample}" / "logs" / "trim.log"
     threads: 2
     shell:
         """
@@ -114,18 +125,40 @@ rule trim_adapters:
         """
 
 
+rule index_bwa:
+    """
+    Create BWA index for reference.
+    """
+    input:
+        ref = OUTPUT_DIR / "reference.fasta"
+    output:
+        bwt = OUTPUT_DIR / "reference.fasta.bwt",
+        pac = OUTPUT_DIR / "reference.fasta.pac",
+        ann = OUTPUT_DIR / "reference.fasta.ann",
+        amb = OUTPUT_DIR / "reference.fasta.amb",
+        sa = OUTPUT_DIR / "reference.fasta.sa"
+    log:
+        OUTPUT_DIR / "logs" / "bwa_index.log"
+    shell:
+        """
+        mkdir -p $(dirname {log})
+        bwa index {input.ref} 2>{log}
+        """
+
+
 rule align_bwa:
     """
     Align with BWA-MEM.
     """
     input:
-        r1 = OUTPUT_DIR / "{sample}" / "trimmed" / "R1_trimmed.fastq.gz",
-        r2 = OUTPUT_DIR / "{sample}" / "trimmed" / "R2_trimmed.fastq.gz",
-        ref = OUTPUT_DIR / "reference.fasta"
+        r1 = SAMPLES_DIR / "{sample}" / "trimmed" / "R1_trimmed.fastq.gz",
+        r2 = SAMPLES_DIR / "{sample}" / "trimmed" / "R2_trimmed.fastq.gz",
+        ref = OUTPUT_DIR / "reference.fasta",
+        bwt = OUTPUT_DIR / "reference.fasta.bwt"  # Ensure index exists
     output:
-        bam = OUTPUT_DIR / "{sample}" / "alignments" / "bwa.bam"
+        bam = SAMPLES_DIR / "{sample}" / "alignments" / "bwa.bam"
     log:
-        OUTPUT_DIR / "{sample}" / "logs" / "bwa.log"
+        SAMPLES_DIR / "{sample}" / "logs" / "bwa.log"
     threads: THREADS_PER_SAMPLE
     shell:
         """
@@ -140,13 +173,13 @@ rule align_bbmap:
     Align with BBMap.
     """
     input:
-        r1 = OUTPUT_DIR / "{sample}" / "trimmed" / "R1_trimmed.fastq.gz",
-        r2 = OUTPUT_DIR / "{sample}" / "trimmed" / "R2_trimmed.fastq.gz",
+        r1 = SAMPLES_DIR / "{sample}" / "trimmed" / "R1_trimmed.fastq.gz",
+        r2 = SAMPLES_DIR / "{sample}" / "trimmed" / "R2_trimmed.fastq.gz",
         ref = OUTPUT_DIR / "reference.fasta"
     output:
-        bam = OUTPUT_DIR / "{sample}" / "alignments" / "bbmap.bam"
+        bam = SAMPLES_DIR / "{sample}" / "alignments" / "bbmap.bam"
     log:
-        OUTPUT_DIR / "{sample}" / "logs" / "bbmap.log"
+        SAMPLES_DIR / "{sample}" / "logs" / "bbmap.log"
     threads: THREADS_PER_SAMPLE
     shell:
         """
@@ -158,6 +191,7 @@ rule align_bbmap:
             out={output.bam} \
             threads={threads} \
             nodisk \
+            -Xmx4g \
             2>{log}
         """
 
@@ -167,13 +201,13 @@ rule align_minimap2:
     Align with minimap2.
     """
     input:
-        r1 = OUTPUT_DIR / "{sample}" / "trimmed" / "R1_trimmed.fastq.gz",
-        r2 = OUTPUT_DIR / "{sample}" / "trimmed" / "R2_trimmed.fastq.gz",
+        r1 = SAMPLES_DIR / "{sample}" / "trimmed" / "R1_trimmed.fastq.gz",
+        r2 = SAMPLES_DIR / "{sample}" / "trimmed" / "R2_trimmed.fastq.gz",
         ref = OUTPUT_DIR / "reference.fasta"
     output:
-        bam = OUTPUT_DIR / "{sample}" / "alignments" / "minimap2.bam"
+        bam = SAMPLES_DIR / "{sample}" / "alignments" / "minimap2.bam"
     log:
-        OUTPUT_DIR / "{sample}" / "logs" / "minimap2.log"
+        SAMPLES_DIR / "{sample}" / "logs" / "minimap2.log"
     threads: THREADS_PER_SAMPLE
     shell:
         """
@@ -183,30 +217,49 @@ rule align_minimap2:
         """
 
 
+rule sort_bam:
+    """
+    Sort and index BAM file for visualization.
+    Uses BWA alignments as the primary alignment source.
+    """
+    input:
+        bam = SAMPLES_DIR / "{sample}" / "alignments" / "bwa.bam"
+    output:
+        bam = SAMPLES_DIR / "{sample}" / "alignments" / "bwa_sorted.bam",
+        bai = SAMPLES_DIR / "{sample}" / "alignments" / "bwa_sorted.bam.bai"
+    threads: 2
+    shell:
+        """
+        samtools sort -@ {threads} -o {output.bam} {input.bam}
+        samtools index {output.bam}
+        """
+
+
 rule classify_reads:
     """
     Classify reads using per-sample guide/donor sequences.
-    Uses external Python script to avoid subprocess import issues.
-    Requires all three aligners (BWA, BBMap, minimap2) for triple-aligner consensus.
+    Uses edit distance HDR detection which:
+    - Handles any number of SNVs without combinatorial explosion
+    - Filters to core edits near cut site (ignores flanking sequences)
+    - Tracks per-SNV integration for conversion tract analysis
     """
     input:
-        bwa = OUTPUT_DIR / "{sample}" / "alignments" / "bwa.bam",
-        bbmap = OUTPUT_DIR / "{sample}" / "alignments" / "bbmap.bam",
-        minimap2 = OUTPUT_DIR / "{sample}" / "alignments" / "minimap2.bam",
+        bwa = SAMPLES_DIR / "{sample}" / "alignments" / "bwa.bam",
+        bbmap = SAMPLES_DIR / "{sample}" / "alignments" / "bbmap.bam",
+        minimap2 = SAMPLES_DIR / "{sample}" / "alignments" / "minimap2.bam",
         manifest = MANIFEST
     output:
-        tsv = OUTPUT_DIR / "{sample}" / "classification.tsv"
+        tsv = SAMPLES_DIR / "{sample}" / "classification.tsv",
+        hdr_detail = SAMPLES_DIR / "{sample}" / "hdr_snv_detail.tsv"
     log:
-        OUTPUT_DIR / "{sample}" / "logs" / "classify.log"
+        SAMPLES_DIR / "{sample}" / "logs" / "classify.log"
     params:
         reference = lambda w: sample_info[w.sample]['reference'] if sample_info[w.sample]['reference'] and not pd.isna(sample_info[w.sample]['reference']) else DEFAULT_REF,
         guide = lambda w: sample_info[w.sample]['guide'] if sample_info[w.sample]['guide'] and not pd.isna(sample_info[w.sample]['guide']) else DEFAULT_GUIDE,
         hdr_template = lambda w: sample_info[w.sample]['hdr_template'] if sample_info[w.sample]['hdr_template'] and not pd.isna(sample_info[w.sample]['hdr_template']) else DEFAULT_HDR,
-        analysis_window = ANALYSIS_WINDOW,
-        large_deletion_min = LARGE_DELETION_MIN,
-        hdr_threshold = HDR_THRESHOLD
+        edit_region_size = config.get("edit_region_size", 30)  # bp around cut site for HDR SNVs
     script:
-        str(WORKFLOW_DIR / "scripts" / "classify_sample.py")
+        str(WORKFLOW_DIR / "scripts" / "classify_sample_v2.py")
 
 
 rule aggregate_results:
@@ -215,11 +268,243 @@ rule aggregate_results:
     Uses external Python script.
     """
     input:
-        expand(OUTPUT_DIR / "{sample}" / "classification.tsv", sample=SAMPLES)
+        expand(SAMPLES_DIR / "{sample}" / "classification.tsv", sample=SAMPLES)
     output:
         tsv = OUTPUT_DIR / "summary" / "all_samples_results.tsv"
     params:
         samples = SAMPLES,
-        output_dir = OUTPUT_DIR
+        samples_dir = SAMPLES_DIR
     script:
         str(WORKFLOW_DIR / "scripts" / "aggregate_results.py")
+
+
+rule crispresso2:
+    """
+    Run CRISPResso2 analysis with per-sample guide and HDR amplicon.
+    Uses trimmed reads and per-sample sequences from manifest.
+    """
+    input:
+        r1 = SAMPLES_DIR / "{sample}" / "trimmed" / "R1_trimmed.fastq.gz",
+        r2 = SAMPLES_DIR / "{sample}" / "trimmed" / "R2_trimmed.fastq.gz"
+    output:
+        done = SAMPLES_DIR / "{sample}" / "crispresso2" / "CRISPResso_done.txt"
+    log:
+        SAMPLES_DIR / "{sample}" / "logs" / "crispresso2.log"
+    params:
+        reference = lambda w: sample_info[w.sample]['reference'] if sample_info[w.sample]['reference'] and not pd.isna(sample_info[w.sample]['reference']) else DEFAULT_REF,
+        guide = lambda w: sample_info[w.sample]['guide'] if sample_info[w.sample]['guide'] and not pd.isna(sample_info[w.sample]['guide']) else DEFAULT_GUIDE,
+        hdr_template = lambda w: sample_info[w.sample]['hdr_template'] if sample_info[w.sample]['hdr_template'] and not pd.isna(sample_info[w.sample]['hdr_template']) else DEFAULT_HDR,
+        output_dir = lambda w: str(SAMPLES_DIR / w.sample / "crispresso2"),
+        sample_id = lambda w: w.sample
+    threads: THREADS_PER_SAMPLE
+    run:
+        import subprocess
+        import re
+        from pathlib import Path
+        from trace_crispr.config import parse_sequence_input
+
+        # Parse sequences
+        ref_seq = parse_sequence_input(params.reference) if params.reference else None
+        hdr_seq = parse_sequence_input(params.hdr_template) if params.hdr_template else None
+        guide_seq = params.guide.upper() if params.guide else None
+
+        # Skip samples without required sequences
+        if not ref_seq or not guide_seq:
+            Path(output.done).parent.mkdir(parents=True, exist_ok=True)
+            Path(output.done).write_text("SKIPPED: Missing reference or guide sequence\n")
+            return
+
+        # Find guide position in reference and extract amplicon region
+        # CRISPResso2 works best when the amplicon matches the actual read span
+        ref_upper = ref_seq.upper()
+        guide_upper = guide_seq.upper()
+
+        # Find guide in reference (forward or reverse complement)
+        def reverse_complement(seq):
+            comp = {'A': 'T', 'T': 'A', 'G': 'C', 'C': 'G'}
+            return ''.join(comp.get(b, b) for b in reversed(seq.upper()))
+
+        guide_pos = ref_upper.find(guide_upper)
+        guide_rc = reverse_complement(guide_upper)
+        is_rc = False
+        if guide_pos == -1:
+            guide_pos = ref_upper.find(guide_rc)
+            is_rc = True
+
+        if guide_pos == -1:
+            Path(output.done).parent.mkdir(parents=True, exist_ok=True)
+            Path(output.done).write_text("SKIPPED: Guide not found in reference\n")
+            return
+
+        # Calculate cut site (3bp upstream of PAM for Cas9)
+        cut_site = guide_pos + 17 if not is_rc else guide_pos + 3
+
+        # Extract amplicon region centered on cut site (~400bp for typical read merging)
+        amplicon_size = 400
+        start = max(0, cut_site - amplicon_size // 2)
+        end = min(len(ref_seq), cut_site + amplicon_size // 2)
+        amplicon_seq = ref_seq[start:end].upper()
+
+        # Adjust guide position relative to amplicon
+        guide_in_amplicon = guide_upper if not is_rc else guide_rc
+
+        # For HDR, create the expected HDR amplicon by applying ONLY the signature SNVs
+        # Signature SNVs are indicated by lowercase letters in the original donor sequence
+        # We apply these specific edits to the reference amplicon
+        hdr_amplicon = None
+        if hdr_seq:
+            # The original donor sequence has lowercase letters for signature SNVs
+            original_donor = params.hdr_template if params.hdr_template else ""
+            hdr_upper = hdr_seq.upper()
+
+            # Find signature SNV positions in donor (lowercase letters indicate SNVs)
+            signature_snvs = []
+            for i, c in enumerate(original_donor):
+                if c.islower():
+                    signature_snvs.append((i, c.upper()))
+
+            # Find best alignment of donor to reference (forward or RC)
+            best_offset = 0
+            best_matches = 0
+            is_donor_rc = False
+
+            # Try forward orientation
+            for offset in range(max(1, len(ref_upper) - len(hdr_upper) + 1)):
+                aligned = ref_upper[offset:offset + len(hdr_upper)]
+                if len(aligned) == len(hdr_upper):
+                    matches = sum(1 for a, b in zip(aligned, hdr_upper) if a == b)
+                    if matches > best_matches:
+                        best_matches = matches
+                        best_offset = offset
+                        is_donor_rc = False
+
+            # Try reverse complement
+            donor_rc = reverse_complement(hdr_upper)
+            for offset in range(max(1, len(ref_upper) - len(donor_rc) + 1)):
+                aligned = ref_upper[offset:offset + len(donor_rc)]
+                if len(aligned) == len(donor_rc):
+                    matches = sum(1 for a, b in zip(aligned, donor_rc) if a == b)
+                    if matches > best_matches:
+                        best_matches = matches
+                        best_offset = offset
+                        is_donor_rc = True
+
+            # Create HDR amplicon by applying ONLY signature SNVs to reference amplicon
+            if signature_snvs:
+                hdr_amplicon_list = list(amplicon_seq)
+
+                for donor_pos, snv_base in signature_snvs:
+                    # Convert donor position to reference position
+                    if is_donor_rc:
+                        # If donor is RC, need to flip position and complement the base
+                        rc_pos = len(hdr_upper) - 1 - donor_pos
+                        ref_pos = best_offset + rc_pos
+                        comp = {'A': 'T', 'T': 'A', 'G': 'C', 'C': 'G'}
+                        snv_base = comp.get(snv_base, snv_base)
+                    else:
+                        ref_pos = best_offset + donor_pos
+
+                    # Convert to amplicon position
+                    amp_pos = ref_pos - start
+
+                    # Apply SNV if position is within amplicon
+                    if 0 <= amp_pos < len(hdr_amplicon_list):
+                        hdr_amplicon_list[amp_pos] = snv_base
+
+                hdr_amplicon = ''.join(hdr_amplicon_list)
+            else:
+                # No signature SNVs found - use full donor substitution as fallback
+                donor_start_in_amplicon = best_offset - start
+                donor_end_in_amplicon = donor_start_in_amplicon + len(hdr_upper)
+                best_donor = donor_rc if is_donor_rc else hdr_upper
+
+                if donor_start_in_amplicon >= 0 and donor_end_in_amplicon <= len(amplicon_seq):
+                    hdr_amplicon = (
+                        amplicon_seq[:donor_start_in_amplicon] +
+                        best_donor +
+                        amplicon_seq[donor_end_in_amplicon:]
+                    )
+
+        # Build CRISPResso2 command
+        cmd = [
+            CRISPRESSO_BIN,
+            "-r1", str(input.r1),
+            "-r2", str(input.r2),
+            "-a", amplicon_seq,
+            "-g", guide_in_amplicon,
+            "-n", params.sample_id,
+            "-o", params.output_dir,
+            "-p", str(threads),
+            "--quantification_window_size", "10",
+            "--min_frequency_alleles_around_cut_to_plot", "0.01",
+            "--suppress_report"
+        ]
+
+        # Add HDR template if available
+        if hdr_amplicon:
+            cmd.extend(["-e", hdr_amplicon])
+
+        # Run CRISPResso2
+        Path(params.output_dir).mkdir(parents=True, exist_ok=True)
+        with open(str(log), 'w') as log_file:
+            result = subprocess.run(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+
+        # Create done file
+        if result.returncode == 0:
+            Path(output.done).write_text("SUCCESS\n")
+        else:
+            Path(output.done).write_text(f"FAILED: exit code {result.returncode}\n")
+
+
+rule aggregate_crispresso2:
+    """
+    Aggregate CRISPResso2 results into summary table.
+    Extracts HDR%, NHEJ%, and other metrics from CRISPResso2 output.
+    """
+    input:
+        expand(SAMPLES_DIR / "{sample}" / "crispresso2" / "CRISPResso_done.txt", sample=SAMPLES)
+    output:
+        tsv = OUTPUT_DIR / "summary" / "crispresso2_results.tsv"
+    params:
+        samples = SAMPLES,
+        samples_dir = SAMPLES_DIR
+    script:
+        str(WORKFLOW_DIR / "scripts" / "aggregate_crispresso2.py")
+
+
+rule combine_trace_crispresso2:
+    """
+    Combine TRACE and CRISPResso2 results into a single summary table.
+    Allows direct comparison between the two methods.
+    """
+    input:
+        trace = OUTPUT_DIR / "summary" / "all_samples_results.tsv",
+        crispresso2 = OUTPUT_DIR / "summary" / "crispresso2_results.tsv"
+    output:
+        tsv = OUTPUT_DIR / "summary" / "combined_trace_crispresso2.tsv"
+    run:
+        import pandas as pd
+        from pathlib import Path
+
+        # Load both summaries
+        trace_df = pd.read_csv(input.trace, sep='\t')
+        crispresso_df = pd.read_csv(input.crispresso2, sep='\t')
+
+        # Merge on sample_id
+        combined_df = pd.merge(
+            trace_df,
+            crispresso_df,
+            on='sample_id',
+            how='outer'
+        )
+
+        # Reorder columns: sample_id first, then TRACE, then CRISPResso2
+        trace_cols = [c for c in trace_df.columns if c != 'sample_id']
+        crispresso_cols = [c for c in crispresso_df.columns if c != 'sample_id']
+        col_order = ['sample_id'] + trace_cols + crispresso_cols
+        combined_df = combined_df[col_order]
+
+        # Write combined summary
+        output_path = Path(output.tsv)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        combined_df.to_csv(output_path, sep='\t', index=False)

@@ -264,6 +264,197 @@ class CRISPRessoRunner:
 
 def run_crispresso_batch(
     samples: list,
+    output_dir: Path,
+    default_amplicon_seq: Optional[str] = None,
+    default_guide_seq: Optional[str] = None,
+    default_hdr_seq: Optional[str] = None,
+    threads: int = 4,
+    skip_finished: bool = True,
+    container_path: Optional[Path] = None,
+    quantification_window: int = 10,
+    min_identity: int = 70,
+) -> Dict[str, CRISPRessoResult]:
+    """
+    Run CRISPRessoBatch on multiple samples efficiently.
+
+    Uses CRISPRessoBatch for:
+    - Sequence caching (identical reads aligned once across all samples)
+    - Parallel processing (-p flag)
+    - Skip already-completed samples (--skip_finished)
+
+    Args:
+        samples: List of dicts with keys:
+            - 'sample_id': Sample name (required)
+            - 'r1_path': Path to R1 FASTQ (required)
+            - 'r2_path': Path to R2 FASTQ (optional)
+            - 'amplicon_seq': Per-sample amplicon (optional, uses default)
+            - 'guide_seq': Per-sample guide (optional, uses default)
+            - 'hdr_seq': Per-sample HDR template (optional, uses default)
+        output_dir: Base output directory
+        default_amplicon_seq: Default amplicon sequence
+        default_guide_seq: Default guide sequence
+        default_hdr_seq: Default HDR sequence
+        threads: Number of parallel processes
+        skip_finished: Skip already-completed samples
+        container_path: Optional path to Singularity container
+
+    Returns:
+        Dict mapping sample_id to CRISPRessoResult
+    """
+    runner = CRISPRessoRunner(container_path)
+
+    if not runner.is_available():
+        logger.warning("CRISPResso2 is not available, skipping")
+        return {}
+
+    if not samples:
+        logger.warning("No samples provided for CRISPRessoBatch")
+        return {}
+
+    # Create output directory
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate batch settings file
+    batch_file = output_dir / "crispresso_batch_settings.tsv"
+    _write_batch_settings(
+        batch_file=batch_file,
+        samples=samples,
+        default_amplicon_seq=default_amplicon_seq,
+        default_guide_seq=default_guide_seq,
+        default_hdr_seq=default_hdr_seq,
+        quantification_window=quantification_window,
+        min_identity=min_identity,
+    )
+
+    # Build CRISPRessoBatch command
+    cmd = _build_batch_command(
+        runner=runner,
+        batch_file=batch_file,
+        output_dir=output_dir,
+        threads=threads,
+        skip_finished=skip_finished,
+    )
+
+    logger.info(f"Running CRISPRessoBatch on {len(samples)} samples with {threads} threads...")
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            check=True,
+            cwd=str(output_dir),
+        )
+        logger.info("CRISPRessoBatch completed successfully")
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"CRISPRessoBatch failed: {e.stderr.decode() if e.stderr else str(e)}")
+        # Continue to parse whatever results exist
+
+    # Parse results for each sample
+    results = {}
+    for sample in samples:
+        sample_id = sample['sample_id']
+        sample_result = runner._parse_results(output_dir, sample_id)
+        results[sample_id] = sample_result
+
+    return results
+
+
+def _write_batch_settings(
+    batch_file: Path,
+    samples: list,
+    default_amplicon_seq: Optional[str],
+    default_guide_seq: Optional[str],
+    default_hdr_seq: Optional[str],
+    quantification_window: int,
+    min_identity: int,
+) -> None:
+    """
+    Write CRISPRessoBatch settings TSV file.
+
+    Each row can have per-sample parameters that override defaults.
+    """
+    # Determine which columns we need
+    has_r2 = any(sample.get('r2_path') for sample in samples)
+    has_per_sample_amplicon = any(sample.get('amplicon_seq') for sample in samples)
+    has_per_sample_guide = any(sample.get('guide_seq') for sample in samples)
+    has_per_sample_hdr = any(sample.get('hdr_seq') for sample in samples)
+
+    # Build header
+    columns = ['name', 'fastq_r1']
+    if has_r2:
+        columns.append('fastq_r2')
+    columns.append('amplicon_seq')
+    columns.append('guide_seq')
+    if default_hdr_seq or has_per_sample_hdr:
+        columns.append('expected_hdr_amplicon_seq')
+    columns.extend(['quantification_window_size', 'min_identity_score'])
+
+    with open(batch_file, 'w') as f:
+        # Header
+        f.write('\t'.join(columns) + '\n')
+
+        # Data rows
+        for sample in samples:
+            row = [sample['sample_id']]
+
+            # R1 path (required)
+            row.append(str(sample['r1_path']))
+
+            # R2 path (optional)
+            if has_r2:
+                row.append(str(sample.get('r2_path', '')))
+
+            # Amplicon sequence (per-sample or default)
+            amplicon = sample.get('amplicon_seq', default_amplicon_seq) or ''
+            row.append(amplicon)
+
+            # Guide sequence (per-sample or default)
+            guide = sample.get('guide_seq', default_guide_seq) or ''
+            row.append(guide)
+
+            # HDR sequence (per-sample or default)
+            if default_hdr_seq or has_per_sample_hdr:
+                hdr = sample.get('hdr_seq', default_hdr_seq) or ''
+                row.append(hdr)
+
+            # Quantification window and min identity
+            row.append(str(quantification_window))
+            row.append(str(min_identity))
+
+            f.write('\t'.join(row) + '\n')
+
+    logger.info(f"Wrote batch settings to {batch_file} ({len(samples)} samples)")
+
+
+def _build_batch_command(
+    runner: CRISPRessoRunner,
+    batch_file: Path,
+    output_dir: Path,
+    threads: int,
+    skip_finished: bool,
+) -> list:
+    """Build CRISPRessoBatch command."""
+    if runner.execution_mode == 'singularity':
+        cmd = ['singularity', 'exec', str(runner.container_path), 'CRISPRessoBatch']
+    else:
+        cmd = ['CRISPRessoBatch']
+
+    cmd.extend([
+        '--batch_settings', str(batch_file),
+        '--output_folder', str(output_dir),
+        '-p', str(threads),
+    ])
+
+    if skip_finished:
+        cmd.append('--skip_finished')
+
+    return cmd
+
+
+# Legacy function for backwards compatibility
+def run_crispresso_sequential(
+    samples: list,
     amplicon_seq: str,
     guide_seq: str,
     output_dir: Path,
@@ -272,19 +463,9 @@ def run_crispresso_batch(
     container_path: Optional[Path] = None,
 ) -> Dict[str, CRISPRessoResult]:
     """
-    Run CRISPResso2 on multiple samples.
+    Run CRISPResso2 on multiple samples sequentially (legacy method).
 
-    Args:
-        samples: List of dicts with 'sample_id', 'r1_path', 'r2_path' keys
-        amplicon_seq: Amplicon sequence
-        guide_seq: Guide sequence
-        output_dir: Base output directory
-        hdr_seq: Optional HDR sequence
-        threads: Number of threads
-        container_path: Optional path to Singularity container
-
-    Returns:
-        Dict mapping sample_id to CRISPRessoResult
+    Use run_crispresso_batch() instead for better performance.
     """
     runner = CRISPRessoRunner(container_path)
 

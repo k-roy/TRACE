@@ -16,18 +16,52 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SampleResult:
-    """Results for a single sample."""
+    """
+    Results for a single sample.
+
+    Classification categories (comprehensive scheme):
+    - HDR_COMPLETE: All donor-encoded edits present, no other modifications
+    - HDR_PARTIAL: ≥1 but not all donor-encoded edits present
+    - HDR_PLUS_NHEJ_INDEL: Donor edits + classical NHEJ indel at cut site (0-2bp microhomology)
+    - HDR_PLUS_MMEJ_INDEL: Donor edits + MMEJ indel at cut site (>2bp microhomology)
+    - HDR_PLUS_OTHER: Donor edits + edits NOT at cut site
+    - DONOR_CAPTURE: Donor edits + extra donor sequence duplicated at site
+    - NHEJ_INDEL: Classical NHEJ indel at cut site, no donor edits (0-2bp microhomology)
+    - MMEJ_INDEL: Alt-NHEJ indel at cut site, no donor edits (>2bp microhomology)
+    - WT: No edits detected
+    - NON_DONOR_SNV: SNVs not matching donor, no indels
+    - UNCLASSIFIED: Does not fit other categories
+    - UNMAPPED: Read did not align
+    """
     sample_id: str
     total_reads: int = 0
     aligned_reads: int = 0
     classifiable_reads: int = 0
     duplicate_rate: float = 0.0
 
-    # Deduplicated counts
+    # === New comprehensive classification counts (deduplicated) ===
+    # HDR categories
+    dedup_hdr_complete_count: int = 0
+    dedup_hdr_partial_count: int = 0
+    dedup_hdr_plus_nhej_count: int = 0
+    dedup_hdr_plus_mmej_count: int = 0
+    dedup_hdr_plus_other_count: int = 0
+    dedup_donor_capture_count: int = 0
+
+    # NHEJ/MMEJ categories
+    dedup_nhej_indel_count: int = 0
+    dedup_mmej_indel_count: int = 0
+
+    # Other categories
     dedup_wt_count: int = 0
-    dedup_hdr_count: int = 0
-    dedup_nhej_count: int = 0
-    dedup_large_del_count: int = 0
+    dedup_non_donor_snv_count: int = 0
+    dedup_unclassified_count: int = 0
+    dedup_unmapped_count: int = 0
+
+    # === Legacy fields for backwards compatibility ===
+    dedup_hdr_count: int = 0  # HDR total (all HDR categories combined)
+    dedup_nhej_count: int = 0  # NHEJ + MMEJ combined
+    dedup_large_del_count: int = 0  # Large deletions (flagged, not separate category)
 
     # Non-deduplicated counts (for comparison)
     nondedup_hdr_count: int = 0
@@ -48,11 +82,127 @@ class SampleResult:
     def __post_init__(self):
         if self.metadata is None:
             self.metadata = {}
+        # Compute legacy totals from new categories
+        self._update_legacy_totals()
+
+    def _update_legacy_totals(self):
+        """Update legacy total fields from new category counts."""
+        # HDR total = all HDR categories
+        self.dedup_hdr_count = (
+            self.dedup_hdr_complete_count +
+            self.dedup_hdr_partial_count +
+            self.dedup_hdr_plus_nhej_count +
+            self.dedup_hdr_plus_mmej_count +
+            self.dedup_hdr_plus_other_count
+        )
+        # NHEJ total = NHEJ + MMEJ (excluding HDR_PLUS variants)
+        self.dedup_nhej_count = self.dedup_nhej_indel_count + self.dedup_mmej_indel_count
+
+    # === Aggregated counts ===
+    @property
+    def dedup_hdr_total(self) -> int:
+        """Sum of all HDR categories."""
+        return (
+            self.dedup_hdr_complete_count +
+            self.dedup_hdr_partial_count +
+            self.dedup_hdr_plus_nhej_count +
+            self.dedup_hdr_plus_mmej_count +
+            self.dedup_hdr_plus_other_count
+        )
+
+    @property
+    def dedup_nhej_mmej_total(self) -> int:
+        """Sum of NHEJ + MMEJ (without HDR)."""
+        return self.dedup_nhej_indel_count + self.dedup_mmej_indel_count
+
+    @property
+    def dedup_edited_total(self) -> int:
+        """Total edited reads (HDR + NHEJ/MMEJ + donor capture)."""
+        return self.dedup_hdr_total + self.dedup_nhej_mmej_total + self.dedup_donor_capture_count
 
     @property
     def dedup_total(self) -> int:
-        return self.dedup_wt_count + self.dedup_hdr_count + self.dedup_nhej_count + self.dedup_large_del_count
+        """Total classifiable reads (all categories except unmapped)."""
+        return (
+            self.dedup_hdr_total +
+            self.dedup_nhej_mmej_total +
+            self.dedup_donor_capture_count +
+            self.dedup_wt_count +
+            self.dedup_non_donor_snv_count +
+            self.dedup_unclassified_count
+        )
 
+    # === Percentage properties (new categories) ===
+    @property
+    def dedup_hdr_complete_pct(self) -> float:
+        total = self.dedup_total
+        return (self.dedup_hdr_complete_count / total * 100) if total > 0 else 0
+
+    @property
+    def dedup_hdr_partial_pct(self) -> float:
+        total = self.dedup_total
+        return (self.dedup_hdr_partial_count / total * 100) if total > 0 else 0
+
+    @property
+    def dedup_hdr_plus_nhej_pct(self) -> float:
+        total = self.dedup_total
+        return (self.dedup_hdr_plus_nhej_count / total * 100) if total > 0 else 0
+
+    @property
+    def dedup_hdr_plus_mmej_pct(self) -> float:
+        total = self.dedup_total
+        return (self.dedup_hdr_plus_mmej_count / total * 100) if total > 0 else 0
+
+    @property
+    def dedup_hdr_plus_other_pct(self) -> float:
+        total = self.dedup_total
+        return (self.dedup_hdr_plus_other_count / total * 100) if total > 0 else 0
+
+    @property
+    def dedup_donor_capture_pct(self) -> float:
+        total = self.dedup_total
+        return (self.dedup_donor_capture_count / total * 100) if total > 0 else 0
+
+    @property
+    def dedup_nhej_indel_pct(self) -> float:
+        total = self.dedup_total
+        return (self.dedup_nhej_indel_count / total * 100) if total > 0 else 0
+
+    @property
+    def dedup_mmej_indel_pct(self) -> float:
+        total = self.dedup_total
+        return (self.dedup_mmej_indel_count / total * 100) if total > 0 else 0
+
+    @property
+    def dedup_non_donor_snv_pct(self) -> float:
+        total = self.dedup_total
+        return (self.dedup_non_donor_snv_count / total * 100) if total > 0 else 0
+
+    @property
+    def dedup_unclassified_pct(self) -> float:
+        total = self.dedup_total
+        return (self.dedup_unclassified_count / total * 100) if total > 0 else 0
+
+    # === Aggregated percentage properties ===
+    @property
+    def dedup_hdr_total_pct(self) -> float:
+        """Combined HDR rate (all HDR categories)."""
+        total = self.dedup_total
+        return (self.dedup_hdr_total / total * 100) if total > 0 else 0
+
+    @property
+    def dedup_nhej_mmej_total_pct(self) -> float:
+        """Combined NHEJ + MMEJ rate."""
+        total = self.dedup_total
+        return (self.dedup_nhej_mmej_total / total * 100) if total > 0 else 0
+
+    @property
+    def dedup_edited_total_pct(self) -> float:
+        """Total editing rate (all non-WT outcomes)."""
+        total = self.dedup_total
+        return (self.dedup_edited_total / total * 100) if total > 0 else 0
+
+    # === Legacy percentage properties (backwards compatibility) ===
     @property
     def dedup_wt_pct(self) -> float:
         total = self.dedup_total
@@ -60,13 +210,13 @@ class SampleResult:
 
     @property
     def dedup_hdr_pct(self) -> float:
-        total = self.dedup_total
-        return (self.dedup_hdr_count / total * 100) if total > 0 else 0
+        """Legacy HDR rate (same as hdr_total_pct)."""
+        return self.dedup_hdr_total_pct
 
     @property
     def dedup_nhej_pct(self) -> float:
-        total = self.dedup_total
-        return (self.dedup_nhej_count / total * 100) if total > 0 else 0
+        """Legacy NHEJ rate (same as nhej_mmej_total_pct)."""
+        return self.dedup_nhej_mmej_total_pct
 
     @property
     def dedup_large_del_pct(self) -> float:
@@ -319,12 +469,41 @@ def write_results_tsv(
             'aligned_reads': r.aligned_reads,
             'classifiable_reads': r.classifiable_reads,
             'duplicate_rate': f"{r.duplicate_rate:.4f}",
+
+            # === New comprehensive classification columns ===
+            # HDR categories
+            'HDR_COMPLETE_%': f"{r.dedup_hdr_complete_pct:.2f}",
+            'HDR_PARTIAL_%': f"{r.dedup_hdr_partial_pct:.2f}",
+            'HDR_PLUS_NHEJ_%': f"{r.dedup_hdr_plus_nhej_pct:.2f}",
+            'HDR_PLUS_MMEJ_%': f"{r.dedup_hdr_plus_mmej_pct:.2f}",
+            'HDR_PLUS_OTHER_%': f"{r.dedup_hdr_plus_other_pct:.2f}",
+            'HDR_total_%': f"{r.dedup_hdr_total_pct:.2f}",
+
+            # Donor capture
+            'DONOR_CAPTURE_%': f"{r.dedup_donor_capture_pct:.2f}",
+
+            # NHEJ/MMEJ categories
+            'NHEJ_INDEL_%': f"{r.dedup_nhej_indel_pct:.2f}",
+            'MMEJ_INDEL_%': f"{r.dedup_mmej_indel_pct:.2f}",
+            'NHEJ_MMEJ_total_%': f"{r.dedup_nhej_mmej_total_pct:.2f}",
+
+            # Other categories
+            'WT_%': f"{r.dedup_wt_pct:.2f}",
+            'NON_DONOR_SNV_%': f"{r.dedup_non_donor_snv_pct:.2f}",
+            'UNCLASSIFIED_%': f"{r.dedup_unclassified_pct:.2f}",
+
+            # Aggregated metrics
+            'Edited_total_%': f"{r.dedup_edited_total_pct:.2f}",
+
+            # === Legacy columns for backwards compatibility ===
             'Dedup_WT_%': f"{r.dedup_wt_pct:.2f}",
             'Dedup_HDR_%': f"{r.dedup_hdr_pct:.2f}",
             'Dedup_NHEJ_%': f"{r.dedup_nhej_pct:.2f}",
             'Dedup_LgDel_%': f"{r.dedup_large_del_pct:.3f}",
             'NonDedup_HDR_%': f"{r.nondedup_hdr_pct:.2f}",
             'NonDedup_NHEJ_%': f"{r.nondedup_nhej_pct:.2f}",
+
+            # K-mer method
             'kmer_hdr_rate': f"{r.kmer_hdr_rate:.4f}",
         }
 

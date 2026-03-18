@@ -15,6 +15,10 @@ from .sample_key import (
     create_sample_key_template,
     load_sample_key,
 )
+from .sqlite_cache import (
+    SequenceCache,
+    AlignmentCache,
+)
 
 __all__ = [
     'Sample',
@@ -24,4 +28,6 @@ __all__ = [
     'write_results_tsv',
     'write_per_read_classifications',
     'generate_summary_report',
+    'SequenceCache',
+    'AlignmentCache',
 ]
