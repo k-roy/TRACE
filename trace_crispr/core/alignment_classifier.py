@@ -48,6 +48,98 @@ class AlignmentClassificationResult:
     alignment_score: Optional[float] = None  # Penalty score from best alignment
 
 
+def validate_deletion_anchors(
+    read: pysam.AlignedSegment,
+    deletion_start: int,
+    deletion_end: int,
+    min_anchor: int = 20
+) -> Tuple[bool, int, int]:
+    """
+    Validate that a read has sufficient anchored (aligned) sequence
+    on both sides of a deletion.
+
+    Large deletions require well-aligned flanking sequence to confirm they're real
+    and not alignment artifacts, chimeric reads, or low-quality sequences.
+
+    Args:
+        read: pysam AlignedSegment object
+        deletion_start: Reference position where deletion starts
+        deletion_end: Reference position where deletion ends
+        min_anchor: Minimum aligned bases required on each side (default: 20)
+
+    Returns:
+        Tuple of (passes_validation, left_anchor_length, right_anchor_length)
+    """
+    # Get aligned pairs (query_pos, ref_pos) excluding None values
+    aligned_pairs = [(qp, rp) for qp, rp in read.get_aligned_pairs()
+                     if qp is not None and rp is not None]
+
+    if not aligned_pairs:
+        return False, 0, 0
+
+    # Count aligned bases on left side (before deletion)
+    left_anchor = sum(1 for qp, rp in aligned_pairs if rp < deletion_start)
+
+    # Count aligned bases on right side (after deletion)
+    right_anchor = sum(1 for qp, rp in aligned_pairs if rp >= deletion_end)
+
+    passes = left_anchor >= min_anchor and right_anchor >= min_anchor
+
+    return passes, left_anchor, right_anchor
+
+
+def calculate_deletion_microhomology(
+    ref_seq: str,
+    deletion_start: int,
+    deletion_end: int,
+    max_search: int = 20
+) -> Tuple[int, int, str, str]:
+    """
+    Calculate microhomology at deletion boundaries.
+
+    Microhomology indicates the deletion repair mechanism - NHEJ-mediated
+    deletions often show microhomology at the breakpoint junctions.
+
+    Args:
+        ref_seq: Reference sequence
+        deletion_start: Start position of deletion in reference
+        deletion_end: End position of deletion in reference
+        max_search: Maximum distance to search for microhomology (default: 20bp)
+
+    Returns:
+        Tuple of (left_mh_length, right_mh_length, left_mh_seq, right_mh_seq)
+        where mh = microhomology
+    """
+    ref_upper = ref_seq.upper()
+    deletion_length = deletion_end - deletion_start
+    deleted_seq = ref_upper[deletion_start:deletion_end] if deletion_end <= len(ref_upper) else ""
+
+    if not deleted_seq:
+        return 0, 0, "", ""
+
+    # How far left could this deletion be shifted? (left microhomology)
+    left_shift = 0
+    for i in range(1, min(max_search, deletion_length, deletion_start) + 1):
+        # Check if prefix of deleted seq matches suffix before deletion
+        if deletion_start - i >= 0 and deleted_seq[:i] == ref_upper[deletion_start - i:deletion_start]:
+            left_shift = i
+        # NO BREAK - continue to find maximum shift (handles interrupted repeats)
+
+    # How far right could this deletion be shifted? (right microhomology)
+    right_shift = 0
+    for i in range(1, min(max_search, deletion_length, len(ref_upper) - deletion_end) + 1):
+        # Check if suffix of deleted seq matches prefix after deletion
+        if deletion_end + i <= len(ref_upper) and deleted_seq[-i:] == ref_upper[deletion_end:deletion_end + i]:
+            right_shift = i
+        # NO BREAK - continue to find maximum shift
+
+    # Extract the actual microhomology sequences
+    left_mh_seq = ref_upper[deletion_start - left_shift:deletion_start] if left_shift > 0 else ""
+    right_mh_seq = ref_upper[deletion_end:deletion_end + right_shift] if right_shift > 0 else ""
+
+    return left_shift, right_shift, left_mh_seq, right_mh_seq
+
+
 class AlignmentClassifier:
     """
     Triple aligner-based classifier for NHEJ and large deletion detection.
@@ -81,18 +173,38 @@ class AlignmentClassifier:
         self.hdr_templates = hdr_templates or {}
         self.config = config or AlignmentConfig()
 
-        # Calculate cut site from guide (3bp upstream of PAM)
+        # Calculate cut site from guide (check both strands)
         # For SpCas9 with NGG PAM, cut site is ~3bp upstream of PAM (blunt-ended DSB)
-        if guide in reference.upper():
-            guide_pos = reference.upper().index(guide.upper())
+        ref_upper = reference.upper()
+        guide_upper = guide.upper()
+
+        # Try plus strand first
+        if guide_upper in ref_upper:
+            guide_pos = ref_upper.index(guide_upper)
             # PAM is immediately 3' of guide
             pam_pos = guide_pos + len(guide)
-            self.cut_site = pam_pos - 3  # Cut site ~3bp UPSTREAM of PAM (CORRECTED)
-            logger.info(f"Guide found at position {guide_pos}, PAM at {pam_pos}, cut site at {self.cut_site} (3bp upstream of PAM)")
+            self.cut_site = pam_pos - 3  # Cut site ~3bp UPSTREAM of PAM
+            logger.info(f"Guide found on plus strand at position {guide_pos}, cut site at {self.cut_site}")
         else:
-            # If guide not in reference, use middle of reference
-            self.cut_site = len(reference) // 2
-            logger.warning(f"Guide not found in reference, using middle of reference as cut site: {self.cut_site}")
+            # Try minus strand (reverse complement)
+            def rev_comp(s):
+                comp = {'A':'T','T':'A','G':'C','C':'G'}
+                return ''.join(comp.get(b, b) for b in reversed(s.upper()))
+
+            guide_rc = rev_comp(guide)
+            if guide_rc in ref_upper:
+                guide_pos = ref_upper.index(guide_rc)
+                # Minus strand: cut site is 3bp downstream of PAM (= guide_start + 3)
+                self.cut_site = guide_pos + 3
+                logger.info(f"Guide found on minus strand at position {guide_pos}, cut site at {self.cut_site}")
+            else:
+                # Guide not found in reference - this is a critical error
+                raise ValueError(
+                    f"Guide sequence not found in reference (checked both strands). "
+                    f"Guide: {guide[:50]}{'...' if len(guide) > 50 else ''} "
+                    f"Reference length: {len(reference)}bp. "
+                    f"Verify guide sequence matches reference."
+                )
 
     def classify_sequences(
         self,
@@ -263,17 +375,42 @@ class AlignmentClassifier:
                 if deletion.size >= self.config.large_deletion_threshold:
                     # Check if deletion spans cut site
                     if deletion.ref_start <= self.cut_site <= deletion.ref_end:
-                        classifications[seq] = AlignmentClassificationResult(
-                            outcome=EditingOutcome.LARGE_DELETION,
-                            indel_info={'deletion': {
-                                'start': deletion.ref_start,
-                                'end': deletion.ref_end,
-                                'size': deletion.size,
-                            }},
-                            best_aligner=score.aligner,
-                            alignment_score=score.penalty_score,
+                        # Validate sufficient anchors on both sides
+                        passes_validation, left_anchor, right_anchor = validate_deletion_anchors(
+                            read, deletion.ref_start, deletion.ref_end,
+                            self.config.min_anchor_length
                         )
-                        continue
+
+                        if passes_validation:
+                            # Calculate microhomology at deletion boundaries
+                            left_mh, right_mh, left_mh_seq, right_mh_seq = calculate_deletion_microhomology(
+                                self.reference, deletion.ref_start, deletion.ref_end, max_search=20
+                            )
+
+                            classifications[seq] = AlignmentClassificationResult(
+                                outcome=EditingOutcome.LARGE_DELETION,
+                                indel_info={'deletion': {
+                                    'start': deletion.ref_start,
+                                    'end': deletion.ref_end,
+                                    'size': deletion.size,
+                                    'left_anchor': left_anchor,
+                                    'right_anchor': right_anchor,
+                                    'microhomology_left': left_mh,
+                                    'microhomology_right': right_mh,
+                                    'microhomology_left_seq': left_mh_seq,
+                                    'microhomology_right_seq': right_mh_seq,
+                                }},
+                                best_aligner=score.aligner,
+                                alignment_score=score.penalty_score,
+                            )
+                            break  # Exit deletion loop, move to next sequence
+                        else:
+                            # Insufficient anchors - skip this deletion
+                            logger.debug(
+                                f"Large deletion rejected: insufficient anchors "
+                                f"(left={left_anchor}, right={right_anchor}, min={self.config.min_anchor_length})"
+                            )
+                            continue  # Check next deletion
 
             # Priority 3: NHEJ deletions (small deletions in cleavage window)
             if deletions:

@@ -301,8 +301,40 @@ def align(fastq, reference, output, threads):
               help='Output TSV file')
 @click.option('--nuclease', type=click.Choice(['cas9', 'cas12a']), default='cas9',
               help='Nuclease type')
-def classify(bam, reference, hdr_template, guide, output, nuclease):
-    """Classify aligned reads into editing outcomes."""
+@click.option('--per-read', is_flag=True, default=False,
+              help='Also write per-read classification details')
+def classify(bam, reference, hdr_template, guide, output, nuclease, per_read):
+    """
+    Classify aligned reads into editing outcomes.
+
+    Re-run classification from existing BAM files without re-running alignment.
+    Useful when classification scheme has been updated.
+
+    \b
+    Example:
+      trace classify alignments/sample.bam \\
+        -r reference.fasta \\
+        -h hdr_template.fasta \\
+        -g GCTGAAGCACTGCACGCCGT \\
+        -o classified_results.tsv
+    """
+    import logging
+
+    import pysam
+
+    from .core.classification import (
+        EditingOutcome,
+        classify_read,
+        get_hdr_signature_positions,
+        summarize_classifications,
+    )
+    from .io.output import write_per_read_classifications
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+
     click.echo(f"Classifying reads from: {bam}")
 
     # Load sequences
@@ -325,8 +357,402 @@ def classify(bam, reference, hdr_template, guide, output, nuclease):
 
     locus.print_summary()
 
-    # TODO: Implement classification
-    click.echo("\nClassification not yet implemented.")
+    # Get HDR signature
+    min_len = min(len(ref_seq), len(hdr_seq))
+    hdr_signature = get_hdr_signature_positions(ref_seq[:min_len], hdr_seq[:min_len])
+    click.echo(f"HDR signature: {len(hdr_signature)} positions differ from WT")
+
+    # Get cut site
+    cut_site = locus.guide_info.cleavage_site if locus.guide_info else 0
+
+    # Classify reads
+    classifications = []
+    per_read_details = []
+    aligned_reads = 0
+    unmapped_reads = 0
+
+    click.echo("Classifying reads...")
+    try:
+        with pysam.AlignmentFile(bam, "rb") as bam_file:
+            for read in bam_file.fetch(until_eof=True):
+                if read.is_unmapped:
+                    unmapped_reads += 1
+                    continue
+
+                aligned_reads += 1
+
+                result = classify_read(
+                    read,
+                    hdr_signature,
+                    cut_site,
+                    ref_seq=ref_seq,
+                    donor_seq=hdr_seq,
+                )
+
+                classifications.append(result)
+
+                if per_read:
+                    per_read_details.append({
+                        'read_name': read.query_name,
+                        'outcome': result.outcome.value,
+                        'confidence': f"{result.confidence:.3f}",
+                        'qc_flags': ','.join(result.qc_flags) if result.qc_flags else '',
+                        **{k: str(v) for k, v in result.details.items() if not isinstance(v, (dict, list))}
+                    })
+
+    except Exception as e:
+        click.echo(f"Error reading BAM: {e}", err=True)
+        sys.exit(1)
+
+    # Summarize
+    summary = summarize_classifications(classifications)
+
+    click.echo(f"\n--- Classification Summary ---")
+    click.echo(f"Total aligned reads: {aligned_reads}")
+    click.echo(f"Unmapped reads: {unmapped_reads}")
+    click.echo(f"\n--- Outcome Breakdown ---")
+
+    # Print each category
+    for outcome in EditingOutcome:
+        count = summary.get(f'{outcome.value}_count', 0)
+        rate = summary.get(f'{outcome.value}_rate', 0) * 100
+        if count > 0:
+            click.echo(f"  {outcome.value}: {count} ({rate:.2f}%)")
+
+    # Print aggregated metrics
+    click.echo(f"\n--- Aggregated Metrics ---")
+    click.echo(f"  HDR total: {summary.get('hdr_total_count', 0)} ({summary.get('hdr_total_rate', 0)*100:.2f}%)")
+    click.echo(f"  NHEJ/MMEJ total: {summary.get('nhej_mmej_total_count', 0)} ({summary.get('nhej_mmej_total_rate', 0)*100:.2f}%)")
+    click.echo(f"  Edited total: {summary.get('edited_total_count', 0)} ({summary.get('edited_total_rate', 0)*100:.2f}%)")
+
+    # Write summary output
+    output_path = Path(output)
+    import pandas as pd
+
+    summary_df = pd.DataFrame([{
+        'bam_file': bam,
+        'total_aligned': aligned_reads,
+        'total_unmapped': unmapped_reads,
+        **{f'{outcome.value}_count': summary.get(f'{outcome.value}_count', 0)
+           for outcome in EditingOutcome},
+        **{f'{outcome.value}_pct': summary.get(f'{outcome.value}_rate', 0) * 100
+           for outcome in EditingOutcome},
+        'hdr_total_count': summary.get('hdr_total_count', 0),
+        'hdr_total_pct': summary.get('hdr_total_rate', 0) * 100,
+        'nhej_mmej_total_count': summary.get('nhej_mmej_total_count', 0),
+        'nhej_mmej_total_pct': summary.get('nhej_mmej_total_rate', 0) * 100,
+        'edited_total_count': summary.get('edited_total_count', 0),
+        'edited_total_pct': summary.get('edited_total_rate', 0) * 100,
+    }])
+
+    summary_df.to_csv(output_path, sep='\t', index=False)
+    click.echo(f"\nSummary written to: {output_path}")
+
+    # Write per-read details if requested
+    if per_read and per_read_details:
+        per_read_path = output_path.parent / f"{output_path.stem}_per_read.tsv"
+        write_per_read_classifications(per_read_details, per_read_path)
+        click.echo(f"Per-read details written to: {per_read_path}")
+
+
+@cli.command('classify-batch')
+@click.option('--bam-dir', '-b', type=click.Path(exists=True), required=True,
+              help='Directory containing BAM files from previous TRACE run')
+@click.option('--sample-key', '-s', type=click.Path(exists=True),
+              help='Optional sample key TSV for metadata (uses BAM names if not provided)')
+@click.option('--reference', '-r', type=str, required=True,
+              help='Reference amplicon: DNA sequence or FASTA file path')
+@click.option('--hdr-template', '-h', type=str, required=True,
+              help='HDR template: DNA sequence or FASTA file path')
+@click.option('--guide', '-g', type=str, required=True,
+              help='Guide sequence')
+@click.option('--output', '-o', type=click.Path(), required=True,
+              help='Output directory')
+@click.option('--nuclease', type=click.Choice(['cas9', 'cas12a']), default='cas9',
+              help='Nuclease type')
+@click.option('--bam-pattern', type=str, default='*_sorted.bam',
+              help='Glob pattern for BAM files (default: *_sorted.bam)')
+@click.option('--threads', '-t', type=int, default=4,
+              help='Number of threads')
+def classify_batch(bam_dir, sample_key, reference, hdr_template, guide, output,
+                   nuclease, bam_pattern, threads):
+    """
+    Re-run classification on multiple samples from existing BAM files.
+
+    Use this to re-classify reads with an updated classification scheme
+    without re-running alignment. Perfect for iterating on classification
+    logic after alignment is complete.
+
+    \b
+    Example:
+      trace classify-batch \\
+        --bam-dir results/sample1/alignments \\
+        --sample-key samples.tsv \\
+        -r reference.fasta \\
+        -h hdr_template.fasta \\
+        -g GCTGAAGCACTGCACGCCGT \\
+        -o reclassified_results/
+    """
+    import logging
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    import pysam
+
+    from .core.classification import (
+        EditingOutcome,
+        classify_read,
+        get_hdr_signature_positions,
+        summarize_classifications,
+    )
+    from .io.output import SampleResult, write_results_tsv, generate_summary_report
+    from .io.sample_key import load_sample_key
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+
+    # Load sequences
+    try:
+        ref_seq = parse_sequence_input(reference)
+        hdr_seq = parse_sequence_input(hdr_template)
+    except ValueError as e:
+        click.echo(f"Error loading sequences: {e}", err=True)
+        sys.exit(1)
+
+    nuclease_type = NucleaseType.CAS9 if nuclease == 'cas9' else NucleaseType.CAS12A
+
+    locus = LocusConfig(
+        name="analysis",
+        reference=ref_seq,
+        hdr_template=hdr_seq,
+        guide=guide,
+        nuclease=nuclease_type,
+    ).analyze()
+
+    locus.print_summary()
+
+    # Get HDR signature and cut site
+    min_len = min(len(ref_seq), len(hdr_seq))
+    hdr_signature = get_hdr_signature_positions(ref_seq[:min_len], hdr_seq[:min_len])
+    cut_site = locus.guide_info.cleavage_site if locus.guide_info else 0
+
+    click.echo(f"HDR signature: {len(hdr_signature)} positions")
+    click.echo(f"Cut site: {cut_site}")
+
+    # Find BAM files
+    bam_dir_path = Path(bam_dir)
+    bam_files = list(bam_dir_path.glob(bam_pattern))
+
+    # Also check subdirectories (for per-sample output structure)
+    if not bam_files:
+        bam_files = list(bam_dir_path.glob(f"**/alignments/{bam_pattern}"))
+
+    if not bam_files:
+        click.echo(f"No BAM files found matching '{bam_pattern}' in {bam_dir}", err=True)
+        sys.exit(1)
+
+    click.echo(f"Found {len(bam_files)} BAM files")
+
+    # Load sample metadata if provided
+    sample_metadata = {}
+    if sample_key:
+        samples = load_sample_key(Path(sample_key), validate=False)
+        sample_metadata = {s.sample_id: s.metadata for s in samples}
+        click.echo(f"Loaded metadata for {len(samples)} samples")
+
+    # Create output directory
+    output_path = Path(output)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Process each BAM file
+    results = []
+    for i, bam_path in enumerate(bam_files):
+        # Extract sample ID from BAM filename
+        sample_id = bam_path.stem.replace('_sorted', '').replace('_bbmap', '').replace('_bwa', '')
+
+        click.echo(f"Processing {i+1}/{len(bam_files)}: {sample_id}")
+
+        # Classify reads
+        classifications = []
+        aligned_reads = 0
+        unmapped_reads = 0
+
+        try:
+            with pysam.AlignmentFile(str(bam_path), "rb") as bam_file:
+                for read in bam_file.fetch(until_eof=True):
+                    if read.is_unmapped:
+                        unmapped_reads += 1
+                        continue
+
+                    aligned_reads += 1
+
+                    result = classify_read(
+                        read,
+                        hdr_signature,
+                        cut_site,
+                        ref_seq=ref_seq,
+                        donor_seq=hdr_seq,
+                    )
+                    classifications.append(result)
+
+        except Exception as e:
+            click.echo(f"  Error reading BAM: {e}", err=True)
+            continue
+
+        # Summarize
+        summary = summarize_classifications(classifications)
+
+        # Build SampleResult
+        sample_result = SampleResult(
+            sample_id=sample_id,
+            total_reads=aligned_reads + unmapped_reads,
+            aligned_reads=aligned_reads,
+            classifiable_reads=len(classifications),
+
+            # New comprehensive classification counts
+            dedup_hdr_complete_count=summary.get('hdr_complete_count', 0),
+            dedup_hdr_partial_count=summary.get('hdr_partial_count', 0),
+            dedup_hdr_plus_nhej_count=summary.get('hdr_plus_nhej_indel_count', 0),
+            dedup_hdr_plus_mmej_count=summary.get('hdr_plus_mmej_indel_count', 0),
+            dedup_hdr_plus_other_count=summary.get('hdr_plus_other_count', 0),
+            dedup_donor_capture_count=summary.get('donor_capture_count', 0),
+            dedup_nhej_indel_count=summary.get('nhej_indel_count', 0),
+            dedup_mmej_indel_count=summary.get('mmej_indel_count', 0),
+            dedup_wt_count=summary.get('wt_count', 0),
+            dedup_non_donor_snv_count=summary.get('non_donor_snv_count', 0),
+            dedup_unclassified_count=summary.get('unclassified_count', 0),
+            dedup_unmapped_count=unmapped_reads,
+
+            metadata=sample_metadata.get(sample_id, {}),
+        )
+        results.append(sample_result)
+
+        # Print summary
+        hdr_pct = summary.get('hdr_total_rate', 0) * 100
+        nhej_pct = summary.get('nhej_mmej_total_rate', 0) * 100
+        click.echo(f"  Reads: {aligned_reads}, HDR: {hdr_pct:.1f}%, NHEJ/MMEJ: {nhej_pct:.1f}%")
+
+    # Write output
+    output_file = output_path / "reclassified_editing_outcomes.tsv"
+    write_results_tsv(results, output_file)
+
+    # Generate summary report
+    summary_file = output_path / "summary_report.md"
+    generate_summary_report(results, summary_file)
+
+    click.echo(f"\nReclassification complete!")
+    click.echo(f"Processed {len(results)} samples")
+    click.echo(f"Results written to: {output_file}")
+
+
+@cli.command('aggregate')
+@click.option('--input', '-i', 'input_file', type=click.Path(exists=True), required=True,
+              help='Per-sample results TSV from TRACE pipeline')
+@click.option('--output', '-o', type=click.Path(), required=True,
+              help='Output unified comparison table TSV')
+@click.option('--bio-sample-col', type=str, default='bio_sample',
+              help='Column name for biological sample grouping (default: bio_sample)')
+@click.option('--min-reads', type=int, default=1000,
+              help='Minimum reads threshold for QC (default: 1000)')
+@click.option('--include-crispresso/--no-crispresso', default=True,
+              help='Include CRISPResso comparison columns (default: enabled)')
+@click.option('--metadata-cols', type=str, default=None,
+              help='Comma-separated list of additional metadata columns to include')
+def aggregate(input_file, output, bio_sample_col, min_reads, include_crispresso, metadata_cols):
+    """
+    Generate unified comparison table with replicate aggregation.
+
+    Takes per-sample results from TRACE pipeline, groups by biological sample,
+    calculates mean/SEM for all metrics, and applies QC flags based on read counts.
+
+    QC Flags:
+      - good: All replicates have >= min_reads
+      - all_low_reads: All replicates have < min_reads (still used)
+      - one_low_read_removed: Low-read replicates excluded from mean
+      - no_data: No data available
+
+    \\b
+    Example:
+      trace aggregate \\
+        --input results/per_sample_editing_outcomes.tsv \\
+        --output results/unified_comparison_table.tsv \\
+        --bio-sample-col bio_sample \\
+        --min-reads 1000
+    """
+    import logging
+    import pandas as pd
+
+    from .analysis.aggregation import (
+        generate_unified_comparison_table,
+        write_unified_comparison_table,
+    )
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
+
+    # Load per-sample results
+    click.echo(f"Loading per-sample results from: {input_file}")
+    try:
+        df = pd.read_csv(input_file, sep='\t')
+    except Exception as e:
+        click.echo(f"Error loading input file: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(f"  Loaded {len(df)} samples")
+
+    # Check for required columns
+    if bio_sample_col not in df.columns:
+        click.echo(f"Error: Column '{bio_sample_col}' not found in input file", err=True)
+        click.echo(f"Available columns: {list(df.columns)[:10]}...", err=True)
+        sys.exit(1)
+
+    # Parse metadata columns
+    metadata_list = None
+    if metadata_cols:
+        metadata_list = [c.strip() for c in metadata_cols.split(',')]
+
+    # Generate unified comparison table
+    click.echo(f"Generating unified comparison table...")
+    click.echo(f"  Grouping by: {bio_sample_col}")
+    click.echo(f"  Min reads threshold: {min_reads}")
+
+    try:
+        unified_df = generate_unified_comparison_table(
+            df=df,
+            bio_sample_col=bio_sample_col,
+            min_reads=min_reads,
+            include_crispresso=include_crispresso,
+            metadata_cols=metadata_list,
+        )
+    except Exception as e:
+        click.echo(f"Error generating unified table: {e}", err=True)
+        sys.exit(1)
+
+    # Write output
+    output_path = Path(output)
+    write_unified_comparison_table(unified_df, output_path)
+
+    # Print summary
+    n_bio_samples = len(unified_df)
+    n_good = (unified_df['quality_flag'] == 'good').sum()
+    n_low_reads = (unified_df['quality_flag'] == 'all_low_reads').sum()
+    n_partial = (unified_df['quality_flag'] == 'one_low_read_removed').sum()
+
+    click.echo(f"\n--- Summary ---")
+    click.echo(f"Biological samples: {n_bio_samples}")
+    click.echo(f"  Good (all replicates >= {min_reads} reads): {n_good}")
+    click.echo(f"  All low reads: {n_low_reads}")
+    click.echo(f"  Partial (some low replicates removed): {n_partial}")
+
+    # Show mean HDR rate
+    if 'dedup_hdr_total_pct_mean' in unified_df.columns:
+        mean_hdr = unified_df['dedup_hdr_total_pct_mean'].mean()
+        click.echo(f"\nMean HDR rate: {mean_hdr:.2f}%")
+
+    click.echo(f"\nUnified comparison table written to: {output_path}")
 
 
 @cli.command('extract-kmers')

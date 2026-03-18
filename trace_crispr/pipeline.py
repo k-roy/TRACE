@@ -27,7 +27,7 @@ from .core.kmer import (
 )
 from .core.scoring import DeduplicationSignature, score_alignment
 from .integrations.aligners import AlignerManager, create_reference_fasta, run_triple_alignment
-from .integrations.crispresso import CRISPRessoRunner
+from .integrations.crispresso import CRISPRessoRunner, run_crispresso_batch
 from .io.output import (
     MultiTemplateSampleResult,
     SampleResult,
@@ -200,11 +200,14 @@ class EditingPipeline:
 
         # Process samples
         results = []
+        sample_locus_map = {}  # Track locus config per sample for CRISPResso batch
+
         for i, sample in enumerate(samples):
             logger.info(f"Processing sample {i+1}/{len(samples)}: {sample.sample_id}")
 
             # Get sample-specific or default locus config
             locus_config, kmer_classifier, hdr_signature = self._get_sample_locus(sample)
+            sample_locus_map[sample.sample_id] = (sample, locus_config)
 
             # Log if using custom sequences
             if sample.has_custom_locus():
@@ -219,6 +222,18 @@ class EditingPipeline:
                     sample_id=sample.sample_id,
                     metadata=sample.metadata,
                 ))
+
+        # Run CRISPRessoBatch for all samples (much faster than per-sample)
+        if self.config.run_crispresso:
+            logger.info(f"Running CRISPRessoBatch on {len(samples)} samples...")
+            crispresso_results = self._run_crispresso_batch(samples, sample_locus_map)
+
+            # Update results with CRISPResso data
+            for result in results:
+                if result.sample_id in crispresso_results:
+                    cr = crispresso_results[result.sample_id]
+                    result.crispresso_hdr_rate = cr.hdr_rate
+                    result.crispresso_nhej_rate = cr.nhej_rate
 
         # Write output
         output_file = self.config.output_dir / "per_sample_editing_outcomes_all_methods.tsv"
@@ -315,34 +330,44 @@ class EditingPipeline:
             hdr_signature,
         )
 
-        # Step 6: CRISPResso (if enabled)
-        crispresso_hdr = None
-        crispresso_nhej = None
-        if self.config.run_crispresso:
-            logger.info("  Running CRISPResso2...")
-            crispresso_result = self._run_crispresso(sample, sample_dir, locus_config)
-            if crispresso_result:
-                crispresso_hdr = crispresso_result.hdr_rate
-                crispresso_nhej = crispresso_result.nhej_rate
-
-        # Build result
+        # Build result (CRISPResso runs in batch after all samples processed)
         return SampleResult(
             sample_id=sample.sample_id,
             total_reads=kmer_results.total_reads,
             aligned_reads=classification_result.get('aligned_reads', 0),
             classifiable_reads=classification_result.get('classifiable_reads', 0),
             duplicate_rate=classification_result.get('duplicate_rate', 0),
+
+            # New comprehensive classification counts
+            dedup_hdr_complete_count=classification_result.get('hdr_complete_count', 0),
+            dedup_hdr_partial_count=classification_result.get('hdr_partial_count', 0),
+            dedup_hdr_plus_nhej_count=classification_result.get('hdr_plus_nhej_indel_count', 0),
+            dedup_hdr_plus_mmej_count=classification_result.get('hdr_plus_mmej_indel_count', 0),
+            dedup_hdr_plus_other_count=classification_result.get('hdr_plus_other_count', 0),
+            dedup_donor_capture_count=classification_result.get('donor_capture_count', 0),
+            dedup_nhej_indel_count=classification_result.get('nhej_indel_count', 0),
+            dedup_mmej_indel_count=classification_result.get('mmej_indel_count', 0),
             dedup_wt_count=classification_result.get('wt_count', 0),
-            dedup_hdr_count=classification_result.get('hdr_count', 0),
-            dedup_nhej_count=classification_result.get('nhej_count', 0),
+            dedup_non_donor_snv_count=classification_result.get('non_donor_snv_count', 0),
+            dedup_unclassified_count=classification_result.get('unclassified_count', 0),
+            dedup_unmapped_count=classification_result.get('unmapped_count', 0),
+
+            # Legacy counts (backwards compatibility)
             dedup_large_del_count=classification_result.get('large_del_count', 0),
+
+            # Non-dedup counts
             nondedup_hdr_count=classification_result.get('nondedup_hdr_count', 0),
             nondedup_nhej_count=classification_result.get('nondedup_nhej_count', 0),
+
+            # K-mer method results
             kmer_wt_count=kmer_results.wt_count,
             kmer_hdr_count=kmer_results.hdr_count,
             kmer_contamination_count=kmer_results.contamination_count,
-            crispresso_hdr_rate=crispresso_hdr,
-            crispresso_nhej_rate=crispresso_nhej,
+
+            # CRISPResso (set by batch later)
+            crispresso_hdr_rate=None,
+            crispresso_nhej_rate=None,
+
             metadata=sample.metadata,
         )
 
@@ -399,9 +424,15 @@ class EditingPipeline:
                     )
 
                     # Track non-dedup counts
-                    if result.outcome in (EditingOutcome.HDR_PERFECT, EditingOutcome.HDR_IMPERFECT):
+                    if result.outcome in (
+                        EditingOutcome.HDR_COMPLETE,
+                        EditingOutcome.HDR_PARTIAL,
+                        EditingOutcome.HDR_PLUS_NHEJ_INDEL,
+                        EditingOutcome.HDR_PLUS_MMEJ_INDEL,
+                        EditingOutcome.HDR_PLUS_OTHER,
+                    ):
                         nondedup_hdr += 1
-                    elif result.outcome in (EditingOutcome.NHEJ_INSERTION, EditingOutcome.NHEJ_DELETION):
+                    elif result.outcome in (EditingOutcome.NHEJ_INDEL, EditingOutcome.MMEJ_INDEL):
                         nondedup_nhej += 1
 
                     # Deduplication (simplified for single-end)
@@ -435,32 +466,85 @@ class EditingPipeline:
             'aligned_reads': aligned_reads,
             'classifiable_reads': unique_reads,
             'duplicate_rate': duplicate_rate,
-            'wt_count': summary.get('wild_type_count', 0),
+
+            # New comprehensive classification counts
+            'hdr_complete_count': summary.get('hdr_complete_count', 0),
+            'hdr_partial_count': summary.get('hdr_partial_count', 0),
+            'hdr_plus_nhej_indel_count': summary.get('hdr_plus_nhej_indel_count', 0),
+            'hdr_plus_mmej_indel_count': summary.get('hdr_plus_mmej_indel_count', 0),
+            'hdr_plus_other_count': summary.get('hdr_plus_other_count', 0),
+            'donor_capture_count': summary.get('donor_capture_count', 0),
+            'nhej_indel_count': summary.get('nhej_indel_count', 0),
+            'mmej_indel_count': summary.get('mmej_indel_count', 0),
+            'wt_count': summary.get('wt_count', 0),
+            'non_donor_snv_count': summary.get('non_donor_snv_count', 0),
+            'unclassified_count': summary.get('unclassified_count', 0),
+            'unmapped_count': summary.get('unmapped_count', 0),
+
+            # Legacy counts (for backwards compatibility)
             'hdr_count': summary.get('hdr_total_count', 0),
-            'nhej_count': summary.get('nhej_insertion_count', 0) + summary.get('nhej_deletion_count', 0),
-            'large_del_count': summary.get('large_deletion_count', 0),
+            'nhej_count': summary.get('nhej_mmej_total_count', 0),
+            'large_del_count': 0,  # Now flagged, not separate category
+
+            # Non-dedup counts
             'nondedup_hdr_count': nondedup_hdr,
             'nondedup_nhej_count': nondedup_nhej,
         }
 
-    def _run_crispresso(self, sample: Sample, sample_dir: Path, locus_config: LocusConfig):
-        """Run CRISPResso2 for a sample."""
+    def _run_crispresso_batch(
+        self,
+        samples: List[Sample],
+        sample_locus_map: Dict[str, tuple],
+    ) -> Dict:
+        """
+        Run CRISPRessoBatch for all samples.
+
+        Uses CRISPRessoBatch for efficient processing with:
+        - Sequence caching across samples
+        - Parallel processing
+        - Per-sample amplicon/guide/HDR sequences
+
+        Args:
+            samples: List of Sample objects
+            sample_locus_map: Dict mapping sample_id -> (sample, locus_config)
+
+        Returns:
+            Dict mapping sample_id -> CRISPRessoResult
+        """
+        # Check availability
         runner = CRISPRessoRunner()
-
         if not runner.is_available():
-            logger.warning("CRISPResso2 not available, skipping")
-            return None
+            logger.warning("CRISPResso2 not available, skipping batch run")
+            return {}
 
-        crispresso_dir = sample_dir / "crispresso"
+        # Build sample list for batch processing
+        batch_samples = []
+        for sample in samples:
+            sample_obj, locus_config = sample_locus_map.get(sample.sample_id, (sample, self.default_locus))
 
-        return runner.run(
-            r1_fastq=sample.r1_path,
-            r2_fastq=sample.r2_path,
-            amplicon_seq=locus_config.reference,
-            guide_seq=locus_config.guide,
+            batch_samples.append({
+                'sample_id': sample.sample_id,
+                'r1_path': sample.r1_path,
+                'r2_path': sample.r2_path,
+                # Per-sample sequences (will use defaults if None)
+                'amplicon_seq': locus_config.reference,
+                'guide_seq': locus_config.guide,
+                'hdr_seq': locus_config.hdr_template,
+            })
+
+        # Create CRISPResso output directory
+        crispresso_dir = self.config.output_dir / "crispresso_batch"
+        crispresso_dir.mkdir(parents=True, exist_ok=True)
+
+        # Run batch
+        return run_crispresso_batch(
+            samples=batch_samples,
             output_dir=crispresso_dir,
-            hdr_seq=locus_config.hdr_template,
-            name=sample.sample_id,
+            default_amplicon_seq=self.default_locus.reference,
+            default_guide_seq=self.default_locus.guide,
+            default_hdr_seq=self.default_locus.hdr_template,
+            threads=self.config.threads,
+            skip_finished=True,
         )
 
 

@@ -14,11 +14,11 @@ from pathlib import Path
 
 def main():
     samples = snakemake.params.samples
-    output_dir = Path(snakemake.params.output_dir)
+    samples_dir = Path(snakemake.params.samples_dir)
 
     results = []
     for sample_id in samples:
-        cls_file = output_dir / sample_id / "classification.tsv"
+        cls_file = samples_dir / sample_id / "classification.tsv"
 
         if cls_file.exists():
             df = pd.read_csv(cls_file, sep='\t')
@@ -28,99 +28,121 @@ def main():
                 results.append({
                     'sample_id': sample_id,
                     'total_reads': 0,
-                    'HDR_PERFECT': 0,
-                    'HDR_IMPERFECT': 0,
+                    'HDR_COMPLETE': 0,
+                    'HDR_PARTIAL': 0,
                     'HDR_total': 0,
-                    'ANY_HDR': 0,
-                    'SNV_0': 0,
-                    'SNV_1': 0,
-                    'SNV_2': 0,
-                    'SNV_3': 0,
-                    'SNV_4': 0,
-                    'SNV_5': 0,
-                    'NHEJ_DELETION': 0,
-                    'NHEJ_INSERTION': 0,
-                    'NHEJ_total': 0,
-                    'WILD_TYPE': 0,
-                    'LARGE_DELETION': 0,
-                    'UNCLASSIFIED': 0,
+                    'NHEJ_INDEL': 0,
+                    'MMEJ_INDEL': 0,
+                    'NHEJ_MMEJ_indel': 0,
+                    'HDR_PLUS_NHEJ_INDEL': 0,
+                    'HDR_PLUS_MMEJ_INDEL': 0,
+                    'HDR_PLUS_NHEJ_MMEJ_indel': 0,
+                    'HDR_PLUS_OTHER': 0,
+                    'NON_NHEJ_INDEL': 0,
+                    'NON_DONOR_SNV': 0,
+                    'DONOR_CAPTURE': 0,
+                    'CHIMERIC': 0,
+                    'WT': 0,
+                    'UNALIGNED': 0,
                     'HDR_pct': 0.0,
-                    'ANY_HDR_pct': 0.0,
                     'NHEJ_pct': 0.0,
-                    'WT_pct': 0.0
+                    'MMEJ_pct': 0.0,
+                    'NHEJ_MMEJ_pct': 0.0,
+                    'HDR_PLUS_NHEJ_pct': 0.0,
+                    'HDR_PLUS_MMEJ_pct': 0.0,
+                    'HDR_PLUS_NHEJ_MMEJ_pct': 0.0,
+                    'HDR_PLUS_OTHER_pct': 0.0,
+                    'WT_pct': 0.0,
+                    'edited_pct': 0.0,
+                    'off_target_pct': 0.0,
+                    'chimeric_pct': 0.0,
+                    'donor_capture_pct': 0.0
                 })
             else:
-                # Count outcomes (using correct outcome names from classifier)
-                outcome_counts = df['outcome'].value_counts().to_dict()
-                total = len(df)
+                # Count outcomes (sum counts weighted by 'count' column if present)
+                if 'count' in df.columns:
+                    # Group by outcome and sum counts
+                    outcome_counts = df.groupby('outcome')['count'].sum().to_dict()
+                    total = df['count'].sum()
+                else:
+                    outcome_counts = df['outcome'].value_counts().to_dict()
+                    total = len(df)
 
-                # HDR = HDR_PERFECT + HDR_IMPERFECT
-                hdr_perfect = outcome_counts.get('HDR_PERFECT', 0)
-                hdr_imperfect = outcome_counts.get('HDR_IMPERFECT', 0)
-                hdr_total = hdr_perfect + hdr_imperfect
+                # HDR outcomes from edit_distance_hdr classifier
+                hdr_complete = outcome_counts.get('HDR_COMPLETE', 0)
+                hdr_partial = outcome_counts.get('HDR_PARTIAL', 0)
+                hdr_total = hdr_complete + hdr_partial
 
-                # NHEJ = NHEJ_DELETION + NHEJ_INSERTION
-                nhej_del = outcome_counts.get('NHEJ_DELETION', 0)
-                nhej_ins = outcome_counts.get('NHEJ_INSERTION', 0)
-                nhej_total = nhej_del + nhej_ins
+                # NHEJ outcomes (classical pathway: 0-2bp microhomology)
+                nhej_indel = outcome_counts.get('NHEJ_INDEL', 0)
+                hdr_plus_nhej = outcome_counts.get('HDR_PLUS_NHEJ_INDEL', 0)
 
-                # WT = WILD_TYPE
-                wt = outcome_counts.get('WILD_TYPE', 0)
+                # MMEJ outcomes (alt-NHEJ pathway: >2bp microhomology)
+                mmej_indel = outcome_counts.get('MMEJ_INDEL', 0)
+                hdr_plus_mmej = outcome_counts.get('HDR_PLUS_MMEJ_INDEL', 0)
 
-                # Large deletion
-                large_del = outcome_counts.get('LARGE_DELETION', 0)
+                # Mixed/other outcomes
+                hdr_plus_other = outcome_counts.get('HDR_PLUS_OTHER', 0)
 
-                # Unclassified
-                unclassified = outcome_counts.get('UNCLASSIFIED', 0)
+                # Off-target outcomes
+                non_nhej_indel = outcome_counts.get('NON_DONOR_NON_NHEJ_INDEL', 0)
+                non_donor_snv = outcome_counts.get('NON_DONOR_SNV', 0)
 
-                # Per-SNV incorporation levels (based on hdr_match_fraction)
-                # With 5 signature positions: 0.2=1SNV, 0.4=2SNV, 0.6=3SNV, 0.8=4SNV, 1.0=5SNV
-                snv_counts = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
-                any_hdr = 0
+                # Artifacts
+                chimeric = outcome_counts.get('CHIMERIC', 0)
 
-                if 'hdr_match_fraction' in df.columns:
-                    # Any HDR = reads with at least 1 donor SNV incorporated
-                    any_hdr = len(df[df['hdr_match_fraction'] > 0])
+                # Donor capture (NHEJ-mediated donor insertion)
+                donor_capture = outcome_counts.get('DONOR_CAPTURE', 0)
 
-                    # Count reads at each SNV level
-                    # Using bins: 0, 0.2, 0.4, 0.6, 0.8, 1.0 (assuming 5 signature positions)
-                    for frac, count in df['hdr_match_fraction'].value_counts().items():
-                        if frac == 0.0:
-                            snv_counts[0] += count
-                        elif frac <= 0.2:
-                            snv_counts[1] += count
-                        elif frac <= 0.4:
-                            snv_counts[2] += count
-                        elif frac <= 0.6:
-                            snv_counts[3] += count
-                        elif frac <= 0.8:
-                            snv_counts[4] += count
-                        else:  # > 0.8 (including 1.0)
-                            snv_counts[5] += count
+                # Control outcomes
+                wt = outcome_counts.get('WT', 0)
+                unaligned = outcome_counts.get('UNALIGNED', 0)
+                no_cigar = outcome_counts.get('NO_CIGAR', 0)
+
+                # Combined NHEJ+MMEJ categories (for comparison with CRISPResso2)
+                nhej_mmej_indel = nhej_indel + mmej_indel
+                hdr_plus_nhej_mmej = hdr_plus_nhej + hdr_plus_mmej
+
+                # Edited = HDR + NHEJ + MMEJ + mixed outcomes
+                edited_total = hdr_total + nhej_mmej_indel + hdr_plus_nhej_mmej + hdr_plus_other
 
                 results.append({
                     'sample_id': sample_id,
                     'total_reads': total,
-                    'HDR_PERFECT': hdr_perfect,
-                    'HDR_IMPERFECT': hdr_imperfect,
+                    # Core editing outcomes
+                    'HDR_COMPLETE': hdr_complete,
+                    'HDR_PARTIAL': hdr_partial,
                     'HDR_total': hdr_total,
-                    'ANY_HDR': any_hdr,
-                    'SNV_0': snv_counts[0],
-                    'SNV_1': snv_counts[1],
-                    'SNV_2': snv_counts[2],
-                    'SNV_3': snv_counts[3],
-                    'SNV_4': snv_counts[4],
-                    'SNV_5': snv_counts[5],
-                    'NHEJ_DELETION': nhej_del,
-                    'NHEJ_INSERTION': nhej_ins,
-                    'NHEJ_total': nhej_total,
-                    'WILD_TYPE': wt,
-                    'LARGE_DELETION': large_del,
-                    'UNCLASSIFIED': unclassified,
+                    'NHEJ_INDEL': nhej_indel,
+                    'MMEJ_INDEL': mmej_indel,
+                    'NHEJ_MMEJ_indel': nhej_mmej_indel,  # Combined for CRISPResso2 comparison
+                    'HDR_PLUS_NHEJ_INDEL': hdr_plus_nhej,
+                    'HDR_PLUS_MMEJ_INDEL': hdr_plus_mmej,
+                    'HDR_PLUS_NHEJ_MMEJ_indel': hdr_plus_nhej_mmej,  # Combined for CRISPResso2 comparison
+                    'HDR_PLUS_OTHER': hdr_plus_other,
+                    # Off-target outcomes
+                    'NON_NHEJ_INDEL': non_nhej_indel,
+                    'NON_DONOR_SNV': non_donor_snv,
+                    # Donor capture
+                    'DONOR_CAPTURE': donor_capture,
+                    # Artifacts and controls
+                    'CHIMERIC': chimeric,
+                    'WT': wt,
+                    'UNALIGNED': unaligned,
+                    # Percentages
                     'HDR_pct': 100.0 * hdr_total / total if total > 0 else 0.0,
-                    'ANY_HDR_pct': 100.0 * any_hdr / total if total > 0 else 0.0,
-                    'NHEJ_pct': 100.0 * nhej_total / total if total > 0 else 0.0,
-                    'WT_pct': 100.0 * wt / total if total > 0 else 0.0
+                    'NHEJ_pct': 100.0 * nhej_indel / total if total > 0 else 0.0,
+                    'MMEJ_pct': 100.0 * mmej_indel / total if total > 0 else 0.0,
+                    'NHEJ_MMEJ_pct': 100.0 * nhej_mmej_indel / total if total > 0 else 0.0,  # Combined
+                    'HDR_PLUS_NHEJ_pct': 100.0 * hdr_plus_nhej / total if total > 0 else 0.0,
+                    'HDR_PLUS_MMEJ_pct': 100.0 * hdr_plus_mmej / total if total > 0 else 0.0,
+                    'HDR_PLUS_NHEJ_MMEJ_pct': 100.0 * hdr_plus_nhej_mmej / total if total > 0 else 0.0,  # Combined
+                    'HDR_PLUS_OTHER_pct': 100.0 * hdr_plus_other / total if total > 0 else 0.0,
+                    'WT_pct': 100.0 * wt / total if total > 0 else 0.0,
+                    'edited_pct': 100.0 * edited_total / total if total > 0 else 0.0,
+                    'off_target_pct': 100.0 * (non_nhej_indel + non_donor_snv) / total if total > 0 else 0.0,
+                    'chimeric_pct': 100.0 * chimeric / total if total > 0 else 0.0,
+                    'donor_capture_pct': 100.0 * donor_capture / total if total > 0 else 0.0
                 })
 
     # Write summary

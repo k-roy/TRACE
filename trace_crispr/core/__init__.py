@@ -20,12 +20,6 @@ from .classification import (
     get_hdr_signature_positions,
     summarize_classifications,
 )
-from .kmer import (
-    KmerClassification,
-    KmerClassifier,
-    KmerResults,
-    classify_fastq_kmer,
-)
 from .models import (
     EditingTemplate,
 )
@@ -36,6 +30,9 @@ from .multi_ref_classifier import (
     MultiRefClassifier,
     classify_sample,
 )
+# Obsolete modules (moved to obsolete/ directory):
+# - kmer: Superseded by edit_distance_hdr
+# - combinatorial_hdr: Not used in current pipeline
 from .scoring import (
     AlignmentScore,
     DeduplicationSignature,
@@ -67,11 +64,6 @@ __all__ = [
     'classify_read',
     'summarize_classifications',
     'get_hdr_signature_positions',
-    # K-mer
-    'KmerClassification',
-    'KmerClassifier',
-    'KmerResults',
-    'classify_fastq_kmer',
     # Models
     'EditingTemplate',
     # Multi-reference alignment classifier
