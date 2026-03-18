@@ -45,7 +45,8 @@ import pandas as pd
 
 from trace_crispr.config import parse_sequence_input
 from trace_crispr.core.edit_distance_hdr import (
-    build_donor_signature, classify_read_edit_distance, DonorSignature
+    build_donor_signature, classify_read_edit_distance, DonorSignature,
+    classify_read_multi_donor, MultiDonorClassification, summarize_sample_swap_detection
 )
 
 
@@ -435,6 +436,12 @@ class ClassificationResult:
     junction_homology_left: int
     junction_homology_right: int
     mmej_class: str
+    # Multi-donor comparison fields
+    best_donor_id: str = ''
+    expected_donor_id: str = ''
+    is_sample_swap: bool = False
+    swap_confidence: float = 0.0
+    best_donor_score: float = 0.0
 
 
 def classify_sequence_worker(args: Tuple) -> Tuple[str, ClassificationResult]:
@@ -483,6 +490,224 @@ def classify_sequence_worker(args: Tuple) -> Tuple[str, ClassificationResult]:
         )
 
     return (seq_hash, clf)
+
+
+def classify_sequence_multi_donor_worker(args: Tuple) -> Tuple[str, ClassificationResult]:
+    """
+    Worker function for parallel multi-donor classification.
+
+    Compares each sequence against all donor templates to find the best match
+    and detect potential sample swaps.
+    """
+    (seq_hash, aln, ref_seq, guide, expected_donor_id,
+     all_donor_sig_dicts, cut_site, snv_distance_filter) = args
+
+    # Reconstruct all DonorSignatures from dicts
+    all_donor_signatures = {}
+    for donor_id, sig_dict in all_donor_sig_dicts.items():
+        all_donor_signatures[donor_id] = DonorSignature(
+            snvs=sig_dict['snvs'],
+            insertions=sig_dict['insertions'],
+            deletions=sig_dict['deletions']
+        )
+
+    if aln is None:
+        return (seq_hash, ClassificationResult(
+            seq_hash=seq_hash,
+            outcome='NOT_IN_CACHE',
+            n_donor_snvs=0,
+            n_non_donor=0,
+            donor_fraction=0.0,
+            donor_snvs_detected='',
+            sequencing_mode='unknown',
+            coverage_mode='unknown',
+            uncovered_positions='',
+            is_donor_capture=False,
+            donor_capture_size=0,
+            donor_capture_distance=0,
+            junction_homology_left=0,
+            junction_homology_right=0,
+            mmej_class='',
+            best_donor_id='',
+            expected_donor_id=expected_donor_id,
+            is_sample_swap=False,
+            swap_confidence=0.0,
+            best_donor_score=0.0
+        ))
+
+    clf = classify_sequence_multi_donor(
+        seq_hash=seq_hash,
+        aln=aln,
+        ref_seq=ref_seq,
+        guide=guide,
+        expected_donor_id=expected_donor_id,
+        all_donor_signatures=all_donor_signatures,
+        cut_site=cut_site,
+        snv_distance_filter=snv_distance_filter
+    )
+
+    return (seq_hash, clf)
+
+
+def classify_sequence_multi_donor(
+    seq_hash: str, aln: dict, ref_seq: str, guide: str,
+    expected_donor_id: str, all_donor_signatures: Dict[str, DonorSignature],
+    cut_site: int, snv_distance_filter: int = 50
+) -> ClassificationResult:
+    """
+    Classify a single sequence against multiple donor templates.
+
+    Returns ClassificationResult with best matching donor and swap detection.
+    """
+    mode = aln.get('mode', 'single_end')
+    r1_mapped = aln.get('r1_is_mapped', False)
+    r2_mapped = aln.get('r2_is_mapped', False)
+    r1_seq = aln.get('r1_sequence', '')
+    r2_seq = aln.get('r2_sequence', '')
+
+    # Use expected donor for sequencing mode detection (representative)
+    expected_signature = all_donor_signatures.get(expected_donor_id, DonorSignature({}, {}, {}))
+
+    sequencing_mode = detect_sequencing_mode(
+        r1_mapped, r2_mapped,
+        len(r1_seq), len(r2_seq),
+        expected_signature, len(ref_seq)
+    )
+
+    # Coverage verification using expected donor
+    r1_region = get_aligned_region(
+        aln.get('r1_ref_start', -1), aln.get('r1_ref_end', -1),
+        aln.get('r1_is_reverse', False)
+    ) if r1_mapped else None
+    r2_region = get_aligned_region(
+        aln.get('r2_ref_start', -1), aln.get('r2_ref_end', -1),
+        aln.get('r2_is_reverse', False)
+    ) if r2_mapped else None
+
+    is_covered, coverage_mode, uncovered_edits = check_donor_coverage(
+        expected_signature, r1_region, r2_region, len(ref_seq)
+    )
+    uncovered_str = ','.join(str(p) for p in uncovered_edits) if uncovered_edits else ''
+
+    # Handle unmapped reads
+    if not r1_mapped:
+        return ClassificationResult(
+            seq_hash=seq_hash,
+            outcome='UNALIGNED',
+            n_donor_snvs=0,
+            n_non_donor=0,
+            donor_fraction=0.0,
+            donor_snvs_detected='',
+            sequencing_mode=sequencing_mode,
+            coverage_mode=coverage_mode,
+            uncovered_positions=uncovered_str,
+            is_donor_capture=False,
+            donor_capture_size=0,
+            donor_capture_distance=0,
+            junction_homology_left=0,
+            junction_homology_right=0,
+            mmej_class='',
+            best_donor_id='',
+            expected_donor_id=expected_donor_id,
+            is_sample_swap=False,
+            swap_confidence=0.0,
+            best_donor_score=0.0
+        )
+
+    # Parse CIGAR
+    r1_cigar = parse_cigar_string(aln.get('r1_cigar', ''))
+    if r1_cigar is None:
+        return ClassificationResult(
+            seq_hash=seq_hash,
+            outcome='NO_CIGAR',
+            n_donor_snvs=0,
+            n_non_donor=0,
+            donor_fraction=0.0,
+            donor_snvs_detected='',
+            sequencing_mode=sequencing_mode,
+            coverage_mode=coverage_mode,
+            uncovered_positions=uncovered_str,
+            is_donor_capture=False,
+            donor_capture_size=0,
+            donor_capture_distance=0,
+            junction_homology_left=0,
+            junction_homology_right=0,
+            mmej_class='',
+            best_donor_id='',
+            expected_donor_id=expected_donor_id,
+            is_sample_swap=False,
+            swap_confidence=0.0,
+            best_donor_score=0.0
+        )
+
+    # Multi-donor classification
+    multi_clf = classify_read_multi_donor(
+        read_seq=r1_seq,
+        ref_seq=ref_seq,
+        donor_signatures=all_donor_signatures,
+        expected_donor_id=expected_donor_id,
+        ref_start=int(aln['r1_ref_start']),
+        cigar_ops=r1_cigar,
+        cut_site=cut_site,
+        snv_distance_filter=snv_distance_filter
+    )
+
+    # Get classification from best matching donor
+    clf = multi_clf.best_donor_classification
+
+    # Check for donor capture using expected donor
+    donor_capture_info = detect_donor_capture(
+        read_seq=r1_seq,
+        cigar_tuples=r1_cigar,
+        ref_start=int(aln['r1_ref_start']),
+        donor_seq='',  # Would need to reconstruct from signature
+        ref_seq=ref_seq,
+        cut_site=cut_site,
+        min_insertion_size=10,
+        min_match_fraction=0.8
+    )
+
+    final_outcome = clf.outcome
+    is_donor_capture = False
+    donor_capture_size = 0
+    donor_capture_distance = 0
+    junction_homology_left = 0
+    junction_homology_right = 0
+    mmej_class = ''
+
+    if donor_capture_info:
+        is_donor_capture = True
+        donor_capture_size = donor_capture_info['insertion_size']
+        donor_capture_distance = donor_capture_info['distance_to_cut']
+        junction_homology_left = donor_capture_info.get('junction_homology_left', 0)
+        junction_homology_right = donor_capture_info.get('junction_homology_right', 0)
+        mmej_class = donor_capture_info.get('mmej_class', 'UNKNOWN')
+        final_outcome = 'DONOR_CAPTURE'
+
+    donor_snvs_str = ','.join(str(p) for p in sorted(clf.donor_snvs_detected)) if clf.donor_snvs_detected else ''
+
+    return ClassificationResult(
+        seq_hash=seq_hash,
+        outcome=final_outcome,
+        n_donor_snvs=clf.n_donor_encoded,
+        n_non_donor=clf.n_non_donor,
+        donor_fraction=clf.donor_fraction,
+        donor_snvs_detected=donor_snvs_str,
+        sequencing_mode=sequencing_mode,
+        coverage_mode=coverage_mode,
+        uncovered_positions=uncovered_str,
+        is_donor_capture=is_donor_capture,
+        donor_capture_size=donor_capture_size,
+        donor_capture_distance=donor_capture_distance,
+        junction_homology_left=junction_homology_left,
+        junction_homology_right=junction_homology_right,
+        mmej_class=mmej_class,
+        best_donor_id=multi_clf.best_donor_id,
+        expected_donor_id=multi_clf.expected_donor_id,
+        is_sample_swap=multi_clf.is_sample_swap,
+        swap_confidence=multi_clf.swap_confidence,
+        best_donor_score=multi_clf.best_donor_score
+    )
 
 
 def classify_sequence(seq_hash: str, aln: dict, ref_seq: str, guide: str, donor: str,
@@ -663,7 +888,8 @@ def classify_sequence(seq_hash: str, aln: dict, ref_seq: str, guide: str, donor:
     )
 
 
-def write_sample_outputs(sample_id: str, results: list, output_dir: Path):
+def write_sample_outputs(sample_id: str, results: list, output_dir: Path,
+                         multi_donor_mode: bool = False):
     """
     Write per-sample classification.tsv and hdr_snv_detail.tsv.
 
@@ -678,7 +904,7 @@ def write_sample_outputs(sample_id: str, results: list, output_dir: Path):
     total_hdr_reads = 0
 
     for seq_hash, clf, count in results:
-        rows.append({
+        row = {
             'read_name': f"{seq_hash}_x{count}",
             'outcome': clf.outcome,
             'n_donor_snvs': clf.n_donor_snvs,
@@ -695,7 +921,17 @@ def write_sample_outputs(sample_id: str, results: list, output_dir: Path):
             'junction_homology_right': clf.junction_homology_right,
             'mmej_class': clf.mmej_class,
             'count': count
-        })
+        }
+
+        # Add multi-donor columns if enabled
+        if multi_donor_mode:
+            row['best_donor_id'] = clf.best_donor_id
+            row['expected_donor_id'] = clf.expected_donor_id
+            row['is_sample_swap'] = clf.is_sample_swap
+            row['swap_confidence'] = clf.swap_confidence
+            row['best_donor_score'] = clf.best_donor_score
+
+        rows.append(row)
 
         # Track per-SNV integration for HDR reads
         if clf.outcome in ['HDR_COMPLETE', 'HDR_PARTIAL', 'MIXED']:
@@ -764,6 +1000,10 @@ def main():
     parser.add_argument('--samples-dir', required=True, help='Directory containing sample collapsed files')
     parser.add_argument('--checkpoint-dir', help='Checkpoint directory (default: output-dir/checkpoints)')
     parser.add_argument('--snv-distance-filter', type=int, default=50)
+    parser.add_argument('--multi-donor-mode', action='store_true',
+                        help='Enable multi-donor comparison for barcoded experiments. '
+                             'Compares each read against all donor templates in the manifest '
+                             'to find the best match and detect sample swaps.')
 
     args = parser.parse_args()
 
@@ -792,6 +1032,7 @@ def main():
     # Load manifest and find samples for this combo
     manifest_df = pd.read_csv(args.manifest, sep='\t')
     samples_for_combo = []
+    sample_to_expected_donor = {}  # sample_id -> expected donor ID (for multi-donor mode)
 
     for _, row in manifest_df.iterrows():
         sample_guide = str(row.get('guide', '')) if pd.notna(row.get('guide', '')) else ''
@@ -800,6 +1041,43 @@ def main():
         # Match guide/donor
         if sample_guide == guide and sample_donor == donor:
             samples_for_combo.append(row['sample_id'])
+            sample_to_expected_donor[row['sample_id']] = sample_donor
+
+    # Multi-donor mode: load all unique donors for this guide
+    all_donor_signatures = {}  # donor_seq -> DonorSignature
+    all_donor_ids = {}  # donor_seq -> short ID for reporting
+    if args.multi_donor_mode:
+        # Find all unique donors that share this guide
+        unique_donors = set()
+        for _, row in manifest_df.iterrows():
+            sample_guide = str(row.get('guide', '')) if pd.notna(row.get('guide', '')) else ''
+            sample_donor = str(row.get('hdr_template', '')) if pd.notna(row.get('hdr_template', '')) else ''
+
+            if sample_guide == guide and sample_donor:
+                unique_donors.add(sample_donor)
+
+        print(f"Multi-donor mode: building signatures for {len(unique_donors)} unique donors...")
+        for i, donor_seq in enumerate(sorted(unique_donors)):
+            # Create a short ID for this donor (using first 8 chars of hash)
+            import hashlib
+            donor_hash = hashlib.md5(donor_seq.encode()).hexdigest()[:8]
+            donor_id = f"donor_{donor_hash}"
+            all_donor_ids[donor_seq] = donor_id
+
+            # Build signature for this donor
+            sig = build_donor_signature(ref_seq, donor_seq, cut_site)
+            all_donor_signatures[donor_id] = sig
+
+            if (i + 1) % 10 == 0 or i + 1 == len(unique_donors):
+                print(f"  Built {i+1}/{len(unique_donors)} donor signatures")
+
+        # Map sample expected donors to IDs
+        for sample_id in samples_for_combo:
+            expected_donor_seq = sample_to_expected_donor.get(sample_id, '')
+            if expected_donor_seq:
+                sample_to_expected_donor[sample_id] = all_donor_ids.get(expected_donor_seq, '')
+            else:
+                sample_to_expected_donor[sample_id] = ''
 
     print(f"Found {len(samples_for_combo)} samples for combo {args.combo_id}")
     print(f"  Guide: {guide[:30]}..." if len(guide) > 30 else f"  Guide: {guide or '(none)'}")
@@ -846,12 +1124,22 @@ def main():
     n_workers = min(mp.cpu_count(), 16)  # Cap at 16 to match typical SLURM allocation
     print(f"Using {n_workers} parallel workers for classification")
 
-    # Prepare donor signature as dict for pickling
+    # Prepare donor signature(s) as dict for pickling
     donor_sig_dict = {
         'snvs': dict(donor_signature.snvs),
         'insertions': dict(donor_signature.insertions),
         'deletions': dict(donor_signature.deletions)
     }
+
+    # For multi-donor mode, prepare all donor signatures as dicts
+    all_donor_sig_dicts = {}
+    if args.multi_donor_mode:
+        for donor_id, sig in all_donor_signatures.items():
+            all_donor_sig_dicts[donor_id] = {
+                'snvs': dict(sig.snvs),
+                'insertions': dict(sig.insertions),
+                'deletions': dict(sig.deletions)
+            }
 
     # Extract alignments in batches (64K lookups/sec with pre-indexed cache)
     print("Extracting alignments for parallel classification...")
@@ -871,19 +1159,31 @@ def main():
     alignment_lookup.close()
 
     # Prepare work items for parallel classification
-    work_items = [
-        (seq_hash, seq_to_aln.get(seq_hash), ref_seq, guide, donor, donor_sig_dict,
-         cut_site, args.snv_distance_filter)
-        for seq_hash in all_seq_hashes
-    ]
+    if args.multi_donor_mode:
+        # Multi-donor mode: classify against all donors (use '' as placeholder expected_donor)
+        work_items = [
+            (seq_hash, seq_to_aln.get(seq_hash), ref_seq, guide, '',
+             all_donor_sig_dicts, cut_site, args.snv_distance_filter)
+            for seq_hash in all_seq_hashes
+        ]
+        worker_func = classify_sequence_multi_donor_worker
+    else:
+        # Standard mode: single donor
+        work_items = [
+            (seq_hash, seq_to_aln.get(seq_hash), ref_seq, guide, donor, donor_sig_dict,
+             cut_site, args.snv_distance_filter)
+            for seq_hash in all_seq_hashes
+        ]
+        worker_func = classify_sequence_worker
 
     # Classify all unique sequences in parallel
-    print(f"Classifying {len(work_items)} unique sequences in parallel...")
+    mode_str = "multi-donor" if args.multi_donor_mode else "single-donor"
+    print(f"Classifying {len(work_items)} unique sequences in parallel ({mode_str} mode)...")
     level2_cache = {}  # type: Dict[str, ClassificationResult]
 
     with mp.Pool(processes=n_workers) as pool:
         # Use imap_unordered for better progress tracking
-        results_iter = pool.imap_unordered(classify_sequence_worker, work_items, chunksize=100)
+        results_iter = pool.imap_unordered(worker_func, work_items, chunksize=100)
 
         classified = 0
         for seq_hash, clf in results_iter:
@@ -902,6 +1202,7 @@ def main():
     log_lines = []
     total_classified = 0
     total_reads = 0
+    swap_summary = []  # Track sample swaps for reporting
 
     for i, sample_id in enumerate(remaining_samples):
         if sample_id not in sample_sequences:
@@ -909,6 +1210,9 @@ def main():
 
         seqs = sample_sequences[sample_id]
         results = []
+
+        # Get expected donor for this sample (multi-donor mode)
+        expected_donor_id = sample_to_expected_donor.get(sample_id, '') if args.multi_donor_mode else ''
 
         for seq_hash, count in seqs:
             clf = level2_cache.get(seq_hash)
@@ -931,10 +1235,61 @@ def main():
                     junction_homology_right=0,
                     mmej_class=''
                 )
+            elif args.multi_donor_mode and expected_donor_id:
+                # Update classification with sample-specific expected donor and swap detection
+                is_swap = (clf.best_donor_id != expected_donor_id and
+                           clf.best_donor_score > 0 and
+                           clf.n_donor_snvs > 0)
+                swap_confidence = clf.swap_confidence if is_swap else 0.0
+
+                # Create updated classification with correct expected_donor_id
+                clf = ClassificationResult(
+                    seq_hash=clf.seq_hash,
+                    outcome=clf.outcome,
+                    n_donor_snvs=clf.n_donor_snvs,
+                    n_non_donor=clf.n_non_donor,
+                    donor_fraction=clf.donor_fraction,
+                    donor_snvs_detected=clf.donor_snvs_detected,
+                    sequencing_mode=clf.sequencing_mode,
+                    coverage_mode=clf.coverage_mode,
+                    uncovered_positions=clf.uncovered_positions,
+                    is_donor_capture=clf.is_donor_capture,
+                    donor_capture_size=clf.donor_capture_size,
+                    donor_capture_distance=clf.donor_capture_distance,
+                    junction_homology_left=clf.junction_homology_left,
+                    junction_homology_right=clf.junction_homology_right,
+                    mmej_class=clf.mmej_class,
+                    best_donor_id=clf.best_donor_id,
+                    expected_donor_id=expected_donor_id,
+                    is_sample_swap=is_swap,
+                    swap_confidence=swap_confidence,
+                    best_donor_score=clf.best_donor_score
+                )
             results.append((seq_hash, clf, count))
 
         # Write sample outputs
-        n_seqs, n_reads = write_sample_outputs(sample_id, results, output_dir)
+        n_seqs, n_reads = write_sample_outputs(sample_id, results, output_dir, args.multi_donor_mode)
+
+        # Summarize sample swap detection for multi-donor mode
+        if args.multi_donor_mode:
+            swap_reads = sum(count for _, clf, count in results if clf.is_sample_swap)
+            hdr_reads = sum(count for _, clf, count in results if clf.n_donor_snvs > 0)
+            if hdr_reads > 0 and swap_reads > hdr_reads * 0.5:
+                # Majority of HDR reads show different donor - likely swap
+                best_donors = {}
+                for _, clf, count in results:
+                    if clf.n_donor_snvs > 0:
+                        best_donors[clf.best_donor_id] = best_donors.get(clf.best_donor_id, 0) + count
+                if best_donors:
+                    detected_donor = max(best_donors, key=best_donors.get)
+                    swap_summary.append({
+                        'sample_id': sample_id,
+                        'expected_donor': expected_donor_id,
+                        'detected_donor': detected_donor,
+                        'swap_reads': swap_reads,
+                        'total_hdr_reads': hdr_reads,
+                        'swap_fraction': swap_reads / hdr_reads
+                    })
         total_classified += n_seqs
         total_reads += n_reads
 
@@ -947,19 +1302,46 @@ def main():
         print(log_line)
         log_lines.append(log_line)
 
+    # Write swap detection report if in multi-donor mode
+    swap_report_lines = []
+    if args.multi_donor_mode and swap_summary:
+        print(f"\n=== SAMPLE SWAP DETECTION ===")
+        print(f"Found {len(swap_summary)} potential sample swaps:")
+        swap_report_lines.append("sample_id\texpected_donor\tdetected_donor\tswap_reads\ttotal_hdr_reads\tswap_fraction")
+        for swap in swap_summary:
+            line = f"{swap['sample_id']}\t{swap['expected_donor']}\t{swap['detected_donor']}\t{swap['swap_reads']}\t{swap['total_hdr_reads']}\t{swap['swap_fraction']:.3f}"
+            swap_report_lines.append(line)
+            print(f"  {swap['sample_id']}: expected={swap['expected_donor']}, detected={swap['detected_donor']} ({swap['swap_fraction']:.1%})")
+
+        # Write swap report
+        swap_report_path = output_dir / "swap_detection_report.tsv"
+        swap_report_path.write_text('\n'.join(swap_report_lines))
+        print(f"Swap report written to: {swap_report_path}")
+
     # Write final log
+    mode_str = "Multi-donor mode" if args.multi_donor_mode else "Single-donor mode"
+    donor_info = f"Donors: {len(all_donor_signatures)}" if args.multi_donor_mode else f"Donor: {donor[:50] if donor else '(none)'}"
+
     log_msg = f"""Classify Group Complete: {args.combo_id}
 
+Mode: {mode_str}
 Guide: {guide[:50] if guide else '(none)'}
-Donor: {donor[:50] if donor else '(none)'}
+{donor_info}
 
 Samples processed: {len(remaining_samples)}
 Level 2 cache entries: {len(level2_cache)}
 Total sequences classified: {total_classified}
 Total reads: {total_reads}
+"""
 
-Sample details:
-""" + '\n'.join(log_lines)
+    if args.multi_donor_mode:
+        log_msg += f"\nSample swaps detected: {len(swap_summary)}\n"
+        if swap_summary:
+            log_msg += "\nSwap details:\n"
+            for swap in swap_summary:
+                log_msg += f"  {swap['sample_id']}: {swap['expected_donor']} -> {swap['detected_donor']} ({swap['swap_fraction']:.1%})\n"
+
+    log_msg += "\nSample details:\n" + '\n'.join(log_lines)
 
     log_path.write_text(log_msg)
     print(f"\nDone! Log written to {log_path}")

@@ -996,3 +996,344 @@ def analyze_donor_integration(
         'partial_breakdown': partial_counts,
         'n_donor_positions': len(donor_signature)
     }
+
+
+@dataclass
+class MultiDonorClassification:
+    """
+    Classification result when comparing against multiple donor templates.
+
+    Used for barcoded experiments where each sample has a unique HDR template
+    and we need to:
+    1. Find the best matching donor from all possibilities
+    2. Detect sample swaps (when detected donor differs from expected)
+    """
+    # Best matching donor
+    best_donor_id: str
+    best_donor_score: float  # Higher is better match
+    best_donor_classification: EditDistanceClassification
+
+    # Expected donor (from manifest)
+    expected_donor_id: str
+
+    # Sample swap detection
+    is_sample_swap: bool  # True if best_donor_id != expected_donor_id
+    swap_confidence: float  # Confidence in swap detection (0-1)
+
+    # All donor scores for debugging/analysis
+    all_donor_scores: Dict[str, float] = field(default_factory=dict)
+
+
+def score_donor_match(
+    classification: EditDistanceClassification,
+    donor_signature: DonorSignature
+) -> float:
+    """
+    Score how well a read matches a donor template.
+
+    Scoring system:
+    - +10 points per donor-encoded SNV detected
+    - +10 points per donor-encoded insertion detected
+    - +10 points per donor-encoded deletion detected
+    - -5 points per non-donor edit
+    - Bonus for complete HDR: +20 points
+
+    Args:
+        classification: Result from classify_read_edit_distance
+        donor_signature: The donor template signature
+
+    Returns:
+        Score (higher = better match)
+    """
+    score = 0.0
+
+    # Count expected donor edits
+    n_expected_snvs = len(donor_signature.snvs)
+    n_expected_insertions = len(donor_signature.insertions)
+    n_expected_deletions = len(donor_signature.deletions)
+    n_total_expected = n_expected_snvs + n_expected_insertions + n_expected_deletions
+
+    if n_total_expected == 0:
+        # No donor edits expected (WT/control)
+        return 0.0
+
+    # Count donor edits found
+    n_donor_edits = classification.n_donor_encoded
+    n_non_donor = classification.n_non_donor
+
+    # Base score: points for donor edits found
+    score += n_donor_edits * 10.0
+
+    # Penalty for non-donor edits
+    score -= n_non_donor * 5.0
+
+    # Bonus for complete HDR
+    if n_donor_edits == n_total_expected and n_non_donor == 0:
+        score += 20.0
+
+    # Normalize by expected edits to handle different barcode sizes
+    # This makes scores comparable across donors with different numbers of edits
+    normalized_score = score / n_total_expected
+
+    return normalized_score
+
+
+def classify_read_multi_donor(
+    read_seq: str,
+    ref_seq: str,
+    donor_signatures: Dict[str, DonorSignature],
+    expected_donor_id: str,
+    ref_start: int,
+    cigar_ops: Optional[List[Tuple[int, int]]] = None,
+    cut_site: int = 0,
+    snv_distance_filter: int = 50,
+    filter_chimeric: bool = True,
+    homopolymer_filter: int = 0,
+    nhej_quantification_window: int = 1,
+    min_alignment_quality: float = 0.90,
+    max_mismatch_rate: float = 0.15,
+    min_score_difference: float = 5.0
+) -> MultiDonorClassification:
+    """
+    Classify a read by comparing against multiple donor templates.
+
+    This enables:
+    1. Sample swap detection: Find which barcode is actually present
+    2. Improved HDR calling: Match against the correct template
+    3. Quality control: Flag ambiguous assignments
+
+    Args:
+        read_seq: Read sequence
+        ref_seq: Reference sequence
+        donor_signatures: Dict mapping donor_id -> DonorSignature
+        expected_donor_id: The donor ID expected for this sample (from manifest)
+        ref_start: Start position of read in reference
+        cigar_ops: Optional CIGAR operations for indel handling
+        cut_site: Cut site position for distance calculations
+        snv_distance_filter: Distance filter for non-donor SNVs
+        filter_chimeric: Filter chimeric reads
+        homopolymer_filter: Filter homopolymer indels
+        nhej_quantification_window: Window for NHEJ calling
+        min_alignment_quality: Minimum alignment quality
+        max_mismatch_rate: Maximum mismatch rate
+        min_score_difference: Minimum score difference to confidently call a swap
+
+    Returns:
+        MultiDonorClassification with best donor match and swap detection
+    """
+    if not donor_signatures:
+        # No donors to compare - return empty result
+        empty_clf = EditDistanceClassification(
+            outcome='NO_DONORS',
+            edits=[],
+            n_donor_encoded=0,
+            n_non_donor=0,
+            n_total_edits=0,
+            donor_fraction=0.0
+        )
+        return MultiDonorClassification(
+            best_donor_id='',
+            best_donor_score=0.0,
+            best_donor_classification=empty_clf,
+            expected_donor_id=expected_donor_id,
+            is_sample_swap=False,
+            swap_confidence=0.0
+        )
+
+    # Classify read against each donor
+    donor_results = {}
+    donor_scores = {}
+
+    for donor_id, signature in donor_signatures.items():
+        clf = classify_read_edit_distance(
+            read_seq=read_seq,
+            ref_seq=ref_seq,
+            donor_signature=signature,
+            ref_start=ref_start,
+            cigar_ops=cigar_ops,
+            cut_site=cut_site,
+            snv_distance_filter=snv_distance_filter,
+            filter_chimeric=filter_chimeric,
+            homopolymer_filter=homopolymer_filter,
+            nhej_quantification_window=nhej_quantification_window,
+            min_alignment_quality=min_alignment_quality,
+            max_mismatch_rate=max_mismatch_rate
+        )
+
+        score = score_donor_match(clf, signature)
+        donor_results[donor_id] = clf
+        donor_scores[donor_id] = score
+
+    # Find best matching donor
+    if donor_scores:
+        best_donor_id = max(donor_scores, key=donor_scores.get)
+        best_score = donor_scores[best_donor_id]
+        best_clf = donor_results[best_donor_id]
+
+        # Calculate swap confidence
+        # If best donor differs from expected, calculate confidence
+        if best_donor_id != expected_donor_id:
+            expected_score = donor_scores.get(expected_donor_id, 0.0)
+            score_diff = best_score - expected_score
+
+            # Only call swap if score difference exceeds threshold
+            is_swap = score_diff >= min_score_difference and best_score > 0
+
+            # Confidence based on score difference
+            if is_swap:
+                # Normalize confidence: score_diff of min_score_difference = 0.5,
+                # score_diff of 2*min_score_difference = 0.75, etc.
+                swap_confidence = min(0.5 + (score_diff - min_score_difference) / (2 * min_score_difference), 1.0)
+            else:
+                swap_confidence = 0.0
+        else:
+            is_swap = False
+            swap_confidence = 0.0
+    else:
+        # Fallback to expected donor if no scores
+        best_donor_id = expected_donor_id
+        best_score = 0.0
+        best_clf = donor_results.get(expected_donor_id, EditDistanceClassification(
+            outcome='NO_MATCH',
+            edits=[],
+            n_donor_encoded=0,
+            n_non_donor=0,
+            n_total_edits=0,
+            donor_fraction=0.0
+        ))
+        is_swap = False
+        swap_confidence = 0.0
+
+    return MultiDonorClassification(
+        best_donor_id=best_donor_id,
+        best_donor_score=best_score,
+        best_donor_classification=best_clf,
+        expected_donor_id=expected_donor_id,
+        is_sample_swap=is_swap,
+        swap_confidence=swap_confidence,
+        all_donor_scores=donor_scores
+    )
+
+
+def batch_classify_multi_donor(
+    sequences: List[Tuple[str, str, int, Optional[List[Tuple[int, int]]]]],
+    ref_seq: str,
+    donor_signatures: Dict[str, DonorSignature],
+    expected_donor_id: str,
+    cut_site: int = 0,
+    **kwargs
+) -> List[MultiDonorClassification]:
+    """
+    Classify multiple sequences against multiple donors efficiently.
+
+    Optimizes by pre-building all donor signatures once, then classifying
+    each sequence against all donors.
+
+    Args:
+        sequences: List of (read_seq, seq_id, ref_start, cigar_ops) tuples
+        ref_seq: Reference sequence
+        donor_signatures: Dict mapping donor_id -> DonorSignature
+        expected_donor_id: Expected donor for this sample
+        cut_site: Cut site position
+        **kwargs: Additional arguments for classify_read_multi_donor
+
+    Returns:
+        List of MultiDonorClassification results
+    """
+    results = []
+
+    for read_seq, seq_id, ref_start, cigar_ops in sequences:
+        clf = classify_read_multi_donor(
+            read_seq=read_seq,
+            ref_seq=ref_seq,
+            donor_signatures=donor_signatures,
+            expected_donor_id=expected_donor_id,
+            ref_start=ref_start,
+            cigar_ops=cigar_ops,
+            cut_site=cut_site,
+            **kwargs
+        )
+        results.append(clf)
+
+    return results
+
+
+def summarize_sample_swap_detection(
+    classifications: List[MultiDonorClassification]
+) -> Dict:
+    """
+    Summarize sample swap detection results across all reads in a sample.
+
+    Args:
+        classifications: List of MultiDonorClassification results
+
+    Returns:
+        Dict with:
+        - expected_donor_id: Expected donor for this sample
+        - detected_donor_id: Most commonly detected donor
+        - is_sample_swap: Whether sample appears to be swapped
+        - swap_confidence: Confidence in swap detection
+        - donor_distribution: Dict of donor_id -> read count
+        - swap_reads_fraction: Fraction of reads matching non-expected donor
+    """
+    if not classifications:
+        return {
+            'expected_donor_id': '',
+            'detected_donor_id': '',
+            'is_sample_swap': False,
+            'swap_confidence': 0.0,
+            'donor_distribution': {},
+            'swap_reads_fraction': 0.0
+        }
+
+    expected_donor_id = classifications[0].expected_donor_id
+
+    # Count reads per detected donor (only count HDR-positive reads)
+    donor_counts = {}
+    total_hdr_reads = 0
+
+    for clf in classifications:
+        # Only count reads that show HDR evidence
+        if clf.best_donor_score > 0 and clf.best_donor_classification.n_donor_encoded > 0:
+            best_id = clf.best_donor_id
+            donor_counts[best_id] = donor_counts.get(best_id, 0) + 1
+            total_hdr_reads += 1
+
+    if total_hdr_reads == 0:
+        return {
+            'expected_donor_id': expected_donor_id,
+            'detected_donor_id': expected_donor_id,
+            'is_sample_swap': False,
+            'swap_confidence': 0.0,
+            'donor_distribution': {},
+            'swap_reads_fraction': 0.0
+        }
+
+    # Find most common donor
+    detected_donor_id = max(donor_counts, key=donor_counts.get)
+    detected_count = donor_counts[detected_donor_id]
+
+    # Calculate swap metrics
+    expected_count = donor_counts.get(expected_donor_id, 0)
+    swap_reads_fraction = 1.0 - (expected_count / total_hdr_reads)
+
+    # Call swap if detected donor differs and has clear majority
+    is_swap = (detected_donor_id != expected_donor_id and
+               detected_count > expected_count and
+               swap_reads_fraction > 0.5)
+
+    # Confidence based on how dominant the detected donor is
+    if is_swap:
+        swap_confidence = detected_count / total_hdr_reads
+    else:
+        swap_confidence = 0.0
+
+    return {
+        'expected_donor_id': expected_donor_id,
+        'detected_donor_id': detected_donor_id,
+        'is_sample_swap': is_swap,
+        'swap_confidence': swap_confidence,
+        'donor_distribution': donor_counts,
+        'swap_reads_fraction': swap_reads_fraction,
+        'total_hdr_reads': total_hdr_reads
+    }
