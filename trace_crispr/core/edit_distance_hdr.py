@@ -14,10 +14,10 @@ This approach:
 Author: Kevin R. Roy
 """
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple, Set
 import logging
+from dataclasses import dataclass, field
 from enum import Enum
+from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -645,11 +645,6 @@ def classify_read_edit_distance(
     donor_snvs_missing = list(donor_signature.snvs.keys())
     is_chimeric = False  # Flag for chimeric read detection
 
-    # Track expected donor indels
-    n_expected_donor_snvs = len(donor_signature.snvs)
-    n_expected_donor_insertions = len(donor_signature.insertions)
-    n_expected_donor_deletions = len(donor_signature.deletions)
-
     # Process CIGAR if available (for proper indel handling)
     if cigar_ops:
         ref_pos = ref_start
@@ -873,7 +868,6 @@ def classify_read_edit_distance(
 
     n_mmej_indels = len(mmej_indels)
     n_classical_nhej_indels = len(classical_nhej_indels)
-    n_nhej_indels = n_mmej_indels + n_classical_nhej_indels  # Total for backwards compatibility
     n_non_nhej_indels = len(non_nhej_indels)
 
     # Only count non-donor SNVs within snv_distance_filter of cut site
