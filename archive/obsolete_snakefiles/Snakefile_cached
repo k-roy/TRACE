@@ -1,0 +1,226 @@
+"""
+Snakemake workflow for TRACE analysis with sequence caching.
+
+This workflow collapses reads to unique sequences before alignment/classification,
+dramatically reducing compute for amplicon data with high redundancy.
+
+Workflow:
+1. Trim adapters (per-sample)
+2. Collapse to unique sequences (per-sample)
+3. Merge unique sequences globally
+4. Align unique sequences once
+5. Classify unique sequences once
+6. Expand classifications back to per-sample results
+
+Author: Kevin R. Roy
+"""
+
+import pandas as pd
+from pathlib import Path
+import hashlib
+
+# Load configuration
+MANIFEST = config.get("manifest", "trace_manifest.tsv")
+OUTPUT_DIR = Path(config.get("output_dir", "results/trace_cached"))
+THREADS_PER_SAMPLE = config.get("threads_per_sample", 4)
+
+# Load sample manifest
+manifest_df = pd.read_csv(MANIFEST, sep='\t')
+SAMPLES = manifest_df['sample_id'].tolist()
+
+# Create sample info lookup
+sample_info = {}
+for _, row in manifest_df.iterrows():
+    sample_info[row['sample_id']] = {
+        'r1_path': row['r1_path'],
+        'r2_path': row['r2_path'],
+        'reference': row.get('reference', ''),
+        'guide': row.get('guide', ''),
+        'hdr_template': row.get('hdr_template', ''),
+    }
+
+# Default sequences
+DEFAULT_REF = config.get("default_reference", "")
+DEFAULT_GUIDE = config.get("default_guide", "")
+DEFAULT_HDR = config.get("default_hdr_template", "")
+
+# Get workflow directory
+WORKFLOW_DIR = Path("/oak/stanford/groups/larsms/Users/kevinroy/software/trace/workflow")
+SAMPLES_DIR = OUTPUT_DIR / "samples"
+CACHE_DIR = OUTPUT_DIR / "cache"
+
+
+rule all:
+    input:
+        OUTPUT_DIR / "summary" / "all_samples_results.tsv",
+        expand(SAMPLES_DIR / "{sample}" / "classification.tsv", sample=SAMPLES),
+        expand(SAMPLES_DIR / "{sample}" / "hdr_snv_detail.tsv", sample=SAMPLES)
+
+
+rule trim_adapters:
+    """Trim adapters using cutadapt."""
+    input:
+        r1 = lambda w: sample_info[w.sample]['r1_path'],
+        r2 = lambda w: sample_info[w.sample]['r2_path']
+    output:
+        r1 = SAMPLES_DIR / "{sample}" / "trimmed" / "R1_trimmed.fastq.gz",
+        r2 = SAMPLES_DIR / "{sample}" / "trimmed" / "R2_trimmed.fastq.gz"
+    log:
+        SAMPLES_DIR / "{sample}" / "logs" / "trim.log"
+    threads: 2
+    shell:
+        """
+        mkdir -p $(dirname {output.r1})
+        cutadapt \
+            -a AGATCGGAAGAGCACACGTCTGAACTCCAGTCA \
+            -A AGATCGGAAGAGCGTCGTGTAGGGAAAGAGTGT \
+            -j {threads} \
+            -m 20 \
+            -o {output.r1} \
+            -p {output.r2} \
+            {input.r1} {input.r2} \
+            > {log} 2>&1
+        """
+
+
+rule collapse_reads:
+    """
+    Collapse reads to unique merged sequences with counts.
+    Also stores guide/donor context for classification caching.
+    """
+    input:
+        r1 = SAMPLES_DIR / "{sample}" / "trimmed" / "R1_trimmed.fastq.gz",
+        r2 = SAMPLES_DIR / "{sample}" / "trimmed" / "R2_trimmed.fastq.gz"
+    output:
+        collapsed = SAMPLES_DIR / "{sample}" / "collapsed" / "unique_sequences.tsv.gz"
+    log:
+        SAMPLES_DIR / "{sample}" / "logs" / "collapse.log"
+    params:
+        guide = lambda w: sample_info[w.sample]['guide'] if sample_info[w.sample]['guide'] and not pd.isna(sample_info[w.sample]['guide']) else DEFAULT_GUIDE,
+        hdr_template = lambda w: sample_info[w.sample]['hdr_template'] if sample_info[w.sample]['hdr_template'] and not pd.isna(sample_info[w.sample]['hdr_template']) else DEFAULT_HDR
+    script:
+        str(WORKFLOW_DIR / "scripts" / "collapse_reads.py")
+
+
+rule merge_unique_sequences:
+    """
+    Merge unique sequences across all samples.
+    Creates global cache of unique (merged_seq, guide, donor) combinations.
+    """
+    input:
+        collapsed = expand(SAMPLES_DIR / "{sample}" / "collapsed" / "unique_sequences.tsv.gz", sample=SAMPLES)
+    output:
+        global_unique = CACHE_DIR / "global_unique_sequences.tsv.gz",
+        sample_mapping = CACHE_DIR / "sequence_to_sample_mapping.tsv.gz"
+    log:
+        CACHE_DIR / "merge_unique.log"
+    script:
+        str(WORKFLOW_DIR / "scripts" / "merge_unique_sequences.py")
+
+
+rule create_reference_fasta:
+    """Create reference FASTA for aligners."""
+    output:
+        fasta = OUTPUT_DIR / "reference.fasta"
+    run:
+        from trace_crispr.config import parse_sequence_input
+
+        ref_seq = None
+        for sample_id in SAMPLES:
+            ref = sample_info[sample_id]['reference']
+            if ref and not pd.isna(ref):
+                ref_seq = parse_sequence_input(ref)
+                break
+
+        if ref_seq is None and DEFAULT_REF:
+            ref_seq = parse_sequence_input(DEFAULT_REF)
+
+        if ref_seq is None:
+            raise ValueError("No reference sequence found")
+
+        output_path = Path(output.fasta)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(f">reference\n{ref_seq}\n")
+
+
+rule index_bwa:
+    """Create BWA index."""
+    input:
+        ref = OUTPUT_DIR / "reference.fasta"
+    output:
+        bwt = OUTPUT_DIR / "reference.fasta.bwt"
+    log:
+        OUTPUT_DIR / "logs" / "bwa_index.log"
+    shell:
+        "bwa index {input.ref} 2>{log}"
+
+
+rule align_unique_sequences:
+    """
+    Align unique sequences (not individual reads).
+    This is the key optimization - we only align each unique sequence once.
+    """
+    input:
+        unique_seqs = CACHE_DIR / "global_unique_sequences.tsv.gz",
+        ref = OUTPUT_DIR / "reference.fasta",
+        bwt = OUTPUT_DIR / "reference.fasta.bwt"
+    output:
+        bam = CACHE_DIR / "unique_alignments.bam",
+        bai = CACHE_DIR / "unique_alignments.bam.bai"
+    log:
+        CACHE_DIR / "align_unique.log"
+    threads: 8
+    script:
+        str(WORKFLOW_DIR / "scripts" / "align_unique_sequences.py")
+
+
+rule classify_unique_sequences:
+    """
+    Classify unique sequences using edit distance HDR detection.
+    Each unique (sequence, guide, donor) combination is classified once.
+    """
+    input:
+        bam = CACHE_DIR / "unique_alignments.bam",
+        unique_seqs = CACHE_DIR / "global_unique_sequences.tsv.gz"
+    output:
+        classifications = CACHE_DIR / "unique_classifications.tsv.gz"
+    log:
+        CACHE_DIR / "classify_unique.log"
+    params:
+        reference = DEFAULT_REF,
+        edit_region_size = config.get("edit_region_size", 30)
+    script:
+        str(WORKFLOW_DIR / "scripts" / "classify_unique_sequences.py")
+
+
+rule expand_to_samples:
+    """
+    Expand cached classifications back to per-sample results.
+    Maps cached outcomes to original samples using sequence mapping.
+    """
+    input:
+        classifications = CACHE_DIR / "unique_classifications.tsv.gz",
+        sample_mapping = CACHE_DIR / "sequence_to_sample_mapping.tsv.gz",
+        collapsed = SAMPLES_DIR / "{sample}" / "collapsed" / "unique_sequences.tsv.gz"
+    output:
+        classification = SAMPLES_DIR / "{sample}" / "classification.tsv",
+        hdr_detail = SAMPLES_DIR / "{sample}" / "hdr_snv_detail.tsv"
+    log:
+        SAMPLES_DIR / "{sample}" / "logs" / "expand.log"
+    params:
+        sample_id = lambda w: w.sample
+    script:
+        str(WORKFLOW_DIR / "scripts" / "expand_to_samples.py")
+
+
+rule aggregate_results:
+    """Aggregate per-sample results into summary table."""
+    input:
+        expand(SAMPLES_DIR / "{sample}" / "classification.tsv", sample=SAMPLES)
+    output:
+        tsv = OUTPUT_DIR / "summary" / "all_samples_results.tsv"
+    params:
+        samples = SAMPLES,
+        samples_dir = SAMPLES_DIR
+    script:
+        str(WORKFLOW_DIR / "scripts" / "aggregate_results.py")
