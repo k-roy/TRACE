@@ -80,7 +80,8 @@ class Sample:
 
 def load_sample_key(
     path: Path,
-    validate: bool = True
+    validate: bool = True,
+    strict: bool = False
 ) -> List[Sample]:
     """
     Load samples from a sample key TSV file.
@@ -105,9 +106,14 @@ def load_sample_key(
     Args:
         path: Path to sample key TSV
         validate: If True, validate that files exist
+        strict: If True, raise exceptions for validation errors (missing files, etc.).
+                If False (default), log warnings and continue processing.
 
     Returns:
         List of Sample objects
+
+    Raises:
+        ValueError: If strict=True and validation errors are found
     """
     df = pd.read_csv(path, sep='\t')
 
@@ -159,11 +165,15 @@ def load_sample_key(
         samples.append(sample)
 
     if errors:
-        logger.warning(f"Sample key validation found {len(errors)} errors:")
-        for err in errors[:10]:
-            logger.warning(f"  {err}")
+        error_msg = f"Sample key validation found {len(errors)} errors:\n"
+        error_msg += "\n".join(f"  - {err}" for err in errors[:10])
         if len(errors) > 10:
-            logger.warning(f"  ... and {len(errors) - 10} more")
+            error_msg += f"\n  ... and {len(errors) - 10} more"
+
+        if strict:
+            raise ValueError(error_msg)
+        else:
+            logger.warning(error_msg)
 
     # Log if per-sample loci detected
     samples_with_custom_locus = sum(1 for s in samples if s.has_custom_locus())

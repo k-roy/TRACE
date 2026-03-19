@@ -272,6 +272,11 @@ def run_umi_dedup(
                 # Read R2 if available
                 if f2:
                     header2 = f2.readline().strip()
+                    if not header2:
+                        raise ValueError(
+                            f"R2 file ended before R1 at read {total_reads + 1}. "
+                            f"R1 and R2 files have mismatched read counts."
+                        )
                     seq2 = f2.readline().strip()
                     f2.readline()  # Skip '+' line
                     qual2 = f2.readline().strip()
@@ -291,20 +296,30 @@ def run_umi_dedup(
                 trimmed_seq2 = seq2[umi_length_r2:] if r2_path else ""
                 trimmed_qual2 = qual2[umi_length_r2:] if r2_path else ""
 
-                # Calculate quality score
-                qual_sum = sum(ord(c) - 33 for c in trimmed_qual1)
-                if r2_path:
-                    qual_sum += sum(ord(c) - 33 for c in trimmed_qual2)
+                # Calculate mean quality score per base (avoids bias toward longer reads)
+                total_qual = sum(ord(c) - 33 for c in trimmed_qual1)
+                total_bases = len(trimmed_qual1)
+                if r2_path and trimmed_qual2:
+                    total_qual += sum(ord(c) - 33 for c in trimmed_qual2)
+                    total_bases += len(trimmed_qual2)
+                mean_qual = total_qual / total_bases if total_bases > 0 else 0
 
-                # Keep best quality read for each UMI
-                if umi not in umi_best or qual_sum > umi_best[umi][1]:
+                # Keep best quality read for each UMI (using mean quality per base)
+                if umi not in umi_best or mean_qual > umi_best[umi][1]:
                     umi_best[umi] = (
                         (header1, trimmed_seq1, trimmed_qual1,
                          header2, trimmed_seq2, trimmed_qual2),
-                        qual_sum
+                        mean_qual
                     )
 
+            # Check if R2 has more reads than R1
             if f2:
+                extra_r2 = f2.readline().strip()
+                if extra_r2:
+                    raise ValueError(
+                        f"R2 file has more reads than R1. "
+                        f"R1 ended at read {total_reads}, but R2 has additional reads."
+                    )
                 f2.close()
 
         # Write deduplicated reads

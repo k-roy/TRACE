@@ -161,7 +161,8 @@ def get_insertions_from_cigar(
 
     for op in operations:
         if op.op_code == 1 and op.length >= min_size:  # I = insertion
-            # Check if insertion is within target region
+            # Check if insertion is within target region (inclusive bounds)
+            # Uses > for right boundary, so insertions AT region_end are included
             if target_region is not None:
                 region_start, region_end = target_region
                 if op.ref_start < region_start or op.ref_start > region_end:

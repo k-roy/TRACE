@@ -36,7 +36,15 @@ def needleman_wunsch(seq1: str, seq2: str, match=2, mismatch=-1, gap=-2) -> Tupl
 
     Returns:
         (aligned_seq1, aligned_seq2, score)
+
+    Raises:
+        ValueError: If either sequence is empty
     """
+    if not seq1 or not seq2:
+        raise ValueError(
+            f"Cannot align empty sequences. seq1 length={len(seq1) if seq1 else 0}, "
+            f"seq2 length={len(seq2) if seq2 else 0}"
+        )
     n, m = len(seq1), len(seq2)
 
     # Initialize scoring matrix
@@ -106,7 +114,15 @@ def smith_waterman(seq1: str, seq2: str, match=2, mismatch=-1, gap=-2) -> Tuple[
 
     Returns:
         (aligned_seq1, aligned_seq2, score, start_pos_in_seq1, start_pos_in_seq2)
+
+    Raises:
+        ValueError: If either sequence is empty
     """
+    if not seq1 or not seq2:
+        raise ValueError(
+            f"Cannot align empty sequences. seq1 length={len(seq1) if seq1 else 0}, "
+            f"seq2 length={len(seq2) if seq2 else 0}"
+        )
     n, m = len(seq1), len(seq2)
 
     # Initialize scoring matrix (local alignment allows 0)

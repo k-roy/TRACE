@@ -37,53 +37,97 @@ trace run \
 
 ### Editing Summary
 
-TRACE produces a per-sample summary table with editing outcomes:
+TRACE produces a comprehensive per-sample summary table with editing outcomes:
 
 ```
-sample          total_reads  HDR_%   NHEJ_%  WT_%   LgDel_%
-─────────────────────────────────────────────────────────────
-sample_01       125,432      45.2    12.3    38.1   4.4
-sample_02       98,765       52.1    8.7     35.8   3.4
-sample_03       112,890      48.9    15.2    31.2   4.7
+sample     total_reads  HDR_COMPLETE_%  HDR_PARTIAL_%  NHEJ_INDEL_%  MMEJ_INDEL_%  WT_%
+──────────────────────────────────────────────────────────────────────────────────────────
+sample_01  125,432      42.1            3.1            8.2           4.1           38.1
+sample_02  98,765       48.7            3.4            5.6           3.1           35.8
+sample_03  112,890      45.2            3.7            9.8           5.4           31.2
 ```
 
-**Classification categories:**
+### Classification Categories
+
+TRACE classifies reads into 12 comprehensive categories:
+
+**HDR Categories (successful donor integration):**
 | Outcome | Description |
 |---------|-------------|
-| `HDR_COMPLETE` | All donor SNVs integrated, no additional edits |
-| `HDR_PARTIAL` | Subset of donor SNVs, no additional edits |
-| `NHEJ` | Indels near cut site, no donor sequence |
-| `MIXED` | Both donor SNVs and non-donor edits |
-| `WT` | No edits detected |
-| `LARGE_DELETION` | Deletions spanning >50bp |
+| `HDR_COMPLETE` | All donor-encoded edits present, no other modifications |
+| `HDR_PARTIAL` | Subset of donor SNVs integrated, no other modifications |
+| `HDR_PLUS_NHEJ_INDEL` | Donor edits + classical NHEJ indel at cut site (0-2bp microhomology) |
+| `HDR_PLUS_MMEJ_INDEL` | Donor edits + MMEJ indel at cut site (>2bp microhomology) |
+| `HDR_PLUS_OTHER` | Donor edits + modifications NOT at cut site |
 
-### Conversion Tract Analysis
+**Non-HDR Repair Outcomes:**
+| Outcome | Description |
+|---------|-------------|
+| `DONOR_CAPTURE` | Donor edits present + extra donor sequence duplicated at site (over-integration) |
+| `NHEJ_INDEL` | Classical NHEJ indel at cut site (0-2bp microhomology at deletion boundaries) |
+| `MMEJ_INDEL` | Microhomology-mediated indel (>2bp microhomology at deletion boundaries) |
 
-For HDR samples, TRACE outputs per-SNV integration frequencies showing how donor sequence propagates from the cut site:
+**Other Outcomes:**
+| Outcome | Description |
+|---------|-------------|
+| `WT` | Wild-type / unedited |
+| `NON_DONOR_SNV` | SNVs not matching donor template, no indels |
+| `UNCLASSIFIED` | Does not fit other categories |
+| `UNMAPPED` | Read did not align to reference |
 
-```
-position  distance_to_cut  ref  donor  frequency  count
-────────────────────────────────────────────────────────
-125       -3               T    A      0.95       1,234
-127       -1               G    C      0.92       1,198
-130       +2               A    T      0.87       1,132
-135       +7               C    G      0.71       923
-142       +14              T    A      0.45       585
-```
+**Note:** `LARGE_DELETION` (≥50bp) is a flag applied to reads within the above categories, not a separate category.
 
-**Interpretation:** SNVs near the cut site show high integration (>90%), decreasing with distance. This reveals conversion tract length and strand bias in HDR repair.
+### NHEJ vs MMEJ Classification
+
+TRACE distinguishes between two types of error-prone repair based on deletion microhomology:
+
+- **NHEJ (Non-Homologous End Joining):** Deletions with 0-2bp of microhomology at the deletion boundaries. This is classical error-prone repair.
+- **MMEJ (Microhomology-Mediated End Joining):** Deletions with >2bp of microhomology. This alternative repair pathway uses short homologous sequences to rejoin the break.
+
+This distinction is biologically significant as MMEJ and NHEJ involve different repair proteins and have different mutational signatures.
+
+### Output Columns
+
+The main output file (`per_sample_editing_outcomes_all_methods.tsv`) contains:
+
+| Column | Description |
+|--------|-------------|
+| `sample` | Sample identifier |
+| `total_reads` | Total reads processed |
+| `aligned_reads` | Reads that aligned to reference |
+| `classifiable_reads` | Reads that could be classified |
+| `duplicate_rate` | Fraction of reads removed as duplicates |
+| `HDR_COMPLETE_%` | Percentage with complete HDR |
+| `HDR_PARTIAL_%` | Percentage with partial HDR |
+| `HDR_PLUS_NHEJ_%` | HDR + classical NHEJ indel |
+| `HDR_PLUS_MMEJ_%` | HDR + microhomology-mediated indel |
+| `HDR_PLUS_OTHER_%` | HDR + other modifications |
+| `HDR_total_%` | Sum of all HDR categories |
+| `DONOR_CAPTURE_%` | Donor over-integration |
+| `NHEJ_INDEL_%` | Classical NHEJ only |
+| `MMEJ_INDEL_%` | MMEJ only |
+| `NHEJ_MMEJ_total_%` | Combined NHEJ + MMEJ rate |
+| `WT_%` | Wild-type percentage |
+| `NON_DONOR_SNV_%` | Non-donor SNVs |
+| `UNCLASSIFIED_%` | Unclassified reads |
+| `Edited_total_%` | All edited reads (excludes WT) |
 
 ### Pooled Summary (Technical Replicates)
 
-For experiments with technical replicates, TRACE generates a pooled summary with weighted statistics:
+For experiments with technical replicates, use `trace aggregate` to generate pooled statistics:
 
 ```
-bio_sample  n_reps  HDR_pct_mean  HDR_pct_sem  NHEJ_pct_mean  total_reads_sum
-──────────────────────────────────────────────────────────────────────────────
-gene_A      3       45.2          1.3          12.1           356,087
-gene_B      3       52.8          0.9          8.4            312,456
-gene_C      3       38.1          2.1          18.7           298,234
+bio_sample  quality_flag  n_reps  hdr_total_pct_mean  hdr_total_pct_sem  nhej_mmej_total_pct_mean
+────────────────────────────────────────────────────────────────────────────────────────────────────
+gene_A      good          3       45.2                1.3                12.1
+gene_B      good          3       52.8                0.9                8.4
+gene_C      good          3       38.1                2.1                18.7
 ```
+
+The `quality_flag` column indicates:
+- `good`: All replicates passed QC
+- `one_low_read_removed`: One replicate had low reads and was excluded
+- `all_low_reads`: All replicates had low read counts (use with caution)
 
 ## How It Works
 
@@ -253,6 +297,36 @@ snakemake --configfile config.yaml --cores 24
 ```
 
 See [workflow/README.md](workflow/README.md) for details.
+
+## CLI Commands Reference
+
+TRACE provides the following commands:
+
+| Command | Description |
+|---------|-------------|
+| `trace run` | Main analysis pipeline for single or multiple samples |
+| `trace info` | Display locus configuration (reference, donor, guide alignment) |
+| `trace classify` | Re-classify reads from an existing BAM file |
+| `trace classify-batch` | Batch re-classification on multiple BAM files |
+| `trace multi-template` | Analyze samples with multiple possible HDR templates |
+| `trace aggregate` | Aggregate results across technical replicates |
+| `trace extract-kmers` | Extract k-mers for contamination filtering |
+| `trace generate-manifest` | Generate a sample manifest from a directory of FASTQs |
+| `trace generate-templates` | Generate multi-template reference from barcode list |
+| `trace init` | Create a template configuration file |
+
+Use `trace <command> --help` for detailed options.
+
+### Example: Aggregating Replicates
+
+```bash
+# After running trace on all samples
+trace aggregate \
+  --input results/per_sample_editing_outcomes_all_methods.tsv \
+  --sample-key samples.tsv \
+  --group-by condition \
+  --output results/aggregated_by_condition.tsv
+```
 
 ## Analysis Module
 

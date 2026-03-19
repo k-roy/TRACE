@@ -5,6 +5,43 @@ All notable changes to TRACE will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-03-18
+
+### Fixed
+
+- **Homology arm calculation**: Fixed off-by-one error in right homology arm length calculation. Now correctly accounts for multi-base edits (deletions, insertions) when determining the end of the edit region.
+
+- **UMI deduplication quality bias**: Changed from sum-based quality scoring to mean quality per base. Previously, longer reads were favored over shorter high-quality reads during UMI deduplication.
+
+- **R1/R2 read count validation**: Added explicit validation that paired-end FASTQ files have matching read counts. Mismatched files now raise a clear error instead of silently processing corrupted data.
+
+- **Batch processing silent failures**: Preprocessing failures are now explicitly logged with warnings, and affected samples are flagged with `preprocessing_failed=True` in the output. A summary of failed samples is logged at the end of batch processing.
+
+- **Malformed FASTQ handling**: Added validation for FASTQ format (4 lines per record, proper `+` separator). Malformed files now raise descriptive errors.
+
+- **Empty sequence validation**: Needleman-Wunsch and Smith-Waterman alignment functions now raise `ValueError` for empty input sequences instead of returning empty alignments.
+
+### Added
+
+- **FDR correction `use_total_tests` parameter**: Optional conservative FDR correction that uses total tests (including NaN) instead of only valid tests. Default behavior unchanged.
+
+- **`strict` mode for sample key loading**: New `strict=True` parameter in `load_sample_key()` raises exceptions for validation errors (missing files, etc.) instead of just logging warnings.
+
+- **Support for USEARCH/VSEARCH count format**: Pre-collapsed FASTQs with `;size=N` headers (USEARCH format) are now supported in addition to `;count=N` (TRACE format).
+
+- **`preprocessing_failed` and `preprocessing_error` fields**: `CollapsedSample` dataclass now tracks preprocessing failures for downstream QC.
+
+### Changed
+
+- **README overhaul**: Comprehensive documentation update reflecting all 12 classification categories, NHEJ/MMEJ distinction, output columns, and CLI commands. Removed outdated "MIXED" category documentation.
+
+### Documentation
+
+- Added complete classification category reference with biological descriptions
+- Documented NHEJ vs MMEJ microhomology-based classification
+- Added full output column reference table
+- Added CLI commands reference table
+
 ## [0.4.0] - 2026-02-20
 
 ### Added
