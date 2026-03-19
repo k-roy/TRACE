@@ -83,6 +83,8 @@ class CollapsedSample:
     sample_id: str
     sequences: Dict[str, int]  # sequence → count
     total_reads: int
+    preprocessing_failed: bool = False  # True if preprocessing failed and fallback was used
+    preprocessing_error: Optional[str] = None  # Error message if preprocessing failed
 
     @property
     def unique_sequences(self) -> int:
@@ -519,7 +521,12 @@ class BatchMultiTemplateProcessor:
                 )
 
             except Exception as e:
-                logger.error(f"{sample.sample_id}: Error during preprocessing: {e}")
+                error_msg = str(e)
+                logger.error(f"{sample.sample_id}: Error during preprocessing: {error_msg}")
+                logger.warning(
+                    f"{sample.sample_id}: Falling back to raw FASTQ reading "
+                    "(no UMI deduplication, no adapter trimming). Results may differ."
+                )
                 # Fallback to raw FASTQ reading
                 seq_counts, total_reads = self._collapse_fastq(sample.r1_path, max_reads)
                 filtered_counts = self._apply_sequence_filters(
@@ -529,7 +536,18 @@ class BatchMultiTemplateProcessor:
                     sample_id=sample.sample_id,
                     sequences=filtered_counts,
                     total_reads=total_reads,
+                    preprocessing_failed=True,
+                    preprocessing_error=error_msg,
                 ))
+
+        # Log summary of preprocessing failures
+        failed_samples = [s for s in collapsed if s.preprocessing_failed]
+        if failed_samples:
+            logger.warning(
+                f"Preprocessing failed for {len(failed_samples)}/{len(collapsed)} samples: "
+                f"{[s.sample_id for s in failed_samples]}. "
+                f"These samples used fallback raw FASTQ reading."
+            )
 
         return collapsed
 
@@ -552,20 +570,38 @@ class BatchMultiTemplateProcessor:
             Tuple of (sequence → count dict, total reads)
         """
         import re
-        count_pattern = re.compile(r';count=(\d+)')
+        # Support multiple count formats: ;count=N (TRACE), ;size=N (USEARCH/VSEARCH)
+        count_pattern = re.compile(r';(?:count|size)=(\d+)')
 
         seq_counts: Dict[str, int] = Counter()
         total_reads = 0
 
         opener = gzip.open if str(fastq_path).endswith('.gz') else open
+        record_num = 0
         with opener(fastq_path, 'rt') as f:
             while total_reads < max_reads:
                 header = f.readline()
                 if not header:
                     break
-                seq = f.readline().strip().upper()
-                f.readline()  # +
-                f.readline()  # quality
+                record_num += 1
+
+                # Validate FASTQ format: must have 4 lines per record
+                seq = f.readline()
+                plus_line = f.readline()
+                qual = f.readline()
+
+                if not seq or not plus_line or not qual:
+                    raise ValueError(
+                        f"Malformed FASTQ file '{fastq_path}': incomplete record at entry {record_num}. "
+                        f"FASTQ files must have 4 lines per read (header, sequence, +, quality)."
+                    )
+
+                seq = seq.strip().upper()
+                if not plus_line.strip().startswith('+'):
+                    raise ValueError(
+                        f"Malformed FASTQ file '{fastq_path}': record {record_num} has invalid "
+                        f"third line (expected '+', got '{plus_line.strip()[:20]}...')."
+                    )
 
                 # Check if header contains a count (from pre-collapsed FASTQ)
                 count_match = count_pattern.search(header)

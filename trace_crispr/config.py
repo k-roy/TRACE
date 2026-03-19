@@ -527,15 +527,25 @@ class LocusConfig:
             return
 
         first_edit = min(e.position for e in self.edits)
-        last_edit = max(e.position for e in self.edits)
+
+        # Calculate the exclusive end position of each edit in reference coordinates
+        # For deletions/substitutions: position + len(ref_bases)
+        # For insertions: position + 1 (insertions don't span reference positions)
+        def get_edit_end_exclusive(edit: EditInfo) -> int:
+            if edit.edit_type == 'insertion':
+                return edit.position + 1
+            else:  # deletion or substitution
+                return edit.position + len(edit.ref_bases)
+
+        last_edit_end = max(get_edit_end_exclusive(e) for e in self.edits)
 
         self.homology_arms = HomologyArms(
             left_start=template_start,
             left_end=first_edit,
             left_length=first_edit - template_start,
-            right_start=last_edit + 1,
+            right_start=last_edit_end,
             right_end=template_end,  # Use template end, not reference end
-            right_length=template_end - last_edit - 1,
+            right_length=template_end - last_edit_end,
         )
 
     def print_summary(self):

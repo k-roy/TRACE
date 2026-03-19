@@ -91,16 +91,27 @@ def p_value_to_stars(
     return "ns"
 
 
-def benjamini_hochberg(p_values: List[float], alpha: float = 0.05) -> List[float]:
+def benjamini_hochberg(
+    p_values: List[float],
+    alpha: float = 0.05,
+    use_total_tests: bool = False
+) -> List[float]:
     """
     Apply Benjamini-Hochberg FDR correction.
 
     Args:
-        p_values: List of p-values
-        alpha: FDR threshold (default: 0.05)
+        p_values: List of p-values (may contain NaN for invalid tests)
+        alpha: FDR threshold (default: 0.05, unused in calculation but kept for API)
+        use_total_tests: If True, use total number of tests (including NaN) for
+            correction, which is more conservative. If False (default), use only
+            the number of valid (non-NaN) p-values, which is standard BH.
 
     Returns:
-        List of adjusted p-values
+        List of adjusted p-values (NaN values remain NaN)
+
+    Note:
+        Standard BH uses m = number of valid tests. Setting use_total_tests=True
+        provides a more conservative correction when some tests failed/were filtered.
 
     Example:
         >>> p_adj = benjamini_hochberg([0.01, 0.04, 0.03, 0.5])
@@ -123,13 +134,15 @@ def benjamini_hochberg(p_values: List[float], alpha: float = 0.05) -> List[float
     sorted_p = valid_p[sorted_indices]
 
     # Calculate BH adjusted p-values
-    # p_adj[i] = min(p[i] * n / rank[i], p_adj[i+1])
+    # p_adj[i] = min(p[i] * m / rank[i], p_adj[i+1])
+    # where m is the number of tests (n_valid by default, or n if use_total_tests=True)
+    m = n if use_total_tests else n_valid
     adjusted = np.zeros(n_valid)
     adjusted[-1] = sorted_p[-1]
 
     for i in range(n_valid - 2, -1, -1):
         rank = i + 1
-        adjusted[i] = min(sorted_p[i] * n_valid / rank, adjusted[i + 1])
+        adjusted[i] = min(sorted_p[i] * m / rank, adjusted[i + 1])
 
     # Cap at 1.0
     adjusted = np.minimum(adjusted, 1.0)
