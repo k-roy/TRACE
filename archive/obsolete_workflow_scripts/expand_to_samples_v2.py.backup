@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""
+Expand Level 2 classifications to per-sample results.
+
+Looks up each sample's sequences in the merged classification cache,
+filtering by the sample's specific (guide, donor) combination.
+"""
+
+from pathlib import Path
+from collections import defaultdict
+
+import pandas as pd
+
+
+def main():
+    classifications_path = snakemake.input.classifications
+    collapsed_path = snakemake.input.collapsed
+    output_classification = snakemake.output.classification
+    output_hdr_detail = snakemake.output.hdr_detail
+    log_path = Path(str(snakemake.log))
+
+    sample_id = snakemake.params.sample_id
+    sample_guide = snakemake.params.guide if snakemake.params.guide else ""
+    sample_donor = snakemake.params.donor if snakemake.params.donor else ""
+
+    # Clean up nan values
+    if sample_guide == "nan":
+        sample_guide = ""
+    if sample_donor == "nan":
+        sample_donor = ""
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    Path(output_classification).parent.mkdir(parents=True, exist_ok=True)
+
+    # Load Level 2 classifications
+    cache_df = pd.read_csv(classifications_path, sep='\t', compression='gzip')
+    cache_df['guide'] = cache_df['guide'].fillna('')
+    cache_df['donor'] = cache_df['donor'].fillna('')
+
+    # Filter to this sample's (guide, donor) combination
+    sample_cache = cache_df[
+        (cache_df['guide'] == sample_guide) &
+        (cache_df['donor'] == sample_donor)
+    ]
+    cache_lookup = {row['seq_hash']: row for _, row in sample_cache.iterrows()}
+
+    # Load sample's collapsed sequences
+    sample_df = pd.read_csv(collapsed_path, sep='\t', compression='gzip')
+
+    # Expand to per-sample results
+    results = []
+    per_snv_counts = defaultdict(int)
+    total_hdr_reads = 0
+    found = 0
+    not_found = 0
+
+    for _, row in sample_df.iterrows():
+        seq_hash = row['seq_hash']
+        count = row['count']
+
+        if seq_hash not in cache_lookup:
+            not_found += 1
+            results.append({
+                'read_name': f"{seq_hash}_x{count}",
+                'outcome': 'NOT_IN_CACHE',
+                'n_donor_snvs': 0,
+                'n_non_donor': 0,
+                'donor_fraction': 0.0,
+                'donor_snvs_detected': '',
+                'count': count
+            })
+            continue
+
+        found += 1
+        cached = cache_lookup[seq_hash]
+
+        results.append({
+            'read_name': f"{seq_hash}_x{count}",
+            'outcome': cached['outcome'],
+            'n_donor_snvs': cached['n_donor_snvs'],
+            'n_non_donor': cached['n_non_donor'],
+            'donor_fraction': cached['donor_fraction'],
+            'donor_snvs_detected': cached['donor_snvs_detected'] if pd.notna(cached['donor_snvs_detected']) else '',
+            'count': count
+        })
+
+        # Track per-SNV integration for HDR reads
+        if cached['outcome'] in ['HDR_COMPLETE', 'HDR_PARTIAL', 'MIXED']:
+            total_hdr_reads += count
+            snvs = cached['donor_snvs_detected']
+            if pd.notna(snvs) and snvs:
+                for pos in str(snvs).split(','):
+                    if pos:
+                        per_snv_counts[int(pos)] += count
+
+    # Save classification results
+    results_df = pd.DataFrame(results)
+    results_df.to_csv(output_classification, sep='\t', index=False)
+
+    # Save HDR detail (per-SNV frequencies)
+    hdr_detail_rows = []
+    for pos, count in sorted(per_snv_counts.items()):
+        freq = count / total_hdr_reads if total_hdr_reads > 0 else 0
+        hdr_detail_rows.append({
+            'position': pos,
+            'count': count,
+            'frequency': freq
+        })
+
+    hdr_detail_df = pd.DataFrame(hdr_detail_rows)
+    hdr_detail_df.to_csv(output_hdr_detail, sep='\t', index=False)
+
+    # Calculate summary statistics
+    total_reads = results_df['count'].sum()
+
+    outcome_counts = {}
+    for outcome in results_df['outcome'].unique():
+        mask = results_df['outcome'] == outcome
+        outcome_counts[outcome] = results_df.loc[mask, 'count'].sum()
+
+    # Write log
+    log_msg = (
+        f"Expanded classifications for {sample_id}:\n"
+        f"  Guide: {sample_guide[:30]}...\n"
+        f"  Donor: {sample_donor[:30]}...\n"
+        f"  \n"
+        f"  Unique sequences: {len(sample_df)}\n"
+        f"  Found in cache: {found}\n"
+        f"  Not in cache: {not_found}\n"
+        f"  Total reads: {total_reads}\n"
+        f"  \n"
+        f"Outcome distribution:\n"
+    )
+
+    for outcome, count in sorted(outcome_counts.items(), key=lambda x: -x[1]):
+        pct = 100 * count / total_reads if total_reads > 0 else 0
+        log_msg += f"  {outcome}: {count} ({pct:.1f}%)\n"
+
+    log_path.write_text(log_msg)
+
+
+if __name__ == '__main__':
+    main()

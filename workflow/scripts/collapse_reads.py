@@ -138,8 +138,11 @@ def main():
         config = {}
 
     # Check library type - Tn5 libraries don't have UMIs
-    library_type = config.get('library_type', 'TruSeq')
-    is_tn5 = library_type == 'Tn5'
+    # Per-sample detection: if sample_id contains "Tn5", treat as Tn5 library
+    # This handles mixed manifests with both TruSeq and Tn5 samples
+    global_library_type = config.get('library_type', 'TruSeq')
+    is_tn5 = 'Tn5' in sample_id or 'tn5' in sample_id.lower()
+    library_type = 'Tn5' if is_tn5 else global_library_type
 
     # Detect primer pair and get trim parameters
     primer_pair = detect_primer_pair(sample_id, config)
