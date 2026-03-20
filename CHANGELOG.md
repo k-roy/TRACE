@@ -5,6 +5,14 @@ All notable changes to TRACE will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.2] - 2026-03-20
+
+### Fixed
+
+- **Insertion-based HDR detection**: Fixed fragmented insertion detection caused by Smith-Waterman alignment. Added `consolidate_donor_insertions()` function that merges fragmented insertions within 10bp of each other. This resolves issues where insertion-based edits (like EMX1 10bp insertion) were split into multiple smaller insertions and not properly detected as HDR.
+
+- **Flexible insertion matching**: Updated insertion matching logic to use position tolerance (±5bp) and substring matching. Read insertions that are subsets of expected insertions (or vice versa) are now correctly classified as donor-encoded.
+
 ## [0.6.1] - 2026-03-18
 
 ### Fixed

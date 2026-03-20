@@ -314,11 +314,95 @@ def align_donor_to_reference(
     return DonorSignature(snvs=snvs, insertions=insertions, deletions=deletions)
 
 
+def consolidate_donor_insertions(
+    signature: 'DonorSignature',
+    ref_seq: str,
+    max_gap: int = 10
+) -> 'DonorSignature':
+    """
+    Consolidate fragmented insertions into a single insertion.
+
+    Smith-Waterman alignment sometimes produces fragmented insertions when there
+    are incidental matches within a biological insertion. For example, a 10bp
+    insertion like 'CGTTTCAGCT' might be split into multiple smaller insertions
+    if some bases match the reference.
+
+    This function merges insertions that are within max_gap bases of each other,
+    capturing any reference bases between them as part of the consolidated insertion.
+
+    Args:
+        signature: DonorSignature from align_donor_to_reference
+        ref_seq: Reference sequence (needed to fill gaps)
+        max_gap: Maximum gap between insertions to merge (default 10)
+
+    Returns:
+        DonorSignature with consolidated insertions
+    """
+    if len(signature.insertions) <= 1:
+        return signature
+
+    # Sort insertions by position
+    sorted_positions = sorted(signature.insertions.keys())
+
+    # Find clusters of insertions to merge
+    clusters = []
+    current_cluster = [sorted_positions[0]]
+
+    for pos in sorted_positions[1:]:
+        prev_pos = current_cluster[-1]
+        # Calculate gap (accounting for the inserted sequence length doesn't matter
+        # since insertions don't consume reference positions)
+        gap = pos - prev_pos
+
+        if gap <= max_gap:
+            current_cluster.append(pos)
+        else:
+            clusters.append(current_cluster)
+            current_cluster = [pos]
+    clusters.append(current_cluster)
+
+    # Build new insertions dict
+    new_insertions = {}
+    ref_upper = ref_seq.upper()
+
+    for cluster in clusters:
+        if len(cluster) == 1:
+            # No merging needed
+            pos = cluster[0]
+            new_insertions[pos] = signature.insertions[pos]
+        else:
+            # Merge insertions in this cluster
+            # The merged insertion starts at the first position
+            start_pos = cluster[0]
+            end_pos = cluster[-1]
+
+            # Build merged sequence: insertion + ref_bases + insertion + ref_bases + ...
+            merged_seq = ""
+            for i, pos in enumerate(cluster):
+                merged_seq += signature.insertions[pos]
+                # Add reference bases between this and next insertion
+                if i < len(cluster) - 1:
+                    next_pos = cluster[i + 1]
+                    # Reference bases between pos and next_pos
+                    if pos < len(ref_upper) and next_pos <= len(ref_upper):
+                        merged_seq += ref_upper[pos:next_pos]
+
+            new_insertions[start_pos] = merged_seq
+            logger.info(f"Consolidated {len(cluster)} insertions at positions {cluster} into single {len(merged_seq)}bp insertion at position {start_pos}")
+
+    return DonorSignature(
+        snvs=signature.snvs,
+        insertions=new_insertions,
+        deletions=signature.deletions
+    )
+
+
 def build_donor_signature(
     ref_seq: str,
     donor_seq: str,
     cut_site: int,
-    edit_region: Optional[Tuple[int, int]] = None
+    edit_region: Optional[Tuple[int, int]] = None,
+    consolidate_insertions: bool = True
 ) -> DonorSignature:
     """
     Build a signature of donor-encoded edits (SNVs and indels).
@@ -328,11 +412,16 @@ def build_donor_signature(
         donor_seq: Donor template sequence
         cut_site: Position of cut site
         edit_region: Optional (start, end) to limit to specific region
+        consolidate_insertions: If True, merge fragmented insertions (default True)
 
     Returns:
         DonorSignature containing SNVs, insertions, and deletions
     """
     signature = align_donor_to_reference(ref_seq, donor_seq)
+
+    # Consolidate fragmented insertions (important for insertion-based edits)
+    if consolidate_insertions and len(signature.insertions) > 1:
+        signature = consolidate_donor_insertions(signature, ref_seq)
 
     # Filter to edit region if specified
     if edit_region:
@@ -715,11 +804,43 @@ def classify_read_edit_distance(
 
                 if not skip_homopolymer:
                     # Check if insertion matches donor
+                    # Use flexible matching: position within window AND sequence overlap
                     is_donor_ins = False
-                    if ref_pos in donor_signature.insertions:
-                        expected_ins = donor_signature.insertions[ref_pos]
-                        if inserted_seq == expected_ins:
-                            is_donor_ins = True
+                    position_tolerance = 5  # Allow insertions within ±5bp of expected
+
+                    for expected_pos, expected_ins in donor_signature.insertions.items():
+                        # Check if position is close
+                        if abs(ref_pos - expected_pos) <= position_tolerance:
+                            # Check for sequence match (exact, substring, or high overlap)
+                            if inserted_seq == expected_ins:
+                                # Exact match
+                                is_donor_ins = True
+                                break
+                            elif inserted_seq in expected_ins:
+                                # Read insertion is subset of expected (partial HDR)
+                                is_donor_ins = True
+                                break
+                            elif expected_ins in inserted_seq:
+                                # Read insertion contains expected (HDR with extra bases)
+                                is_donor_ins = True
+                                break
+                            else:
+                                # Check overlap for long insertions (>5bp)
+                                if len(inserted_seq) >= 5 and len(expected_ins) >= 5:
+                                    # Check if core sequence matches
+                                    min_overlap = min(len(inserted_seq), len(expected_ins)) // 2
+                                    for offset in range(-3, 4):
+                                        if offset >= 0:
+                                            ins_slice = inserted_seq[offset:]
+                                            exp_slice = expected_ins[:len(ins_slice)]
+                                        else:
+                                            ins_slice = inserted_seq[:len(expected_ins)+offset]
+                                            exp_slice = expected_ins[-offset:]
+                                        if len(ins_slice) >= min_overlap and ins_slice == exp_slice:
+                                            is_donor_ins = True
+                                            break
+                                    if is_donor_ins:
+                                        break
 
                     edits.append(DetectedEdit(
                         edit_type=EditType.INSERTION,
