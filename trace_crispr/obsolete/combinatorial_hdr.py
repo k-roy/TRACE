@@ -12,11 +12,11 @@ This enables detection of:
 Author: Kevin R. Roy
 """
 
+import logging
 from dataclasses import dataclass, field
 from itertools import combinations
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
-import logging
+from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 

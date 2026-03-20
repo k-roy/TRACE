@@ -407,10 +407,10 @@ def classify(bam, reference, hdr_template, guide, output, nuclease, per_read):
     # Summarize
     summary = summarize_classifications(classifications)
 
-    click.echo(f"\n--- Classification Summary ---")
+    click.echo("\n--- Classification Summary ---")
     click.echo(f"Total aligned reads: {aligned_reads}")
     click.echo(f"Unmapped reads: {unmapped_reads}")
-    click.echo(f"\n--- Outcome Breakdown ---")
+    click.echo("\n--- Outcome Breakdown ---")
 
     # Print each category
     for outcome in EditingOutcome:
@@ -420,7 +420,7 @@ def classify(bam, reference, hdr_template, guide, output, nuclease, per_read):
             click.echo(f"  {outcome.value}: {count} ({rate:.2f}%)")
 
     # Print aggregated metrics
-    click.echo(f"\n--- Aggregated Metrics ---")
+    click.echo("\n--- Aggregated Metrics ---")
     click.echo(f"  HDR total: {summary.get('hdr_total_count', 0)} ({summary.get('hdr_total_rate', 0)*100:.2f}%)")
     click.echo(f"  NHEJ/MMEJ total: {summary.get('nhej_mmej_total_count', 0)} ({summary.get('nhej_mmej_total_rate', 0)*100:.2f}%)")
     click.echo(f"  Edited total: {summary.get('edited_total_count', 0)} ({summary.get('edited_total_rate', 0)*100:.2f}%)")
@@ -494,17 +494,15 @@ def classify_batch(bam_dir, sample_key, reference, hdr_template, guide, output,
         -o reclassified_results/
     """
     import logging
-    from concurrent.futures import ProcessPoolExecutor, as_completed
 
     import pysam
 
     from .core.classification import (
-        EditingOutcome,
         classify_read,
         get_hdr_signature_positions,
         summarize_classifications,
     )
-    from .io.output import SampleResult, write_results_tsv, generate_summary_report
+    from .io.output import SampleResult, generate_summary_report, write_results_tsv
     from .io.sample_key import load_sample_key
 
     logging.basicConfig(
@@ -641,7 +639,7 @@ def classify_batch(bam_dir, sample_key, reference, hdr_template, guide, output,
     summary_file = output_path / "summary_report.md"
     generate_summary_report(results, summary_file)
 
-    click.echo(f"\nReclassification complete!")
+    click.echo("\nReclassification complete!")
     click.echo(f"Processed {len(results)} samples")
     click.echo(f"Results written to: {output_file}")
 
@@ -681,6 +679,7 @@ def aggregate(input_file, output, bio_sample_col, min_reads, include_crispresso,
         --min-reads 1000
     """
     import logging
+
     import pandas as pd
 
     from .analysis.aggregation import (
@@ -715,7 +714,7 @@ def aggregate(input_file, output, bio_sample_col, min_reads, include_crispresso,
         metadata_list = [c.strip() for c in metadata_cols.split(',')]
 
     # Generate unified comparison table
-    click.echo(f"Generating unified comparison table...")
+    click.echo("Generating unified comparison table...")
     click.echo(f"  Grouping by: {bio_sample_col}")
     click.echo(f"  Min reads threshold: {min_reads}")
 
@@ -741,7 +740,7 @@ def aggregate(input_file, output, bio_sample_col, min_reads, include_crispresso,
     n_low_reads = (unified_df['quality_flag'] == 'all_low_reads').sum()
     n_partial = (unified_df['quality_flag'] == 'one_low_read_removed').sum()
 
-    click.echo(f"\n--- Summary ---")
+    click.echo("\n--- Summary ---")
     click.echo(f"Biological samples: {n_bio_samples}")
     click.echo(f"  Good (all replicates >= {min_reads} reads): {n_good}")
     click.echo(f"  All low reads: {n_low_reads}")

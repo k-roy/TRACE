@@ -374,7 +374,7 @@ def consolidate_donor_insertions(
             # Merge insertions in this cluster
             # The merged insertion starts at the first position
             start_pos = cluster[0]
-            end_pos = cluster[-1]
+            _end_pos = cluster[-1]  # noqa: F841 - kept for clarity
 
             # Build merged sequence: insertion + ref_bases + insertion + ref_bases + ...
             merged_seq = ""
