@@ -16,8 +16,8 @@ from .sample_key import (
     load_sample_key,
 )
 from .sqlite_cache import (
-    SequenceCache,
     AlignmentCache,
+    SequenceCache,
 )
 
 __all__ = [

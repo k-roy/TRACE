@@ -15,12 +15,10 @@ Key advantages:
 Author: Kevin R. Roy
 """
 
-import gzip
 import hashlib
 import sqlite3
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Dict, List, Optional, Tuple, Any
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 
 class SequenceCache:

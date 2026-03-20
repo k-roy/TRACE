@@ -338,7 +338,7 @@ def run_crispresso_batch(
     logger.info(f"Running CRISPRessoBatch on {len(samples)} samples with {threads} threads...")
 
     try:
-        result = subprocess.run(
+        subprocess.run(
             cmd,
             capture_output=True,
             check=True,
@@ -376,8 +376,8 @@ def _write_batch_settings(
     """
     # Determine which columns we need
     has_r2 = any(sample.get('r2_path') for sample in samples)
-    has_per_sample_amplicon = any(sample.get('amplicon_seq') for sample in samples)
-    has_per_sample_guide = any(sample.get('guide_seq') for sample in samples)
+    _has_per_sample_amplicon = any(sample.get('amplicon_seq') for sample in samples)  # noqa: F841
+    _has_per_sample_guide = any(sample.get('guide_seq') for sample in samples)  # noqa: F841
     has_per_sample_hdr = any(sample.get('hdr_seq') for sample in samples)
 
     # Build header
