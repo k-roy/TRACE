@@ -24,6 +24,7 @@ from .cigar import (
     get_deletions_from_cigar,
     get_insertions_from_cigar,
 )
+from .edit_distance_hdr import build_donor_signature
 
 
 class EditingOutcome(Enum):
@@ -309,6 +310,7 @@ def detect_donor_capture(
     read: pysam.AlignedSegment,
     donor_seq: str,
     cut_site: int,
+    ref_seq: str = "",
     min_match_length: int = 30,
     window: int = 100
 ) -> Tuple[bool, Dict]:
@@ -316,12 +318,18 @@ def detect_donor_capture(
     Detect donor capture: extra donor sequence duplicated at target site.
 
     Donor capture occurs when HDR happens but additional donor sequence
-    is inserted beyond the intended edits.
+    is inserted beyond the intended edits. This is DISTINCT from designed
+    insertion-based HDR edits.
+
+    IMPORTANT: This function distinguishes between:
+    - Expected HDR insertions (part of the designed edit) -> NOT donor capture
+    - Extra donor sequence beyond the design -> TRUE donor capture
 
     Args:
         read: pysam AlignedSegment object
         donor_seq: Full donor template sequence
         cut_site: Position of CRISPR cut site
+        ref_seq: Reference sequence (needed to identify expected HDR insertions)
         min_match_length: Minimum length of donor match to call capture
         window: Window around cut site to search
 
@@ -340,18 +348,46 @@ def detect_donor_capture(
 
     donor_upper = donor_seq.upper()
 
+    # Build expected donor signature to identify designed HDR insertions
+    expected_insertions = {}
+    if ref_seq:
+        try:
+            donor_signature = build_donor_signature(ref_seq, donor_seq, cut_site)
+            expected_insertions = donor_signature.insertions
+        except Exception:
+            # If signature building fails, fall back to original behavior
+            pass
+
     for ins in insertions:
         ins_seq = ins.inserted_seq.upper()
         if len(ins_seq) < min_match_length:
             continue
 
-        # Check if insertion matches donor sequence
+        # Check if this insertion is an EXPECTED HDR insertion (not donor capture)
+        if expected_insertions:
+            is_expected_hdr = False
+            for expected_pos, expected_seq in expected_insertions.items():
+                expected_seq_upper = expected_seq.upper()
+                # Check if position is close (within 10bp) and sequence matches
+                # Use flexible matching: either contains or is contained
+                if abs(ins.ref_position - expected_pos) <= 10:
+                    if (expected_seq_upper in ins_seq or
+                        ins_seq in expected_seq_upper or
+                        _sequences_overlap(ins_seq, expected_seq_upper, min_overlap=10)):
+                        is_expected_hdr = True
+                        break
+            if is_expected_hdr:
+                # This is the designed HDR insertion, not donor capture
+                continue
+
+        # Check if insertion matches donor sequence (but is NOT expected HDR)
         if ins_seq in donor_upper:
             return True, {
                 'insertion_position': ins.ref_position,
                 'insertion_size': ins.size,
                 'insertion_seq': ins.inserted_seq,
-                'donor_match': True
+                'donor_match': True,
+                'is_extra_donor': True  # Flag that this is extra, not designed
             }
 
         # Also check reverse complement for antisense donors
@@ -362,10 +398,22 @@ def detect_donor_capture(
                 'insertion_size': ins.size,
                 'insertion_seq': ins.inserted_seq,
                 'donor_match': True,
-                'antisense': True
+                'antisense': True,
+                'is_extra_donor': True
             }
 
     return False, {}
+
+
+def _sequences_overlap(seq1: str, seq2: str, min_overlap: int = 10) -> bool:
+    """Check if two sequences have significant overlap."""
+    if len(seq1) < min_overlap or len(seq2) < min_overlap:
+        return False
+    # Check if suffix of seq1 matches prefix of seq2 or vice versa
+    for i in range(min_overlap, min(len(seq1), len(seq2)) + 1):
+        if seq1[-i:] == seq2[:i] or seq2[-i:] == seq1[:i]:
+            return True
+    return False
 
 
 def _reverse_complement(seq: str) -> str:
@@ -556,12 +604,12 @@ def classify_read(
         indel_mechanism = 'nhej'
         details['indel_mechanism'] = 'nhej'
 
-    # Check for donor capture (HDR + extra donor sequence)
+    # Check for donor capture (HDR + extra donor sequence beyond designed edit)
     is_donor_capture = False
     donor_capture_details = {}
     if has_any_hdr_edits and donor_seq:
         is_donor_capture, donor_capture_details = detect_donor_capture(
-            read, donor_seq, cut_site
+            read, donor_seq, cut_site, ref_seq=ref_seq
         )
         if is_donor_capture:
             details['donor_capture'] = donor_capture_details
