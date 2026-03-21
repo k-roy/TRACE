@@ -5,6 +5,16 @@ All notable changes to TRACE will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.3] - 2026-03-20
+
+### Fixed
+
+- **DONOR_CAPTURE misclassification bug**: Fixed critical bug where designed insertion-based HDR edits were incorrectly classified as DONOR_CAPTURE. The `detect_donor_capture()` function now builds the expected donor signature and distinguishes between:
+  - Expected HDR insertions (part of the designed edit) -> classified as HDR
+  - Extra donor sequence beyond the design -> classified as DONOR_CAPTURE
+
+  This fix is essential for datasets with insertion-based HDR edits (e.g., EMX1 retron editing). Previously, reads with the correct designed insertion were being flagged as donor capture instead of HDR, leading to artificially low HDR rates and inflated donor capture rates.
+
 ## [0.6.2] - 2026-03-20
 
 ### Fixed
