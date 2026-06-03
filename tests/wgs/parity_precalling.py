@@ -1,15 +1,24 @@
 #!/usr/bin/env python
 """
-Parity harness: trace_crispr.wgs.donor_outcome vs Shengdi's reference output.
+Parity harness: trace_crispr.wgs.donor_outcome vs a reference precalling output.
 
-Runs the Python pre-caller over a subset (or all) of the samples in Shengdi's
-samplesheet and compares, field-for-field, against his reference
-`on_target_precalling.txt`. Reports any mismatches with full detail.
+Runs the Python pre-caller over a subset (or all) of the samples in a samplesheet
+and compares, field-for-field, against a reference `on_target_precalling.txt`
+(produced by the original Perl ``precalling_target_outcome.pl``). Reports any
+mismatches with full detail. Intended as a manual integration test, pointed at
+your own WGS reference data via CLI args (it needs the per-sample VCF/gVCF + the
+genome FASTA + the reference summary, none of which ship with the package).
 
 Usage:
-    python parity_check.py [N]        # N samples (default 150; 0 = all)
+    python parity_precalling.py \\
+        --samplesheet sample_BC_variant.tsv \\
+        --workdir results_dir \\            # contains vcf/{s}.fil.vcf + gvcf/{s}.g.vcf
+        --genome combined_reference.fa \\
+        --refout on_target_precalling.txt \\
+        [-n 150]                            # samples to check (0 = all)
 """
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -18,14 +27,6 @@ from trace_crispr.wgs.donor_outcome import (
     precall_sample,
     read_samplesheet,
 )
-
-SH = Path("/path/to/projects")
-OM = SH / "WGS_MAGESTIC_QTL_outcome_mapping"
-BC = SH / "WGS_MAGESTIC_QTL_bc_calling"
-SAMPLESHEET = OM / "inputs" / "sample_BC_variant_fil.nns.v20250620.v2.txt"
-WORKDIR = BC / "output3"
-GENOME = OM / "inputs" / "fasta" / "combined_reference.v2.fa"
-REFOUT = BC / "output3" / "summaries" / "on_target_precalling.txt"
 
 
 def load_reference(path):
@@ -42,18 +43,33 @@ def load_reference(path):
 
 
 def main():
-    n = int(sys.argv[1]) if len(sys.argv) > 1 else 150
-    ref = load_reference(REFOUT)
-    refs_fasta = load_fasta(str(GENOME))
-    specs = read_samplesheet(SAMPLESHEET)
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    p.add_argument("--samplesheet", required=True, type=Path,
+                   help="TSV with sample/chrom/donor_start_coord/donor_end_coord/"
+                        "wt_seq/design_donor/synthetic_donor columns")
+    p.add_argument("--workdir", required=True, type=Path,
+                   help="dir containing vcf/{sample}.fil.vcf and gvcf/{sample}.g.vcf")
+    p.add_argument("--genome", required=True, type=Path, help="reference genome FASTA")
+    p.add_argument("--refout", required=True, type=Path,
+                   help="reference on_target_precalling.txt to compare against")
+    p.add_argument("-n", "--num-samples", type=int, default=150,
+                   help="number of samples to check (0 = all; default 150)")
+    args = p.parse_args()
+
+    n = args.num_samples
+    ref = load_reference(args.refout)
+    refs_fasta = load_fasta(str(args.genome))
+    specs = read_samplesheet(args.samplesheet)
 
     checked = mism = missing = 0
     mismatches = []
     for spec in specs:
         if spec.sample not in ref:
             continue
-        vcf = WORKDIR / "vcf" / f"{spec.sample}.fil.vcf"
-        gvcf = WORKDIR / "gvcf" / f"{spec.sample}.g.vcf"
+        vcf = args.workdir / "vcf" / f"{spec.sample}.fil.vcf"
+        gvcf = args.workdir / "gvcf" / f"{spec.sample}.g.vcf"
         if not vcf.exists() or not gvcf.exists():
             missing += 1
             continue
@@ -85,13 +101,13 @@ def main():
         if n and checked >= n:
             break
 
-    print(
-        f"checked={checked}  matched={checked - mism}  mismatched={mism}  missing_inputs={missing}"
-    )
+    print(f"checked={checked}  matched={checked - mism}  mismatched={mism}  "
+          f"missing_inputs={missing}")
     for sample, kind, detail in mismatches:
         print(f"\n[{kind}] {sample}\n{detail}")
     print(
-        f"\nPARITY: {'PASS' if mism == 0 and checked > 0 else 'FAIL'} ({checked - mism}/{checked})"
+        f"\nPARITY: {'PASS' if mism == 0 and checked > 0 else 'FAIL'} "
+        f"({checked - mism}/{checked})"
     )
     return 1 if mism else 0
 
