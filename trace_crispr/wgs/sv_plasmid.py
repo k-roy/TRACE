@@ -68,7 +68,7 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, TypedDict, Union
 
 from ..core.cigar import get_deletions_from_cigar
 
@@ -394,19 +394,29 @@ def classify_donor_reads(
 
 
 def _iter_sam(bam_path: str, samtools: str = "samtools") -> Iterator[str]:
-    """Yield SAM lines (incl. ``@`` header) from ``samtools view -h <bam>``."""
+    """Yield SAM lines (incl. ``@`` header) from ``samtools view -h <bam>``.
+
+    Raises :class:`subprocess.CalledProcessError` if ``samtools`` exits non-zero
+    (e.g. a truncated or unreadable BAM), so callers never silently process a
+    partial SAM stream and emit wrong counts. The exit code is only checked on
+    normal exhaustion of the generator; a consumer that stops early triggers
+    ``GeneratorExit`` and skips the check (no spurious error on a broken pipe).
+    """
     proc = subprocess.Popen(
         [samtools, "view", "-h", bam_path],
         stdout=subprocess.PIPE,
         text=True,
     )
-    assert proc.stdout is not None
+    if proc.stdout is None:  # pragma: no cover - PIPE always provides a stdout
+        raise RuntimeError("failed to capture samtools stdout")
     try:
         for line in proc.stdout:
             yield line
     finally:
         proc.stdout.close()
-        proc.wait()
+        rc = proc.wait()
+    if rc:
+        raise subprocess.CalledProcessError(rc, proc.args)
 
 
 def write_anno(result: CleanResult, path: str) -> None:
@@ -465,7 +475,8 @@ def clean_donor_reads(
                 # else: unknown / unresolved → drop
             else:
                 out.write(ln)
-    subprocess.run(f"{samtools} view -bS {tmp_sam} > {out_bam}", shell=True, check=True)
+    with open(out_bam, "wb") as out_fh:
+        subprocess.run([samtools, "view", "-bS", tmp_sam], stdout=out_fh, check=True)
     os.remove(tmp_sam)
     return result
 
@@ -482,7 +493,7 @@ def _integrated_contigs(references: Sequence[str]) -> List[str]:
 def detect_plasmid_integration(
     bam_path: str,
     integrated_contigs: Optional[Sequence[str]] = None,
-    junction_distance: int = 1129,
+    junction_distance: Union[int, Dict[str, int]] = 1129,
     window: int = 200,
 ) -> Dict[str, int]:
     """Count primary reads spanning the genome↔integration junctions of a sample.
@@ -537,25 +548,33 @@ def detect_plasmid_integration(
         bam.close()
 
 
+class PlasmidIntegrationRow(TypedDict):
+    """One row of the plasmid-integration summary (the ``plasmid_integration_summary.tsv`` schema)."""
+
+    sample_name: str
+    upstream_count: int
+    downstream_count: int
+    total_count: int
+
+
 def summarize_plasmid_integration(
     sample_bams: Dict[str, str],
     integrated_contigs: Optional[Sequence[str]] = None,
-    junction_distance: int = 1129,
+    junction_distance: Union[int, Dict[str, int]] = 1129,
     window: int = 200,
-) -> List[Dict[str, int]]:
+) -> List[PlasmidIntegrationRow]:
     """Run :func:`detect_plasmid_integration` over ``{sample_name: bam_path}``.
 
-    Returns one record per sample (``sample_name``, ``upstream_count``,
-    ``downstream_count``, ``total_count``) sorted by ``total_count`` descending —
-    the row schema of Kevin's ``plasmid_integration_summary.tsv``.
+    Returns one :class:`PlasmidIntegrationRow` per sample, sorted by ``total_count``
+    descending — the row schema of Kevin's ``plasmid_integration_summary.tsv``.
     """
-    rows: List[Dict[str, int]] = []
+    rows: List[PlasmidIntegrationRow] = []
     for sample, bam_path in sample_bams.items():
         counts = detect_plasmid_integration(bam_path, integrated_contigs, junction_distance, window)
         total = counts["upstream_count"] + counts["downstream_count"]
         rows.append(
             {
-                "sample_name": sample,  # type: ignore[dict-item]
+                "sample_name": sample,
                 "upstream_count": counts["upstream_count"],
                 "downstream_count": counts["downstream_count"],
                 "total_count": total,

@@ -365,3 +365,26 @@ def test_build_integrated_plasmid_contig_minus_strand_revcomps_segment():
 def test_integrated_plasmid_junction():
     # bp_to_extend 1000 + 129 bp donor == 1129 (the parity literal)
     assert integrated_plasmid_junction("N" * 129, bp_to_extend=1000) == 1129
+
+
+# --------------------------------------------------------------------------- #
+# _iter_sam — fail loud on samtools failure (don't process a partial stream)   #
+# --------------------------------------------------------------------------- #
+
+
+def test_iter_sam_raises_on_samtools_nonzero_exit():
+    import subprocess
+
+    from trace_crispr.wgs.sv_plasmid import _iter_sam
+
+    # 'false' exits 1 with no output; exhausting the generator must raise, not
+    # silently yield an empty/partial SAM stream.
+    with pytest.raises(subprocess.CalledProcessError):
+        list(_iter_sam("/no/such/file.bam", samtools="false"))
+
+
+def test_iter_sam_clean_exit_does_not_raise():
+    from trace_crispr.wgs.sv_plasmid import _iter_sam
+
+    # 'true' exits 0 with no output -> empty stream, no error.
+    assert list(_iter_sam("whatever", samtools="true")) == []

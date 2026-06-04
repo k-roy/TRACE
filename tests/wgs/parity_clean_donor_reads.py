@@ -75,14 +75,17 @@ def read_ref_anno(path):
 
 def stream_records(bam_path, samtools):
     proc = subprocess.Popen([samtools, "view", "-h", bam_path], stdout=subprocess.PIPE, text=True)
-    assert proc.stdout is not None
+    if proc.stdout is None:
+        raise RuntimeError("failed to capture samtools stdout")
     try:
         for line in proc.stdout:
             if not line.startswith("@"):
                 yield parse_sam_line(line)
     finally:
         proc.stdout.close()
-        proc.wait()
+        rc = proc.wait()
+    if rc:
+        raise subprocess.CalledProcessError(rc, proc.args)
 
 
 def bam_read_names(bam_path, samtools):
