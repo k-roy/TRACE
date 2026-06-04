@@ -50,9 +50,9 @@ import pysam
 
 from ..core.cigar import parse_cigar_to_operations
 
-# Proper-pair primary flags Shengdi kept (read1/read2 x forward/reverse). Used as
-# a feature, not a hard gate (we keep informative reads at n=1).
-PROPER_PAIR_FLAGS = frozenset({83, 99, 147, 163})
+# The genuine barcode read is a proper pair (flags 83/99/147/163, == read.is_proper_pair
+# for a primary mapped read), which extract_track() requires; see is_amplicon_read /
+# is_read2_hop for the contaminant gates layered on top.
 
 _RC_TABLE = str.maketrans("ACGTNacgtn", "TGCANtgcan")
 
@@ -99,8 +99,10 @@ class TrackConfig:
         return self.bc_end - self.bc_start + 1
 
     def to_canonical(self, query_barcode: str) -> str:
-        """Map a forward-on-contig barcode to the canonical bc1 orientation
-        (genome-forward == the orientation of the bc1->donor reference table)."""
+        """Map a forward-on-contig barcode to the canonical bc1 orientation (the
+        bc1->donor reference table / SHA345 / yT182 truth orientation). For a track
+        with ``revcomp=True`` (the genome integrant) that is the reverse-complement of
+        the forward-on-contig read; for ``revcomp=False`` (the plasmid) it is unchanged."""
         return revcomp(query_barcode) if self.revcomp else query_barcode
 
     def validate_against_reference(self, fasta: "pysam.FastaFile") -> None:
@@ -195,13 +197,13 @@ def extract_barcode(read: "pysam.AlignedSegment", track: TrackConfig) -> Optiona
     if read.reference_start < bc_start0:
         anchor = "left"
         q = ref_to_query_offset(read, bc_start0)  # first barcode base
-        if q is None:
+        if q is None or q < 0:  # guard: a negative slice start wraps to the read 3' end
             return None
         barcode = read.query_sequence[q : q + n]
     else:
         anchor = "right"
         q_end = ref_to_query_offset(read, bc_end0)  # first base past barcode
-        if q_end is None:
+        if q_end is None or q_end - n < 0:  # guard against a negative slice start
             return None
         barcode = read.query_sequence[q_end - n : q_end]
 
@@ -246,12 +248,14 @@ def _flank_mismatches(read: "pysam.AlignedSegment", track: TrackConfig, anchor: 
 
 
 def _dedup_key(read: "pysam.AlignedSegment") -> Tuple:
-    """Collapse PCR duplicates. Uses the fragment signature when the mate is
-    mapped, else a single-read fallback (ref span + cigar) so true singletons
-    are not inflated by duplicates."""
+    """Collapse PCR duplicates to one *molecule*. Uses the fragment signature when
+    the mate is mapped, else a single-read fallback (ref span + cigar). TLEN is
+    abs()'d and read1/read2 are NOT distinguished, so both ends of the same fragment
+    (e.g. a left- and a right-anchored mate that both extract the barcode) collapse
+    to a single molecule rather than being counted twice."""
     if read.is_paired and not read.mate_is_unmapped and read.next_reference_id == read.reference_id:
-        return ("pair", min(read.reference_start, read.next_reference_start), read.template_length, read.is_read1)
-    return ("single", read.reference_start, read.reference_end, read.cigarstring, read.is_read1)
+        return ("pair", min(read.reference_start, read.next_reference_start), abs(read.template_length))
+    return ("single", read.reference_start, read.reference_end, read.cigarstring)
 
 
 # --------------------------------------------------------------------------- #
