@@ -29,8 +29,25 @@ from .donor_outcome import (
     precall,
     precall_sample,
 )
+from .sv_plasmid import (
+    CleanResult,
+    SamRecord,
+    build_integrated_plasmid_contig,
+    classify_donor_reads,
+    clean_donor_reads,
+    decode_duplicate,
+    detect_plasmid_integration,
+    integrated_plasmid_junction,
+    load_blacklist,
+    one_read_inside_large_deletion,
+    ref_span_md,
+    rev_comp,
+    summarize_plasmid_integration,
+    within_read_large_deletions,
+)
 
 __all__ = [
+    # donor_outcome (Stage 1)
     "DESIGNED",
     "SYNTHETIC_ERROR",
     "SPONTANEOUS",
@@ -40,4 +57,19 @@ __all__ = [
     "levenshtein",
     "precall",
     "precall_sample",
+    # sv_plasmid (Stage 2-i)
+    "CleanResult",
+    "SamRecord",
+    "classify_donor_reads",
+    "clean_donor_reads",
+    "decode_duplicate",
+    "ref_span_md",
+    "load_blacklist",
+    "detect_plasmid_integration",
+    "summarize_plasmid_integration",
+    "one_read_inside_large_deletion",
+    "within_read_large_deletions",
+    "build_integrated_plasmid_contig",
+    "integrated_plasmid_junction",
+    "rev_comp",
 ]
