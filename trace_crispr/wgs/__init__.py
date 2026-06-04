@@ -18,6 +18,26 @@ parity tests against Shengdi's reference outputs. Each ported module carries a
 provenance docstring crediting the original.
 """
 
+from .bc1_consensus import (
+    BRIDGE_AMBIGUOUS,
+    BRIDGE_EXACT,
+    BRIDGE_HD1,
+    BRIDGE_NONE,
+    Bc1Call,
+    BridgeIndex,
+    BridgeResult,
+    Extraction,
+    TrackCall,
+    TrackConfig,
+    call_sample,
+    caller_confidence,
+    extract_barcode,
+    extract_track,
+    is_amplicon_read,
+    is_read2_hop,
+    top_barcode,
+    tracks_from_config,
+)
 from .donor_outcome import (
     DESIGNED,
     SPONTANEOUS,
@@ -72,4 +92,23 @@ __all__ = [
     "build_integrated_plasmid_contig",
     "integrated_plasmid_junction",
     "rev_comp",
+    # bc1_consensus (Stage 2-ii)
+    "TrackConfig",
+    "Extraction",
+    "TrackCall",
+    "extract_track",
+    "extract_barcode",
+    "is_amplicon_read",
+    "is_read2_hop",
+    "BridgeIndex",
+    "BridgeResult",
+    "BRIDGE_EXACT",
+    "BRIDGE_HD1",
+    "BRIDGE_AMBIGUOUS",
+    "BRIDGE_NONE",
+    "Bc1Call",
+    "top_barcode",
+    "caller_confidence",
+    "call_sample",
+    "tracks_from_config",
 ]

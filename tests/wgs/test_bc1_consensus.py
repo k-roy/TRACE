@@ -12,17 +12,25 @@ orthogonal REDI amplicon (SHA345/yT182): canonical bc1 == ``ATAAAAATGTTGCGATATCT
 """
 
 import pysam
-import pytest
 
 from trace_crispr.wgs.bc1_consensus import (
+    BRIDGE_AMBIGUOUS,
+    BRIDGE_EXACT,
+    BRIDGE_HD1,
+    BRIDGE_NONE,
+    BridgeIndex,
     TrackConfig,
     _boundary_defect,
+    call_sample,
+    caller_confidence,
     extract_barcode,
     extract_track,
+    hd1_neighbors,
     is_amplicon_read,
     is_read2_hop,
     ref_to_query_offset,
     revcomp,
+    top_barcode,
 )
 
 # --------------------------------------------------------------------------- #
@@ -237,3 +245,91 @@ def test_window_shift_breaks_the_call(tmp_path):
     with pysam.AlignmentFile(bam, "rb") as af:
         call = extract_track(af, shifted)
     assert TRUTH not in call.barcode_support()
+
+
+# --------------------------------------------------------------------------- #
+# Bridge: exact / HD1 / ambiguous / none + in-set-HD1 flag                     #
+# --------------------------------------------------------------------------- #
+
+B_EXACT = "AAAACCCCGGGGTTTTACGT"
+B_EXACT_NB = "CAAACCCCGGGGTTTTACGT"  # HD1 neighbour of B_EXACT
+B_AMBIG = "TTTTGGGGCCCCAAAATGCA"
+B_SOLO = "ACGTACGTACGTACGTAAAA"
+
+
+def _bridge():
+    return BridgeIndex.from_records([
+        (B_EXACT, "oligoA", 100), (B_EXACT, "oligoA", 50),  # single oligo, support 150
+        (B_EXACT_NB, "oligoNB", 7),                          # in-set HD1 neighbour of B_EXACT
+        (B_AMBIG, "oligoX", 30), (B_AMBIG, "oligoY", 40),    # two oligos -> ambiguous
+        (B_SOLO, "oligoZ", 20),                              # isolated -> HD1 target
+    ])
+
+
+def test_bridge_exact_with_inset_hd1_flag():
+    r = _bridge().bridge(B_EXACT)
+    assert r.tier == BRIDGE_EXACT
+    assert r.oligo == "oligoA"
+    assert r.support == 150
+    assert r.has_inset_hd1_neighbor is True
+    assert "INSET_HD1_NEIGHBOR" in r.flags
+
+
+def test_bridge_ambiguous_when_multiple_oligos():
+    r = _bridge().bridge(B_AMBIG)
+    assert r.tier == BRIDGE_AMBIGUOUS
+    assert r.n_oligos == 2
+
+
+def test_bridge_hd1_unique():
+    query = B_SOLO[:-1] + "C"  # HD1 from B_SOLO only
+    r = _bridge().bridge(query)
+    assert r.tier == BRIDGE_HD1
+    assert r.oligo == "oligoZ"
+    assert r.matched_barcode == B_SOLO
+
+
+def test_bridge_none_when_no_hit_or_neighbor():
+    r = _bridge().bridge("GGGGGGGGGGGGGGGGGGGG")
+    assert r.tier == BRIDGE_NONE
+    assert r.oligo is None
+
+
+def test_bridge_hd1_disabled():
+    query = B_SOLO[:-1] + "C"
+    r = _bridge().bridge(query, allow_hd1=False)
+    assert r.tier == BRIDGE_NONE
+
+
+def test_hd1_neighbors_count():
+    assert len(set(hd1_neighbors("ACGTACGTACGTACGTACGT"))) == 60
+
+
+# --------------------------------------------------------------------------- #
+# top_barcode + caller_confidence + call_sample end-to-end                     #
+# --------------------------------------------------------------------------- #
+
+
+def test_top_barcode_and_confidence(tmp_path):
+    bam = _write_bam(tmp_path, [GENUINE])
+    with pysam.AlignmentFile(bam, "rb") as af:
+        call = extract_track(af, genome_track())
+    top = top_barcode(call)
+    assert top.barcode == TRUTH
+    assert top.support == 1 and top.both_anchors is False
+    assert caller_confidence(top) == "low"  # single-read single-anchor
+
+
+def test_call_sample_end_to_end(tmp_path):
+    reads = [HOP_A, AMPLICON_LEFT, AMPLICON_RIGHT, GENUINE]
+    bam = _write_bam(tmp_path, reads)
+    bridge = BridgeIndex.from_records([(TRUTH, "oligoNNS", 932)])
+    with pysam.AlignmentFile(bam, "rb") as af:
+        call = call_sample(af, "well_X", genome_track(), plasmid_track=None, bridge=bridge)
+    assert call.sample == "well_X"
+    assert call.track == "genome"
+    assert call.barcode == TRUTH
+    assert call.bridge_tier == BRIDGE_EXACT
+    assert call.oligo == "oligoNNS"
+    assert call.caller_confidence == "low"   # genuine read is a single right-anchored molecule
+    assert call.confidence == "medium"       # low caller x EXACT bridge -> medium
