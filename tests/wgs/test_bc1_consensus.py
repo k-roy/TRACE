@@ -19,10 +19,13 @@ from trace_crispr.wgs.bc1_consensus import (
     BRIDGE_HD1,
     BRIDGE_NONE,
     BridgeIndex,
+    Extraction,
+    TrackCall,
     TrackConfig,
     _boundary_defect,
     call_sample,
     caller_confidence,
+    confident_barcodes,
     extract_barcode,
     extract_track,
     hd1_neighbors,
@@ -333,3 +336,59 @@ def test_call_sample_end_to_end(tmp_path):
     assert call.oligo == "oligoNNS"
     assert call.caller_confidence == "low"   # genuine read is a single right-anchored molecule
     assert call.confidence == "medium"       # low caller x EXACT bridge -> medium
+
+
+# --------------------------------------------------------------------------- #
+# confident_barcodes: the multi-bc1 enumerator (Stage 3 reconciliation input)  #
+# --------------------------------------------------------------------------- #
+
+_MB_A = "AAAACCCCGGGGTTTTAAAA"  # support 2, both anchors      -> high
+_MB_B = "CCCCGGGGTTTTAAAACCCC"  # support 1, single anchor     -> low
+_MB_C = "GGGGTTTTAAAACCCCGGGG"  # support 2, single anchor     -> high (support>=2)
+
+
+def _extr(bc, anchor, mm, key):
+    return Extraction(
+        barcode=bc, query_barcode=bc, anchor=anchor, read_name="r",
+        is_reverse=False, mapq=60, flank_mismatches=mm,
+        barcode_has_n=False, dedup_key=key,
+    )
+
+
+def _multi_call():
+    return TrackCall(track="genome", extractions=[
+        _extr(_MB_A, "left", 0, ("p", 1, 100)),
+        _extr(_MB_A, "right", 0, ("p", 2, 100)),  # A: 2 molecules, both anchors
+        _extr(_MB_B, "right", 0, ("p", 3, 100)),  # B: 1 molecule, single anchor
+        _extr(_MB_C, "left", 1, ("p", 4, 100)),
+        _extr(_MB_C, "left", 1, ("p", 5, 100)),   # C: 2 molecules, one anchor
+    ], n_reads_seen=5)
+
+
+def test_confident_barcodes_enumerates_and_ranks():
+    res = confident_barcodes(_multi_call())
+    # support 2 (A, mm0), 2 (C, mm1), 1 (B) -> A before C on cleaner flank, B last
+    assert [b.barcode for b in res] == [_MB_A, _MB_C, _MB_B]
+    assert res[0].support == 2 and res[0].both_anchors and res[0].caller_confidence == "high"
+    assert res[1].caller_confidence == "high"   # support>=2 even on a single anchor
+    assert res[2].caller_confidence == "low"    # single read, single anchor
+    # the winner agrees with top_barcode (one source of truth)
+    assert res[0].barcode == top_barcode(_multi_call()).barcode
+
+
+def test_confident_barcodes_high_only_and_min_support():
+    call = _multi_call()
+    hi = confident_barcodes(call, high_only=True)
+    assert [b.barcode for b in hi] == [_MB_A, _MB_C]  # low B dropped
+    ms2 = confident_barcodes(call, min_support=2)
+    assert _MB_B not in [b.barcode for b in ms2]
+    assert confident_barcodes(TrackCall(track="genome", extractions=[])) == []
+
+
+def test_confident_barcodes_bridges_each():
+    bridge = BridgeIndex.from_records([(_MB_A, "oligoA", 100)])
+    res = confident_barcodes(_multi_call(), bridge)
+    a = next(b for b in res if b.barcode == _MB_A)
+    assert a.bridge_tier == BRIDGE_EXACT and a.oligo == "oligoA" and a.confidence == "high"
+    b = next(b for b in res if b.barcode == _MB_B)
+    assert b.bridge_tier == BRIDGE_NONE and b.oligo is None and b.confidence == "low"
