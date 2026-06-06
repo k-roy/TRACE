@@ -548,22 +548,32 @@ class TopBarcode:
     min_flank_mm: int  # cleanest anchored-flank mismatch count
 
 
-def top_barcode(call: TrackCall) -> Optional[TopBarcode]:
-    """Deterministic winner of a track: max deduped support, then fewest flank
-    mismatches, then lexicographic barcode."""
+def _barcode_features(call: TrackCall) -> Dict[str, Tuple[int, bool, int]]:
+    """Per-barcode ``(deduped_support, both_anchors, min_flank_mm)`` for one track —
+    the shared feature basis for both :func:`top_barcode` (the single winner) and
+    :func:`confident_barcodes` (the full multi-bc1 set), so the two cannot drift."""
     support = call.barcode_support()
-    if not support:
-        return None
     best_mm: Dict[str, int] = {}
     anchors: Dict[str, set] = {}
     for e in call.extractions:
         best_mm[e.barcode] = min(best_mm.get(e.barcode, 999), e.flank_mismatches)
         anchors.setdefault(e.barcode, set()).add(e.anchor)
-    bc, sup = sorted(support.items(), key=lambda kv: (-kv[1], best_mm[kv[0]], kv[0]))[0]
-    return TopBarcode(
-        barcode=bc, support=sup, n_distinct=len(support),
-        both_anchors={"left", "right"} <= anchors[bc], min_flank_mm=best_mm[bc],
-    )
+    return {
+        bc: (sup, {"left", "right"} <= anchors[bc], best_mm[bc])
+        for bc, sup in support.items()
+    }
+
+
+def top_barcode(call: TrackCall) -> Optional[TopBarcode]:
+    """Deterministic winner of a track: max deduped support, then fewest flank
+    mismatches, then lexicographic barcode."""
+    feats = _barcode_features(call)
+    if not feats:
+        return None
+    bc = sorted(feats.items(), key=lambda kv: (-kv[1][0], kv[1][2], kv[0]))[0][0]
+    sup, both, mm = feats[bc]
+    return TopBarcode(barcode=bc, support=sup, n_distinct=len(feats),
+                      both_anchors=both, min_flank_mm=mm)
 
 
 def caller_confidence(top: TopBarcode) -> str:
@@ -641,6 +651,75 @@ def call_sample(
         caller_confidence=conf, bridge_tier=br.tier, oligo=br.oligo, bridge_support=br.support,
         n_oligos=br.n_oligos, bridge_flags=br.flags, confidence=_combine_confidence(conf, br.tier),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Multi-bc1 enumeration (Stage 3 reconciliation input)                         #
+# --------------------------------------------------------------------------- #
+#
+# call_sample collapses a track to its single winner (Bc1Call). Reconciliation
+# instead needs the FULL set of confident barcodes in a cell: a clean single-
+# lineage cell yields one, a mixed/contaminated cell yields >=2. Two distinct bc1
+# at the single haploid integration locus (yT177) cannot coexist in one clone, so
+# >=2 confident barcodes is itself the primary contamination signal (validated
+# against colony_purity in bc1_consensus); the edit-VAF axis then separates a
+# genuine multi-edit (two plasmids / two oligos -> two ~100% genomic edits) from
+# a mixture.
+
+
+@dataclass
+class BarcodeCall:
+    """One confident bc1 within a sample — the multi-bc1 unit consumed by Stage-3
+    reconciliation. Same feature/bridge fields as :class:`Bc1Call`, but a sample
+    yields a *list* of these (typically 1; >=2 flags a multi-lineage cell)."""
+
+    barcode: str  # canonical
+    support: int  # deduped molecules
+    both_anchors: bool
+    min_flank_mm: int
+    caller_confidence: str  # "high" / "low"
+    bridge_tier: str
+    oligo: Optional[str]
+    bridge_support: int
+    n_oligos: int
+    bridge_flags: Tuple[str, ...]
+    confidence: str  # combined caller x bridge
+
+
+def confident_barcodes(
+    call: TrackCall,
+    bridge: Optional[BridgeIndex] = None,
+    *,
+    min_support: int = 1,
+    high_only: bool = False,
+) -> List[BarcodeCall]:
+    """Enumerate *all* barcodes on a track (not just the winner), each scored and
+    bridged — the multi-bc1 input to reconciliation. ``min_support`` drops singleton
+    PCR/sequencing noise; ``high_only`` keeps only two-orientation or support>=2
+    barcodes. Returned sorted by deduped support desc (then cleanest flank, then
+    barcode), so ``confident_barcodes(call, bridge)[0]`` matches ``top_barcode``."""
+    out: List[BarcodeCall] = []
+    for bc, (sup, both, mm) in _barcode_features(call).items():
+        if sup < min_support:
+            continue
+        cc = "high" if (both or sup >= 2) else "low"
+        if high_only and cc != "high":
+            continue
+        br = (
+            bridge.bridge(bc)
+            if bridge is not None
+            else BridgeResult(bc, BRIDGE_NONE, None, 0, None, 0, False, ())
+        )
+        out.append(
+            BarcodeCall(
+                barcode=bc, support=sup, both_anchors=both, min_flank_mm=mm,
+                caller_confidence=cc, bridge_tier=br.tier, oligo=br.oligo,
+                bridge_support=br.support, n_oligos=br.n_oligos, bridge_flags=br.flags,
+                confidence=_combine_confidence(cc, br.tier),
+            )
+        )
+    out.sort(key=lambda b: (-b.support, b.min_flank_mm, b.barcode))
+    return out
 
 
 # --------------------------------------------------------------------------- #
