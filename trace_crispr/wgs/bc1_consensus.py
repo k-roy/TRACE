@@ -9,25 +9,24 @@ whole-genome BAM, so each cell can be bridged to its designed donor via the
 Design (2026-06-04) — *not* a port of Shengdi Li's trie caller
 -------------------------------------------------------------
 The barcode is a 20 bp degenerate locus flanked by two long **constant** junction
-sequences, on an integrated contig (and an episomal-plasmid copy). With 75 bp Tn5
-reads a single read captures the barcode plus part of **one** flank, never both,
-and coverage is near-singleton (most calls rest on a single read). So multi-read
-consensus machinery (Shengdi's prefix trie + ``Tscore``/``Uscore``) is moot and
-buggy at this depth. Verified on the real BAMs: the aligner **soft-clips** the
-random barcode (CIGARs like ``3S38M34S`` — ~38 bp anchored in the flank, the
-barcode in the soft-clip), so a reference-column pileup would recover nothing.
+sequences, on an integrated contig (and an episomal-plasmid copy). Reads can
+capture one or both constant flanks; coverage can be near-singleton. The aligner
+can soft-clip the random barcode or place arbitrary indels inside its reference
+N-run. Soft-clipped barcode bases are absent from an aligned-column pileup.
 
 This module instead does robust, deterministic, **per-read** work:
 
 1. anchor on the **constant flank** (never align against the random barcode);
-2. map the flank↔barcode boundary to a query offset via the CIGAR and slice the
-   20 bp directly by query index, **recovering soft-clipped barcode bases**;
+2. derive query boundaries from alignment to the constant flanks, validate their
+   adjacent sequence, and require a unique barcode interval; never use alignment
+   inside the variable N-run to choose a boundary;
 3. drop read-2 amplicon-hop contaminants (mate off the barcode contig);
 4. dedup, then bridge the extracted 20-mer to the designed ``bc1 -> donor`` set.
 
-Confidence is feature-based (bridge tier + anchor cleanliness + support), never a
-read count. The genome/plasmid tracks are called independently and reported
-separately (their flanks differ, so two-track agreement is genuine, not circular).
+Caller confidence uses anchor labels and deduplicated molecule support; combined
+confidence also uses the bridge tier. Genome/plasmid tracks are called and
+reported separately in their configured orientations. Their agreement is an
+internal-consistency measurement, not independent expected well identity.
 The double-edit-vs-contamination call and the edit-VAF corroboration live in a
 **separate reconciliation step** (they need the variant calls), per Kevin's call.
 
@@ -164,9 +163,9 @@ def ref_to_query_offset(read: "pysam.AlignedSegment", ref0: int) -> Optional[int
 class Extraction:
     """A barcode extracted from one read, with raw per-read features.
 
-    ``barcode`` is the **canonical** bc1 (genome-forward; bridge/agreement use this).
-    ``query_barcode`` is the raw forward-on-contig slice (== barcode for the genome
-    track; == revcomp(barcode) for the inverted plasmid track) — kept for QC/debug.
+    ``barcode`` is the canonical bc1 used for bridge/agreement.
+    ``query_barcode`` is the forward-on-contig slice; ``TrackConfig.to_canonical``
+    applies the configured orientation exactly once.
     """
 
     barcode: str  # canonical bc1 orientation
@@ -180,39 +179,116 @@ class Extraction:
     dedup_key: Tuple
 
 
-def extract_barcode(read: "pysam.AlignedSegment", track: TrackConfig) -> Optional[Extraction]:
-    """Extract the 20 bp barcode from one spanning read by flank-boundary query
-    slicing. Returns ``None`` if the read does not anchor a flank cleanly.
+def _flank_boundaries(read: "pysam.AlignedSegment", track: TrackConfig, anchor: str,
+                     *, validate_sequence: bool = True, min_bases: int = 4) -> set:
+    """Query boundaries supported by alignment outside the variable barcode.
 
-    Routing: a read aligned starting left of the barcode anchors the LEFT flank
-    (barcode in the trailing soft-clip); one aligned within/after the barcode
-    anchors the RIGHT flank (barcode in the leading soft-clip).
+    A match block touching the configured constant flank proposes a boundary.
+    Validate up to ten adjacent constant bases in SEQ, with at least four when
+    the read ends within the flank. This also validates extrapolation through a
+    soft-clipped *constant* sequence; variable-region CIGAR operations do not
+    participate. Multiple surviving boundaries remain ambiguous. Unvalidated
+    boundaries only flag observed opposing-flank evidence; they cannot call.
+    A shorter validated flank may corroborate a strong anchor on the other
+    side, but cannot initiate extraction itself.
     """
-    if read.query_sequence is None or read.reference_start is None:
+    seq = read.query_sequence.upper()
+    left = anchor == "left"
+    boundary = track.bc_start - 1 if left else track.bc_end
+    flank = (track.left_junction if left else track.right_junction).upper()
+    lo, hi = (boundary - len(flank), boundary) if left else (boundary, boundary + len(flank))
+    candidates = set()
+    for op in parse_cigar_to_operations(read):
+        if op.op_code not in (0, 7, 8) or op.ref_end <= lo or op.ref_start >= hi:
+            continue
+        q = op.query_start + boundary - op.ref_start
+        if not 0 <= q <= len(seq):
+            continue
+        available = q if left else len(seq) - q
+        k = min(10, len(flank), available)
+        if k < min_bases:
+            continue
+        observed = seq[q-k:q] if left else seq[q:q+k]
+        expected = flank[-k:] if left else flank[:k]
+        if not validate_sequence or observed == expected:
+            candidates.add(q)
+    return candidates
+
+
+def _sequence_boundaries(seq: str, flank: str, left: bool) -> set:
+    """Full adjacent-flank occurrences, used to detect conflicting geometry.
+
+    Sequence alone may corroborate or contradict an aligned anchor but cannot
+    introduce a call without alignment to a configured constant flank.
+    """
+    motif = flank[-10:].upper() if left else flank[:10].upper()
+    if len(motif) < 4:
+        return set()
+    found = set()
+    start = 0
+    while True:
+        pos = seq.find(motif, start)
+        if pos < 0:
+            return found
+        found.add(pos + len(motif) if left else pos)
+        start = pos + 1
+
+
+def extract_barcode(read: "pysam.AlignedSegment", track: TrackConfig) -> Optional[Extraction]:
+    """Decode one unique configured cassette interval from constant flanks.
+
+    CIGAR alignment *within* N20 cannot define molecular boundaries: aligners
+    place insertions/deletions there arbitrarily. Instead validate boundaries
+    derived from constant-flank blocks. If both flanks occur, require the
+    configured barcode length between them; contradictory frames are no-calls.
+    One-flank reads remain callable when a unique aligned anchor spans the full
+    configured width and no observed opposing-flank evidence contradicts it.
+    Without an identifiable opposite flank, the molecule's actual spacer length
+    cannot be independently established. Flanks and orientation come from this
+    track, not an era-wide motif.
+    """
+    if not read.query_sequence or read.reference_start is None or track.bc_len <= 0:
         return None
-    bc_start0 = track.bc_start - 1  # 0-based first barcode base
-    bc_end0 = track.bc_end  # 0-based one-past-last barcode base
+    seq = read.query_sequence.upper()
     n = track.bc_len
-
-    if read.reference_start < bc_start0:
-        anchor = "left"
-        q = ref_to_query_offset(read, bc_start0)  # first barcode base
-        if q is None or q < 0:  # guard: a negative slice start wraps to the read 3' end
-            return None
-        barcode = read.query_sequence[q : q + n]
-    else:
-        anchor = "right"
-        q_end = ref_to_query_offset(read, bc_end0)  # first base past barcode
-        if q_end is None or q_end - n < 0:  # guard against a negative slice start
-            return None
-        barcode = read.query_sequence[q_end - n : q_end]
-
-    if len(barcode) != n:
-        return None  # read did not reach a full barcode width
-    query_barcode = barcode.upper()
+    aligned_left = _flank_boundaries(read, track, "left")
+    aligned_right = _flank_boundaries(read, track, "right")
+    if not aligned_left and not aligned_right:
+        return None
+    sequence_left = _sequence_boundaries(seq, track.left_junction, True)
+    sequence_right = _sequence_boundaries(seq, track.right_junction, False)
+    # A failed opposing-flank check must not silently turn a two-flank record
+    # into a one-flank call (which could include a flank base in a short barcode).
+    corroborated_left = _flank_boundaries(read, track, "left", min_bases=1)
+    corroborated_right = _flank_boundaries(read, track, "right", min_bases=1)
+    left_evidence = corroborated_left or _flank_boundaries(read, track, "left", validate_sequence=False, min_bases=1)
+    right_evidence = corroborated_right or _flank_boundaries(read, track, "right", validate_sequence=False, min_bases=1)
+    left_width = min(10, len(track.left_junction))
+    right_width = min(10, len(track.right_junction))
+    intervals = set()
+    for q in aligned_left:
+        # An incidental opposite motif wholly inside N20 is barcode sequence,
+        # not evidence of a second flank. A motif crossing its boundary still
+        # matters, including genuine 19-base or other wrong-width cassettes.
+        opposite = corroborated_right | {r for r in sequence_right
+                                    if r >= q and r + right_width > q + n}
+        if q + n <= len(seq) and (q + n in opposite or (not opposite and not right_evidence)):
+            intervals.add((q, q+n))
+    for end in aligned_right:
+        opposite = corroborated_left | {l for l in sequence_left
+                                   if l <= end and l - left_width < end - n}
+        if end >= n and (end - n in opposite or (not opposite and not left_evidence)):
+            intervals.add((end-n, end))
+    if len(intervals) != 1:
+        return None
+    q, q_end = next(iter(intervals))
+    if q < 0 or q_end > len(seq):
+        return None
+    # Label the aligned flank that supports this interval. A single two-flank
+    # read is not counted as two molecules or two separate anchors.
+    anchor = "left" if q in aligned_left else "right"
+    query_barcode = seq[q:q_end]
     canonical = track.to_canonical(query_barcode)
-
-    flank_mm = _flank_mismatches(read, track, anchor)
     return Extraction(
         barcode=canonical,
         query_barcode=query_barcode,
@@ -220,7 +296,7 @@ def extract_barcode(read: "pysam.AlignedSegment", track: TrackConfig) -> Optiona
         read_name=read.query_name,
         is_reverse=bool(read.is_reverse),
         mapq=read.mapping_quality,
-        flank_mismatches=flank_mm,
+        flank_mismatches=_flank_mismatches(read, track, anchor),
         barcode_has_n=("N" in canonical),
         dedup_key=_dedup_key(read),
     )
@@ -354,8 +430,17 @@ def extract_track(
         # right-anchored read aligning the right flank starts AT bc_end with the barcode
         # entirely in its leading soft-clip — an aligned-span overlap test wrongly drops it.
         cig = read.cigartuples or []
-        lead_s = cig[0][1] if cig and cig[0][0] == 4 else 0
-        trail_s = cig[-1][1] if cig and cig[-1][0] == 4 else 0
+        # H/P do not consume SEQ. Look past them for terminal soft clips.
+        ends = []
+        for operations in (cig, reversed(cig)):
+            for op, length in operations:
+                if op in (5, 6):
+                    continue
+                ends.append(length if op == 4 else 0)
+                break
+            else:
+                ends.append(0)
+        lead_s, trail_s = ends
         if read.reference_end + trail_s <= bc0 or read.reference_start - lead_s >= bc_end0:
             continue
         call.n_reads_seen += 1
