@@ -88,6 +88,9 @@ class TrackConfig:
     # read whose aligned start is in amplicon_left_window with a defect in the first
     # amplicon_left_defect query bases, OR whose aligned end is in amplicon_right_window with
     # a defect in the last amplicon_right_defect bases, is dropped. None => filter disabled.
+    # A defect at the read's 3' edge that is Nextera read-through is exempt (see
+    # is_amplicon_read). Windows are cohort- and reference-specific: they sit at the
+    # outer (5') ends of the bc1-amplicon inner primers in that reference.
     amplicon_left_window: Optional[Tuple[int, int]] = None  # 1-based inclusive start window
     amplicon_right_window: Optional[Tuple[int, int]] = None  # 1-based inclusive end window
     amplicon_left_defect: int = 5
@@ -375,22 +378,77 @@ def _boundary_defect(read: "pysam.AlignedSegment", n_bp: int, from_end: bool) ->
     return False
 
 
+# The Nextera (Tn5) mosaic end as a read meets it after running off a short fragment.
+# Shengdi's pipeline trims it with cutadapt before bwa (his Snakefile rule `cutadapt`), so
+# in his input a genuine fragment end carries no soft clip. Untrimmed input (the v11 cohort
+# recipe) does, and a Tn5 fragment end that falls in an amplicon window then looks exactly
+# like a randomer defect: on plate 5031 the unexempted test dropped 29 genuine reads beside
+# 27 amplicon reads.
+_NEXTERA_MOSAIC_END = "CTGTCTCTTATACACATCT"
+
+
+def _terminal_soft_clip(read: "pysam.AlignedSegment", leading: bool) -> int:
+    """Length of the soft clip at the leading (or trailing) end, looking past hard clips."""
+    ops = read.cigartuples or []
+    for op, length in (ops if leading else reversed(ops)):
+        if op == 5:  # H does not consume SEQ
+            continue
+        return length if op == 4 else 0
+    return 0
+
+
+def _reads_into_mosaic_end(read: "pysam.AlignedSegment") -> bool:
+    """True if the read's 3' end reads through into the Nextera mosaic end.
+
+    Tested in sequencing orientation: the mosaic end, or a prefix of it of at least three
+    bases where the read ends first, must start between 12 bases before and 2 bases after
+    the start of the 3' soft clip. The 12-base margin covers adapter bases that bwa aligns
+    because they happen to match the reference (chrII carries CTGTCTC at 638903-638909); the
+    2 bases cover a mismatching genomic base clipped ahead of the adapter. Up to 20%
+    mismatches are allowed once 10 or more bases are compared, none below that, so short
+    random matches stay rare while ordinary 3'-end sequencing errors are tolerated.
+    """
+    seq = (read.query_sequence or "").upper()
+    if not seq:
+        return False
+    if read.is_reverse:
+        seq, clip3 = revcomp(seq), _terminal_soft_clip(read, leading=True)
+    else:
+        clip3 = _terminal_soft_clip(read, leading=False)
+    clip_start = len(seq) - clip3
+    me = _NEXTERA_MOSAIC_END
+    for a in range(max(0, clip_start - 12), min(len(seq) - 2, clip_start + 3)):
+        n = min(len(me), len(seq) - a)
+        mismatches = sum(1 for x, y in zip(seq[a:a + n], me[:n]) if x != y)
+        if mismatches <= (n // 5 if n >= 10 else 0):
+            return True
+    return False
+
+
 def is_amplicon_read(read: "pysam.AlignedSegment", track: TrackConfig) -> bool:
     """bc1-amplicon contaminant telltale (Shengdi's ``filter_barcode_region.pl``):
     an aligned outer boundary at a fixed amplicon-primer coordinate **plus** a randomer
-    soft-clip/indel at that boundary. Disabled (returns False) when no window is set."""
+    soft-clip/indel at that boundary. Disabled (returns False) when no window is set.
+
+    One exemption keeps the port faithful on untrimmed input: a defect at the read's 3'
+    edge (the right edge of a forward read, the left edge of a reverse read) does not
+    count when that end reads into the Nextera mosaic end, because it is Tn5 read-through
+    that Shengdi's cutadapt step would have removed. The 5' edge, where an amplicon read's
+    randomer sits, is always tested, so a spurious 3' match cannot hide a real randomer."""
     if read.reference_start is None or read.reference_end is None:
         return False
     if track.amplicon_left_window is not None:
         lo, hi = track.amplicon_left_window
         start1 = read.reference_start + 1  # 1-based aligned start
         if lo <= start1 <= hi and _boundary_defect(read, track.amplicon_left_defect, from_end=False):
-            return True
+            if not (read.is_reverse and _reads_into_mosaic_end(read)):
+                return True
     if track.amplicon_right_window is not None:
         lo, hi = track.amplicon_right_window
         end1 = read.reference_end  # 1-based inclusive aligned end (pysam end is 0-based exclusive)
         if lo <= end1 <= hi and _boundary_defect(read, track.amplicon_right_defect, from_end=True):
-            return True
+            if not (not read.is_reverse and _reads_into_mosaic_end(read)):
+                return True
     return False
 
 
