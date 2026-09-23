@@ -251,7 +251,9 @@ def test_frozen_real_reads_through_indexed_bam(tmp_path, case):
     read.cigarstring = c["cigar"]
     read.mapping_quality = c["mapq"]
     track = TrackConfig(c["track"], c["contig"], c["bc_start1"], c["bc_end1"],
-                        c["left_flank"], c["right_flank"], c["revcomp"])
+                        c["left_flank"], c["right_flank"], c["revcomp"], min_mapq=0)
+    # This frozen replay tests molecular boundaries, including two MAPQ<20
+    # reads. Production locus-identity MAPQ refusal has separate tests.
     path = bam_file(tmp_path, [read])
     with pysam.AlignmentFile(str(path)) as bam:
         assert call_sample(bam, c["sample"], track).barcode == expected

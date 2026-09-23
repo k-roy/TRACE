@@ -92,6 +92,9 @@ class TrackConfig:
     amplicon_right_window: Optional[Tuple[int, int]] = None  # 1-based inclusive end window
     amplicon_left_defect: int = 5
     amplicon_right_defect: int = 7
+    min_mapq: int = 20
+    # Prespecified conservative locus-assignment policy, not calibrated precision.
+    # Set 0 explicitly for historical sensitivity comparisons. MAPQ255 is unknown.
 
     @property
     def bc_len(self) -> int:
@@ -288,6 +291,8 @@ def extract_barcode(read: "pysam.AlignedSegment", track: TrackConfig) -> Optiona
     # read is not counted as two molecules or two separate anchors.
     anchor = "left" if q in aligned_left else "right"
     query_barcode = seq[q:q_end]
+    if any(base not in 'ACGT' for base in query_barcode):
+        return None
     canonical = track.to_canonical(query_barcode)
     return Extraction(
         barcode=canonical,
@@ -398,6 +403,7 @@ class TrackCall:
     n_reads_seen: int = 0
     n_contaminant: int = 0
     n_amplicon: int = 0  # subset of n_contaminant dropped by the amplicon telltale
+    n_ambiguous: int = 0  # insufficient/unknown mapping confidence, not contamination
 
     def barcode_support(self) -> Dict[str, int]:
         """Distinct-molecule (deduped) support per extracted barcode."""
@@ -444,6 +450,9 @@ def extract_track(
         if read.reference_end + trail_s <= bc0 or read.reference_start - lead_s >= bc_end0:
             continue
         call.n_reads_seen += 1
+        if read.mapping_quality == 255 or read.mapping_quality < track.min_mapq:
+            call.n_ambiguous += 1
+            continue
         # Genuine barcode read = PROPER PAIR with mate on-contig. Drop (a) non-proper-pair
         # and cross-contig read-2 hops, and (b) on-contig bc1-amplicon proper pairs via the
         # amplicon-primer telltale (only active when the track has amplicon windows set).
@@ -715,15 +724,28 @@ def call_sample(
     (the plasmid track has no amplicon filter, so a low-confidence plasmid call is
     usually contamination — validated: naive genome-else-plasmid hurts precision)."""
     gcall = extract_track(bam, genome_track)
+    pcall = None
+    if top_barcode(gcall) is None and plasmid_track is not None:
+        pcall = extract_track(bam, plasmid_track)
+    return call_from_tracks(sample, gcall, pcall, bridge)
+
+
+def call_from_tracks(sample: str, gcall: TrackCall, pcall: Optional[TrackCall] = None,
+                     bridge: Optional[BridgeIndex] = None) -> Bc1Call:
+    """Apply the same winning-track decision to already extracted evidence."""
     top = top_barcode(gcall)
     track, used = "genome", gcall
-    if top is None and plasmid_track is not None:
-        pcall = extract_track(bam, plasmid_track)
+    if top is None and pcall is not None:
         ptop = top_barcode(pcall)
         if ptop is not None and caller_confidence(ptop) == "high":
             top, track, used = ptop, "plasmid", pcall
     if top is None:
-        return Bc1Call.empty(sample)
+        empty = Bc1Call.empty(sample)
+        tracks = [gcall] + ([pcall] if pcall is not None else [])
+        empty.n_reads_seen = sum(t.n_reads_seen for t in tracks)
+        empty.n_contaminant = sum(t.n_contaminant for t in tracks)
+        empty.n_amplicon = sum(t.n_amplicon for t in tracks)
+        return empty
 
     conf = caller_confidence(top)
     br = bridge.bridge(top.barcode) if bridge is not None else BridgeResult(
@@ -817,19 +839,33 @@ def load_locus_config(path: str) -> Dict[str, str]:
     equivalents). No PyYAML dependency."""
     cfg: Dict[str, str] = {}
     with open(path) as fh:
-        for line in fh:
+        for lineno, line in enumerate(fh, 1):
             line = line.rstrip("\n")
-            if not line or line.lstrip().startswith("#") or ":" not in line:
+            if not line.strip() or line.lstrip().startswith("#"):
                 continue
+            if line != line.lstrip() or ':' not in line:
+                raise ValueError(f'{path}:{lineno}: expected flat key: value, not nested YAML')
             key, val = line.split(":", 1)
-            cfg[key.strip()] = val.strip().strip("'\"")
+            key, val = key.strip(), val.strip()
+            if not re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', key) or not val or key in cfg:
+                raise ValueError(f'{path}:{lineno}: missing value, invalid or duplicate key {key!r}')
+            if val[0] in "'\"":
+                if len(val) < 2 or val[-1] != val[0]:
+                    raise ValueError(f'{path}:{lineno}: unmatched scalar quotes')
+                val = val[1:-1]
+            if not val or val.startswith(('[', '{')):
+                raise ValueError(f'{path}:{lineno}: expected a nonempty scalar')
+            cfg[key] = val
     return cfg
 
 
 def _parse_locus(s: str) -> Tuple[str, int, int]:
-    contig, rng = s.split(":")
+    contig, rng = s.rsplit(":", 1)
     a, b = rng.split("-")
-    return contig, int(a), int(b)
+    start, end = int(a), int(b)
+    if not contig or start < 1 or end < start:
+        raise ValueError(f'Invalid 1-based inclusive locus: {s!r}')
+    return contig, start, end
 
 
 def _parse_window(s: Optional[str]) -> Optional[Tuple[int, int]]:
@@ -844,22 +880,35 @@ def tracks_from_config(
     *,
     amplicon_left_window: Optional[Tuple[int, int]] = None,
     amplicon_right_window: Optional[Tuple[int, int]] = None,
-) -> Tuple[TrackConfig, TrackConfig]:
+    use_plasmid: Optional[bool] = None,
+    min_mapq: Optional[int] = None,
+) -> Tuple[TrackConfig, Optional[TrackConfig]]:
     """Build the (genome, plasmid) tracks from a locus config. Genome bc1 is read
     out as revcomp(canonical) so genome ``revcomp=True``; the plasmid cassette is
     inverted so plasmid-forward is already canonical (``revcomp=False``)."""
     gchr, gs, ge = _parse_locus(cfg["barcode_locus"])
-    pchr, ps, pe = _parse_locus(cfg["plasmid_bc_locus"])
     genome = TrackConfig(
         name="genome", contig=gchr, bc_start=gs, bc_end=ge,
         left_junction=cfg["barcode_left_sequence"], right_junction=cfg["barcode_right_sequence"],
         revcomp=True, amplicon_left_window=amplicon_left_window, amplicon_right_window=amplicon_right_window,
     )
+    if min_mapq is not None:
+        if type(min_mapq) is not int or not 0 <= min_mapq <= 254:
+            raise ValueError('min_mapq must be an integer from 0 to 254')
+        genome.min_mapq = min_mapq
+    keys = ('plasmid_bc_locus', 'plasmid_bc_left_sequence', 'plasmid_bc_right_sequence')
+    present = [bool(cfg.get(k)) for k in keys]
+    if use_plasmid is False or (use_plasmid is None and not any(present)):
+        return genome, None
+    if not all(present):
+        raise ValueError('Plasmid track requires locus and both flanking sequences')
+    pchr, ps, pe = _parse_locus(cfg["plasmid_bc_locus"])
     plasmid = TrackConfig(
         name="plasmid", contig=pchr, bc_start=ps, bc_end=pe,
         left_junction=cfg["plasmid_bc_left_sequence"], right_junction=cfg["plasmid_bc_right_sequence"],
         revcomp=False,
     )
+    plasmid.min_mapq = genome.min_mapq
     return genome, plasmid
 
 
@@ -898,16 +947,20 @@ def run(
     amplicon_right_window: Optional[str] = None,
     use_plasmid: bool = False,
     bam_suffix: str = ".sort.dedup.recal2.bam",
+    min_mapq: Optional[int] = None,
 ) -> int:
     cfg = load_locus_config(config)
     genome, plasmid = tracks_from_config(
         cfg,
         amplicon_left_window=_parse_window(amplicon_left_window),
         amplicon_right_window=_parse_window(amplicon_right_window),
+        use_plasmid=use_plasmid,
+        min_mapq=min_mapq,
     )
     with pysam.FastaFile(fasta) as fa:
         genome.validate_against_reference(fa)
-        plasmid.validate_against_reference(fa)
+        if plasmid is not None:
+            plasmid.validate_against_reference(fa)
     bridge = None
     if bridge_table:
         sys.stderr.write(f"[bridge] loading {bridge_table} ...\n")
@@ -916,8 +969,11 @@ def run(
         )
         sys.stderr.write(f"[bridge] {len(bridge)} distinct bc1\n")
     bams = sorted(glob.glob(os.path.join(bam_dir, "*" + bam_suffix)))
+    if not bams:
+        raise ValueError(f'No BAMs match {bam_dir!r} with suffix {bam_suffix!r}')
     sys.stderr.write(f"[run] {len(bams)} bams\n")
-    with open(out, "w") as o:
+    from ._io import atomic_text
+    with atomic_text(out) as o:
         o.write("\t".join(EMIT_COLUMNS) + "\n")
         for i, bampath in enumerate(bams, 1):
             sample = _sample_from_bam(bampath, bam_suffix)
@@ -947,6 +1003,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--amplicon-right-window", default=None, help="e.g. 10318-10326")
     p.add_argument("--use-plasmid", action="store_true", help="allow high-confidence plasmid-track fallback")
     p.add_argument("--bam-suffix", default=".sort.dedup.recal2.bam")
+    p.add_argument('--min-mapq', type=int, default=None,
+                   help='minimum mapping quality; default20, explicit0 for legacy sensitivity')
     return p
 
 
@@ -957,7 +1015,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         bridge_table=args.bridge_table, bridge_bc1_col=args.bridge_bc1_col,
         bridge_oligo_col=args.bridge_oligo_col, bridge_count_col=args.bridge_count_col,
         amplicon_left_window=args.amplicon_left_window, amplicon_right_window=args.amplicon_right_window,
-        use_plasmid=args.use_plasmid, bam_suffix=args.bam_suffix,
+        use_plasmid=args.use_plasmid, bam_suffix=args.bam_suffix, min_mapq=args.min_mapq,
     )
 
 

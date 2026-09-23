@@ -34,17 +34,24 @@ the MAGESTIC-SCORE workflow (https://github.com/shli-embl/MAGESTIC-SCORE).
 Python port: Kevin R. Roy (2026), validated for bit-for-bit parity against
 Shengdi's reference ``on_target_precalling.txt`` outputs.
 
-The port reproduces the Perl semantics exactly, including: no FILTER-column
-filtering of the ``.fil.vcf`` (lowQual in-window variants are still bucketed);
-strict ``<`` comparisons; gVCF AD taken as the 2nd FORMAT field with ref depth =
-its first value; the donor-region "combine" reconstruction used to separate
-complete from partial installation.
+The bucketing comparisons and omission of spontaneous low-confidence calls retain
+legacy semantics. Parsing and safety intentionally differ: FORMAT is interpreted by
+name, genotype alleles are selected explicitly, reference blocks require MIN_DP,
+coordinates are inclusive, variants remain structured, missing inputs fail, and final
+output is atomic. FILTER remains unfiltered for compatibility; consumers must choose
+an appropriate called-variant input upstream. These contract repairs do not establish
+biological accuracy of the four-distance decision rule.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import gzip
+import json
 import math
+import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -95,18 +102,59 @@ def load_fasta(path: str) -> Dict[str, str]:
     refs: Dict[str, str] = {}
     name: Optional[str] = None
     chunks: List[str] = []
+    def add_contig():
+        sequence = "".join(chunks).upper()
+        if name in refs or not sequence:
+            raise ValueError(f"duplicate or empty FASTA contig {name!r}")
+        if set(sequence) - set("ACGTRYSWKMBDHVN"):
+            raise ValueError(f"invalid DNA sequence in FASTA contig {name!r}")
+        refs[name] = sequence
     with open(path) as fh:
         for line in fh:
             if line.startswith(">"):
                 if name is not None:
-                    refs[name] = "".join(chunks).upper()
+                    add_contig()
+                if not line[1:].split():
+                    raise ValueError("empty FASTA identifier")
                 name = line[1:].split()[0]
                 chunks = []
             else:
+                if name is None and line.strip():
+                    raise ValueError(f"sequence before first FASTA header: {path}")
                 chunks.append(line.strip())
     if name is not None:
-        refs[name] = "".join(chunks).upper()
+        add_contig()
+    if not refs:
+        raise ValueError(f"empty reference FASTA: {path}")
     return refs
+
+
+def _reference_identity(path: Path) -> tuple:
+    stat = path.stat()
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+@dataclass(frozen=True)
+class LoadedReference:
+    """One immutable-source FASTA load for a cohort sharing that reference."""
+
+    path: Path
+    identity: tuple
+    sequences: Dict[str, str]
+
+    def require_current(self, path: Path) -> Dict[str, str]:
+        if path.resolve() != self.path or _reference_identity(path) != self.identity:
+            raise ValueError("preloaded reference does not match current genome source")
+        return self.sequences
+
+
+def load_reference(path: Path) -> LoadedReference:
+    path = Path(path).resolve()
+    identity = _reference_identity(path)
+    sequences = load_fasta(str(path))
+    if identity != _reference_identity(path):
+        raise ValueError("reference changed while loading")
+    return LoadedReference(path, identity, sequences)
 
 
 # --------------------------------------------------------------------------- #
@@ -154,6 +202,12 @@ def apply_variant(donor_wt: str, pos0: int, ref: str, alt: str) -> str:
 
     Mirrors Perl ``substr($donor_tmp, $pos0, length($ref)) = $alt``.
     """
+    if pos0 < 0 or pos0 + len(ref) > len(donor_wt) or not ref:
+        raise ValueError(f"variant outside donor window: {pos0}, {ref!r}")
+    if donor_wt[pos0:pos0 + len(ref)] != ref:
+        raise ValueError(f"variant REF {ref!r} does not match donor at offset {pos0}")
+    if not alt or set(ref + alt) - set("ACGTN"):
+        raise ValueError(f"unsupported non-sequence allele: {ref!r} -> {alt!r}")
     return donor_wt[:pos0] + alt + donor_wt[pos0 + len(ref) :]
 
 
@@ -164,7 +218,11 @@ def apply_variant(donor_wt: str, pos0: int, ref: str, alt: str) -> str:
 
 @dataclass
 class DonorSpec:
-    """A sample's donor-window specification (one samplesheet row)."""
+    """A sample's donor-window specification (one samplesheet row).
+
+    donor_strand declares the supplied WT/design/empirical sequence orientation
+    relative to the reference. None permits inference only when unambiguous.
+    """
 
     sample: str
     chrom: str
@@ -173,6 +231,7 @@ class DonorSpec:
     donor_wt: str  # as provided (donor strand)
     donor_design: str
     donor_step2: str
+    donor_strand: Optional[str] = None
 
 
 @dataclass
@@ -184,6 +243,7 @@ class SampleOutcome:
     designed_variants: List[str] = field(default_factory=list)
     synthetic_errors: List[str] = field(default_factory=list)
     spontaneous_variants: List[str] = field(default_factory=list)
+    ambiguous_genotypes: List[dict] = field(default_factory=list)
 
     def to_row(self) -> str:
         return "\t".join(
@@ -193,19 +253,42 @@ class SampleOutcome:
                 ",".join(self.designed_variants),
                 ",".join(self.synthetic_errors),
                 ",".join(self.spontaneous_variants),
+                json.dumps(self.ambiguous_genotypes, sort_keys=True, separators=(",", ":")),
             ]
         )
 
 
 def orient_to_genome(spec: DonorSpec, chrom_seq: str) -> DonorSpec:
-    """Flip donors to genome orientation if the wt donor is on the minus strand.
+    """Orient all three donor sequences using explicit or unambiguous strand.
+
+    The input specification is never mutated. A flipped result declares '+'
+    because its sequences are now in reference orientation; the source declaration
+    remains on the original specification and in the input samplesheet.
 
     Raises:
         ValueError: if neither orientation matches the reference window
             (the Perl ``exit 0``\\'s here; we raise so the driver can record it).
     """
-    window = chrom_seq[spec.donor_start - 1 : spec.donor_end]
-    if spec.donor_wt == window:
+    _validate_spec(spec)
+    if spec.donor_end > len(chrom_seq):
+        raise ValueError(f"donor window exceeds reference contig: {spec.sample}")
+    window = chrom_seq[spec.donor_start - 1 : spec.donor_end].upper()
+    plus_matches = spec.donor_wt == window
+    minus_matches = reverse_complement(spec.donor_wt) == window
+    if spec.donor_strand is not None:
+        matches = plus_matches if spec.donor_strand == "+" else minus_matches
+        if not matches:
+            raise ValueError(f"declared donor_strand {spec.donor_strand!r} contradicts reference WT: {spec.sample}")
+        flip = spec.donor_strand == "-"
+    elif plus_matches and minus_matches:
+        if any(seq != reverse_complement(seq) for seq in (spec.donor_design, spec.donor_step2)):
+            raise ValueError(f"donor_strand is required for palindromic WT with asymmetric donor sequence: {spec.sample}")
+        flip = False
+    elif plus_matches or minus_matches:
+        flip = minus_matches
+    else:
+        raise ValueError(f"provided donor sequence doesn't match reference genome: {spec.sample}")
+    if not flip:
         return spec
     flipped = DonorSpec(
         sample=spec.sample,
@@ -215,21 +298,152 @@ def orient_to_genome(spec: DonorSpec, chrom_seq: str) -> DonorSpec:
         donor_wt=reverse_complement(spec.donor_wt),
         donor_design=reverse_complement(spec.donor_design),
         donor_step2=reverse_complement(spec.donor_step2),
+        donor_strand="+",
     )
-    if flipped.donor_wt == window:
-        return flipped
-    raise ValueError(f"provided donor sequence doesn't match reference genome: {spec.sample}")
+    return flipped
+
+
+@dataclass(frozen=True)
+class Variant:
+    """Structured genomic variant; the presentation ID is never parsed back."""
+
+    chrom: str
+    pos: int
+    ref: str
+    alt: str
+    low_confidence: bool = False
+
+    @property
+    def identifier(self) -> str:
+        return ("(LC)" if self.low_confidence else "") + f"{self.chrom}_{self.pos}_{self.ref}_to_{self.alt}"
+
+
+def _vcf_rows(path: Path):
+    """Read a single-sample (or eight-column site-only) VCF by named FORMAT keys."""
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rt") as fh:
+        header_width = None
+        for line_number, line in enumerate(fh, 1):
+            if line.startswith("#CHROM\t"):
+                if header_width is not None:
+                    raise ValueError(f"{path}:{line_number}: repeated VCF header")
+                header = line.rstrip("\r\n").split("\t")
+                header_width = len(header)
+                if (header_width not in (8, 10)
+                        or header[:8] != ["#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO"]
+                        or (header_width == 10 and (header[8] != "FORMAT" or not header[9]))):
+                    raise ValueError(f"{path}:{line_number}: invalid single-sample VCF header")
+            if line.startswith("#") or not line.strip():
+                continue
+            cols = line.rstrip("\r\n").split("\t")
+            if header_width is None or len(cols) != header_width:
+                raise ValueError(f"{path}:{line_number}: missing header or mismatched VCF column count")
+            try:
+                pos = int(cols[1])
+            except ValueError as exc:
+                raise ValueError(f"{path}:{line_number}: invalid VCF POS {cols[1]!r}") from exc
+            if pos < 1 or not cols[0] or not cols[3]:
+                raise ValueError(f"{path}:{line_number}: invalid VCF coordinate or REF")
+            fmt = {}
+            alts = cols[4].upper().split(",")
+            if any(not alt for alt in alts) or len(alts) != len(set(alts)) or ("." in alts and len(alts) > 1):
+                raise ValueError(f"{path}:{line_number}: empty, duplicate, or mixed missing ALT")
+            if len(cols) == 10:
+                keys, values = cols[8].split(":"), cols[9].split(":")
+                if any(not key for key in keys) or len(keys) != len(set(keys)) or len(values) > len(keys):
+                    raise ValueError(f"{path}:{line_number}: invalid FORMAT fields")
+                fmt = dict(zip(keys, values + ["."] * (len(keys) - len(values))))
+                if fmt.get("AD", ".") != ".":
+                    depths = fmt["AD"].split(",")
+                    expected = 1 + (len(alts) if alts != ["."] else 0)
+                    if len(depths) != expected or any(v != "." and (not v.isdigit() or int(v) < 0) for v in depths):
+                        raise ValueError(f"{path}:{line_number}: AD must contain nonnegative depths for REF and every ALT")
+            info = {}
+            for item in cols[7].split(";") if cols[7] != "." else ():
+                parts = item.split("=", 1)
+                if not parts[0] or parts[0] in info:
+                    raise ValueError(f"{path}:{line_number}: duplicate or blank INFO key")
+                info[parts[0]] = parts[1] if len(parts) == 2 else None
+            if "END" in info:
+                try:
+                    end = int(info["END"])
+                except (ValueError, TypeError) as exc:
+                    raise ValueError(f"{path}:{line_number}: END must be an integer") from exc
+                if end < pos:
+                    raise ValueError(f"{path}:{line_number}: END precedes POS")
+            yield cols[0], pos, cols[3].upper(), alts, info, fmt
+        if header_width is None:
+            raise ValueError(f"{path}: no VCF #CHROM header")
+
+
+def _selected_indices(alts: List[str], fmt: dict, *, site_only: bool = False) -> set[int]:
+    """Validate genotype indexing, retaining unresolved selected alternatives."""
+    if "GT" not in fmt:
+        if site_only and len(alts) == 1:
+            indices = {1} if alts != ["."] else set()
+        elif all(a in (".", "<NON_REF>", "<*>") for a in alts):
+            return set()
+        else:
+            raise ValueError("concrete ALT requires GT (or a biallelic site-only VCF)")
+    else:
+        try:
+            indices = {int(a) for a in fmt["GT"].replace("|", "/").split("/") if a != "."}
+        except ValueError as exc:
+            raise ValueError(f"invalid GT {fmt['GT']!r}") from exc
+        if any(i < 0 or i > len(alts) for i in indices):
+            raise ValueError(f"GT allele outside ALT list: {fmt['GT']!r}")
+        indices.discard(0)
+    if any(alts[i - 1] == "." for i in indices):
+        raise ValueError("GT selects missing ALT")
+    return indices
+
+
+def _selected_alts(alts: List[str], fmt: dict, *, site_only: bool = False) -> List[str]:
+    """Return concrete clonal alleles; raw unresolved evidence is recorded separately."""
+    indices = _selected_indices(alts, fmt, site_only=site_only)
+    if _ambiguous_genotype(fmt):
+        return []
+    return [alts[i - 1] for i in sorted(indices) if alts[i - 1] and not set(alts[i - 1]) - set("ACGT")]
+
+
+def _ambiguous_genotype(fmt: dict) -> bool:
+    if "GT" not in fmt:
+        return False
+    values = fmt["GT"].replace("|", "/").split("/")
+    return "." in values or len(set(values)) > 1
 
 
 def _iter_vcf_records(path: Path):
-    """Yield ``(chrom, pos, ref, alt_field)`` for non-header VCF lines."""
-    with open(path) as fh:
-        for line in fh:
-            if line.startswith("#"):
-                continue
-            cols = line.rstrip("\n").split("\t")
-            # chrom, pos, id, ref, alt  (FILTER intentionally ignored, per Perl)
-            yield cols[0], int(cols[1]), cols[3], cols[4]
+    """Yield genotype-selected sequence variants; FILTER remains legacy-compatible."""
+    for chrom, pos, ref, alts, _info, fmt in _vcf_rows(path):
+        for alt in _selected_alts(alts, fmt, site_only=not fmt):
+            yield chrom, pos, ref, alt
+
+
+def _reference_depth(fmt: dict, *, reference_block: bool) -> int:
+    """Conservative reference depth; missing values never imply coverage.
+
+    For hom-reference blocks MIN_DP is a lower bound over the whole END interval.
+    AD/DP apply only to an explicit position; a block lacking MIN_DP cannot prove
+    every interior base covered.
+    """
+    if reference_block:
+        value = fmt.get("MIN_DP", ".")
+    elif "AD" in fmt and fmt["AD"] != ".":
+        value = fmt["AD"].split(",")[0]
+    elif fmt.get("GT", ".").replace("|", "/") in ("0", "0/0"):
+        value = fmt.get("DP", ".")
+    else:
+        value = "."
+    if value in ("", "."):
+        return 0
+    try:
+        depth = int(value)
+    except ValueError as exc:
+        raise ValueError(f"invalid reference depth {value!r}") from exc
+    if depth < 0:
+        raise ValueError(f"negative reference depth {depth}")
+    return depth
 
 
 def precall_sample(
@@ -243,130 +457,158 @@ def precall_sample(
 ) -> SampleOutcome:
     """Pre-call the on-target editing outcome for a single sample.
 
-    Faithful port of ``precalling_target_outcome.pl`` per-sample logic.
+    Classify a donor using genotype-selected alleles and conservative reference coverage.
     """
+    if ne_threshold < 1 or quantification_window_size < 1:
+        raise ValueError("coverage threshold and window size must be positive")
+    if not 0 < quantification_window_cov_perc <= 1:
+        raise ValueError("coverage fraction must be in (0, 1]")
     spec = orient_to_genome(spec, chrom_seq)
-    donor_wt = spec.donor_wt
-    donor_design = spec.donor_design
-    donor_step2 = spec.donor_step2
-    chrom = spec.chrom
+    donor_wt, donor_design, donor_step2 = spec.donor_wt, spec.donor_design, spec.donor_step2
     dstart, dend = spec.donor_start, spec.donor_end
-    offset = dstart - 1
-    wt_len = len(donor_wt)
+    selected: Dict[Tuple[str, int, str, str], Tuple[Variant, str]] = {}
+    called_spans: List[Tuple[int, int]] = []
+    ambiguous: List[dict] = []
+    unresolved = False
 
-    designed: Dict[str, str] = {}
-    synthetic: Dict[str, str] = {}
-    spontaneous: Dict[str, str] = {}
-    called_positions: set = set()  # donor-local 0-based positions called in VCF
+    def note_genotype(chrom, pos, ref, alts, fmt, *, site_only=False, span_end=None):
+        nonlocal unresolved
+        span_end = pos + len(ref) - 1 if span_end is None else span_end
+        if chrom != spec.chrom or pos > dend or span_end < dstart:
+            return
+        if _ambiguous_genotype(fmt):
+            evidence = {"chrom": chrom, "pos": pos, "GT": fmt["GT"]}
+            if evidence not in ambiguous:
+                ambiguous.append(evidence)
+        indices = _selected_indices(alts, fmt, site_only=site_only)
+        if any(not alts[i - 1] or set(alts[i - 1]) - set("ACGT") for i in indices):
+            unresolved = True
+            evidence = {"chrom": chrom, "pos": pos, "GT": fmt.get("GT", "."),
+                        "ALT": ",".join(alts), "reason": "unresolved_allele"}
+            if evidence not in ambiguous:
+                ambiguous.append(evidence)
 
-    # ---- VCF pass (all non-header records; NO FILTER filtering, per Perl) ----
-    for v_chr, v_pos, v_ref, v_alt in _iter_vcf_records(vcf_path):
-        pos0 = v_pos - offset - 1
-        if v_chr != chrom or pos0 < 0 or (pos0 + len(v_ref)) >= wt_len:
+    def add_variant(chrom, pos, ref, alt, *, low_confidence=False):
+        pos0 = pos - dstart
+        if chrom != spec.chrom:
+            return
+        if pos0 < 0 or pos0 + len(ref) > len(donor_wt):
+            if pos <= dend and pos + len(ref) - 1 >= dstart:
+                raise ValueError(f"variant overlaps donor boundary and cannot be represented: {chrom}:{pos}")
+            return
+        key = (chrom, pos, ref, alt)
+        if key in selected:
+            return  # exact duplicate is one observation, not extra support
+        end = pos + len(ref) - 1
+        if low_confidence and any(pos <= hi and end >= lo for lo, hi in called_spans):
+            return
+        for old, _bucket in selected.values():
+            if pos <= old.pos + len(old.ref) - 1 and end >= old.pos:
+                raise ValueError(f"overlapping/conflicting donor alleles: {old.identifier}, {key}")
+        donor_tmp = apply_variant(donor_wt, pos0, ref, alt)
+        bucket, _e2, _e1 = bucket_variant(donor_tmp, donor_wt, donor_design, donor_step2)
+        if not low_confidence:
+            called_spans.append((pos, end))
+        if low_confidence and bucket == SPONTANEOUS:
+            return  # preserve the documented no-spontaneous-LC convention
+        selected[key] = (Variant(chrom, pos, ref, alt, low_confidence), bucket)
+
+    for chrom, pos, ref, alts, info, fmt in _vcf_rows(vcf_path):
+        span_end = max(pos + len(ref) - 1, int(info.get("END", pos)))
+        if chrom != spec.chrom or pos > dend or span_end < dstart:
             continue
-        donor_tmp = apply_variant(donor_wt, pos0, v_ref, v_alt)
-        for k in range(len(v_ref)):
-            called_positions.add(pos0 + k)
-        bucket, e2, e1 = bucket_variant(donor_tmp, donor_wt, donor_design, donor_step2)
-        v_id = f"{v_chr}_{v_pos}_{v_ref}_to_{v_alt}"
-        evidence = f"{e2}->{e1}"
-        if bucket == DESIGNED:
-            designed[v_id] = evidence
-        elif bucket == SYNTHETIC_ERROR:
-            synthetic[v_id] = evidence
-        else:
-            spontaneous[v_id] = evidence
+        chosen = _selected_alts(alts, fmt, site_only=not fmt)
+        note_genotype(chrom, pos, ref, alts, fmt, site_only=not fmt, span_end=span_end)
+        for alt in chosen:
+            add_variant(chrom, pos, ref, alt)
 
-    # ---- gVCF pass: coverage check + less-confident (LC) promotions ----------
-    flag_covered = 0
-    qwin_start = math.ceil(dend - (dend - dstart) / 2 - quantification_window_size / 2)
-    qwin_end = qwin_start + quantification_window_size - 1
-    with open(gvcf_path) as fh:
-        for line in fh:
-            if line.startswith("#"):
+    # The actual clipped donor window supplies the denominator, including short donors.
+    width = min(quantification_window_size, len(donor_wt))
+    qstart = math.ceil((dstart + dend - width) / 2)
+    qend = qstart + width - 1
+    covered: set[int] = set()
+    # Coverage at the donor center cannot establish absence of an edit elsewhere.
+    # Same-length designs have explicit positional differences. A length change
+    # can align in several ways (especially in repeats), so require the entire
+    # donor interval rather than invent a single diagnostic coordinate.
+    diagnostic = ({dstart + i for i, (wt, design) in enumerate(zip(donor_wt, donor_design)) if wt != design}
+                  if len(donor_wt) == len(donor_design) else set(range(dstart, dend + 1)))
+    seen_gvcf = []
+    for chrom, pos, ref, alts, info, fmt in _vcf_rows(gvcf_path):
+        if chrom != spec.chrom:
+            continue
+        if pos + len(ref) - 1 > len(chrom_seq) or chrom_seq[pos - 1:pos - 1 + len(ref)].upper() != ref:
+            raise ValueError(f"gVCF REF does not match reference at {chrom}:{pos}")
+        end = int(info.get("END", pos))
+        if end < pos or end > len(chrom_seq):
+            raise ValueError(f"invalid gVCF END at {chrom}:{pos}: {end}")
+        symbolic = all(a in (".", "<NON_REF>", "<*>") for a in alts)
+        hom_ref = fmt.get("GT", ".").replace("|", "/") in ("0", "0/0")
+        is_block = end > pos and symbolic and hom_ref
+        if end > pos and not symbolic and all(not set(a) - set("ACGTN") for a in alts):
+            raise ValueError(f"END on concrete sequence allele is not a reference block: {chrom}:{pos}")
+        span_end = max(end, pos + len(ref) - 1)
+        if pos <= dend and span_end >= dstart:
+            identity = (pos, span_end, ref, tuple(alts), tuple(sorted(info.items())), tuple(sorted(fmt.items())))
+            if identity in seen_gvcf:
                 continue
-            cols = line.rstrip("\n").split("\t")
-            v_chr, v_pos = cols[0], int(cols[1])
-            v_ref, v_alts = cols[3], cols[4]
-            v_alt = v_alts.split(",")
-            # AD = 2nd FORMAT value; ref depth = first AD entry
-            sample_field = cols[9]
-            info = sample_field.split(":")
-            ref_depth = int(info[1].split(",")[0]) if len(info) > 1 else 0
+            if any(pos <= previous[1] and span_end >= previous[0] for previous in seen_gvcf):
+                raise ValueError(f"overlapping non-identical gVCF records in donor interval: {chrom}:{pos}")
+            seen_gvcf.append(identity)
+        depth = _reference_depth(fmt, reference_block=is_block)
+        if depth >= ne_threshold:
+            coverage_end = end if is_block else pos
+            covered.update(range(max(pos, dstart), min(coverage_end, dend) + 1))
+        for alt in _selected_alts(alts, fmt):
+            add_variant(chrom, pos, ref, alt, low_confidence=True)
+        note_genotype(chrom, pos, ref, alts, fmt, span_end=span_end)
 
-            if v_chr == chrom and ref_depth >= ne_threshold and qwin_start <= v_pos <= qwin_end:
-                flag_covered += 1
+    designed = [v for v, bucket in selected.values() if bucket == DESIGNED]
+    synthetic = [v for v, bucket in selected.values() if bucket == SYNTHETIC_ERROR]
+    spontaneous = [v for v, bucket in selected.values() if bucket == SPONTANEOUS]
 
-            if v_chr != chrom:
-                continue
-            if not (offset + 1 <= v_pos < offset + 1 + wt_len - len(v_ref)):
-                continue
-            if v_alt[0] == "<NON_REF>":
-                continue
+    def reconstruct(variants):
+        result = donor_wt
+        # Descending original-reference coordinates preserve offsets across indels.
+        for variant in sorted(variants, key=lambda v: v.pos, reverse=True):
+            result = apply_variant(result, variant.pos - dstart, variant.ref, variant.alt)
+        return result
 
-            pos0 = v_pos - offset - 1
-            donor_tmp = apply_variant(donor_wt, pos0, v_ref, v_alt[0])
-            bucket, e2, e1 = bucket_variant(donor_tmp, donor_wt, donor_design, donor_step2)
-            already_called = any((pos0 + k) in called_positions for k in range(len(v_ref)))
-            if already_called:
-                continue
-            v_id = f"{v_chr}_{v_pos}_{v_ref}_to_{v_alt[0]}"
-            evidence = f"{e2}->{e1}"
-            if bucket == DESIGNED:
-                designed[f"(LC){v_id}"] = evidence
-            elif bucket == SYNTHETIC_ERROR:
-                synthetic[f"(LC){v_id}"] = evidence
-            # NB: spontaneous LC calls are intentionally NOT recorded (per Perl)
-
-    # ---- combine designed (and designed+spontaneous) to judge installation ---
-    combine = list(donor_wt)
-    combine_all = list(donor_wt)
-    for v_id in designed:
-        sp = v_id.split("_")
-        start_pos = int(sp[1]) - offset - 1
-        ref_len = len(sp[2])
-        for k in range(ref_len):
-            combine[start_pos + k] = ""
-            combine_all[start_pos + k] = ""
-        combine[start_pos] = sp[4]
-        combine_all[start_pos] = sp[4]
-    for v_id in spontaneous:
-        sp = v_id.split("_")
-        start_pos = int(sp[1]) - offset - 1
-        ref_len = len(sp[2])
-        for k in range(ref_len):
-            combine_all[start_pos + k] = ""
-        combine_all[start_pos] = sp[4]
-    donor_region_combine = "".join(combine)
-    donor_region_combine_all = "".join(combine_all)
-
-    if levenshtein(donor_region_combine, donor_design) == 0:
+    combined = reconstruct(designed)
+    combined_all = reconstruct(designed + spontaneous)
+    central_covered = sum(qstart <= pos <= qend for pos in covered)
+    proves_unedited = central_covered >= width * quantification_window_cov_perc and diagnostic <= covered
+    if donor_design == donor_wt:
+        flag = "designed_variant_unedited" if proves_unedited else "unknown"
+    elif combined == donor_design:
         flag = "designed_variant_installed"
-    elif levenshtein(donor_region_combine_all, donor_design) == 0:
+    elif combined_all == donor_design:
         flag = "designed_variant_installed"
-        # designed + spontaneous reconstruct the design: promote spontaneous
-        for k, v in spontaneous.items():
-            designed[k] = v
-        spontaneous = {}
-    elif levenshtein(donor_region_combine, donor_design) < levenshtein(donor_wt, donor_design):
+        designed.extend(spontaneous)
+        spontaneous = []
+    elif levenshtein(combined, donor_design) < levenshtein(donor_wt, donor_design):
         flag = "designed_variant_partially_installed"
-    elif flag_covered >= quantification_window_size * quantification_window_cov_perc:
+    elif proves_unedited:
         flag = "designed_variant_unedited"
     else:
         flag = "unknown"
-
-    editing_outcome = flag
     if synthetic:
-        editing_outcome += ";synthetic_error_installed"
+        flag += ";synthetic_error_installed"
     if spontaneous:
-        editing_outcome += ";spontaneous_mutations"
-
+        flag += ";spontaneous_mutations"
+    if ambiguous:
+        reasons = []
+        if any(e.get("reason") != "unresolved_allele" for e in ambiguous):
+            reasons.append("ambiguous_genotype")
+        if unresolved:
+            reasons.append("unresolved_allele")
+        flag = "unknown;" + ";".join(reasons)
     return SampleOutcome(
-        sample=spec.sample,
-        editing_outcome=editing_outcome,
-        designed_variants=sorted(designed),
-        synthetic_errors=sorted(synthetic),
-        spontaneous_variants=sorted(spontaneous),
+        spec.sample, flag,
+        sorted(v.identifier for v in designed),
+        sorted(v.identifier for v in synthetic),
+        sorted(v.identifier for v in spontaneous),
+        ambiguous,
     )
 
 
@@ -386,27 +628,46 @@ _COL = {
 }
 
 
+def _validate_spec(spec: DonorSpec) -> None:
+    if spec.donor_strand not in (None, "+", "-"):
+        raise ValueError(f"donor_strand must be '+' or '-' when supplied: {spec.sample}")
+    if not spec.sample or not spec.chrom or any(c in spec.sample for c in "/\\\t\n\r"):
+        raise ValueError("sample and contig names must be nonempty; sample must be a safe filename")
+    if spec.sample in (".", "..") or spec.donor_start < 1 or spec.donor_end < spec.donor_start:
+        raise ValueError(f"invalid donor coordinates or sample: {spec.sample}")
+    if len(spec.donor_wt) != spec.donor_end - spec.donor_start + 1:
+        raise ValueError(f"wt_seq length differs from 1-based inclusive donor window: {spec.sample}")
+    for label, value in (("wt_seq", spec.donor_wt), ("design_donor", spec.donor_design),
+                         ("synthetic_donor", spec.donor_step2)):
+        if not value or set(value) - set("ACGTN"):
+            raise ValueError(f"invalid {label} DNA for {spec.sample}")
+
+
 def read_samplesheet(path: Path) -> List[DonorSpec]:
-    """Read a tab-separated samplesheet (with header) into :class:`DonorSpec`\\ s."""
+    """Read and validate a unique-sample, 1-based inclusive donor samplesheet."""
     specs: List[DonorSpec] = []
-    with open(path) as fh:
-        header = fh.readline().rstrip("\n").split("\t")
-        idx = {name: header.index(col) for name, col in _COL.items()}
-        for line in fh:
-            if not line.strip():
-                continue
-            c = line.rstrip("\n").split("\t")
-            specs.append(
-                DonorSpec(
-                    sample=c[idx["sample"]],
-                    chrom=c[idx["chrom"]],
-                    donor_start=int(c[idx["donor_start"]]),
-                    donor_end=int(c[idx["donor_end"]]),
-                    donor_wt=c[idx["donor_wt"]].upper(),
-                    donor_design=c[idx["donor_design"]].upper(),
-                    donor_step2=c[idx["donor_step2"]].upper(),
-                )
-            )
+    seen = set()
+    with open(path, newline="") as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        header = reader.fieldnames or []
+        if len(header) != len(set(header)) or set(_COL.values()) - set(header):
+            raise ValueError(f"{path}: missing or duplicate samplesheet columns")
+        for row in reader:
+            if None in row or any(value is None for value in row.values()):
+                raise ValueError(f"{path}:{reader.line_num}: malformed samplesheet row")
+            fields = {key: row[col].strip() for key, col in _COL.items()}
+            spec = DonorSpec(fields["sample"], fields["chrom"],
+                             int(fields["donor_start"]), int(fields["donor_end"]),
+                             fields["donor_wt"].upper(), fields["donor_design"].upper(),
+                             fields["donor_step2"].upper(),
+                             row.get("donor_strand", "").strip() or None)
+            _validate_spec(spec)
+            if spec.sample in seen:
+                raise ValueError(f"{path}: duplicate sample {spec.sample!r}")
+            seen.add(spec.sample)
+            specs.append(spec)
+    if not specs:
+        raise ValueError(f"{path}: samplesheet contains no samples")
     return specs
 
 
@@ -419,6 +680,8 @@ def precall(
     quantification_window_size: int = 10,
     quantification_window_cov_perc: float = 1.0,
     samples: Optional[set] = None,
+    *,
+    loaded_reference: Optional[LoadedReference] = None,
 ) -> List[SampleOutcome]:
     """Run pre-calling over a samplesheet; write the Shengdi-format summary.
 
@@ -426,32 +689,47 @@ def precall(
     If ``samples`` is given, only those sample names are processed (for parity
     subsets).
     """
-    refs = load_fasta(str(genome))
+    refs = loaded_reference.require_current(genome) if loaded_reference is not None else load_fasta(str(genome))
     specs = read_samplesheet(samplesheet)
+    if samples is not None:
+        absent = set(samples) - {spec.sample for spec in specs}
+        if absent:
+            raise ValueError(f"requested samples absent from samplesheet: {sorted(absent)}")
+        specs = [spec for spec in specs if spec.sample in samples]
+    if not specs:
+        raise ValueError("no samples selected for precall")
+    missing = [str(workdir / subdir / f"{spec.sample}{suffix}")
+               for spec in specs for subdir, suffix in (("vcf", ".fil.vcf"), ("gvcf", ".g.vcf"))
+               if not (workdir / subdir / f"{spec.sample}{suffix}").is_file()]
+    if missing:
+        raise FileNotFoundError("precall missing required input(s): " + ", ".join(missing))
+    for spec in specs:
+        if spec.chrom not in refs:
+            raise ValueError(f"sample {spec.sample}: donor contig {spec.chrom!r} absent from reference")
+        orient_to_genome(spec, refs[spec.chrom])
     results: List[SampleOutcome] = []
-    with open(out, "w") as oh:
-        oh.write(
-            "#sample_name\tediting_outcome\tdesigned_variants\t"
-            "synthetic_errors\tspontaneous_variants\n"
-        )
-        for spec in specs:
-            if samples is not None and spec.sample not in samples:
-                continue
-            vcf_path = workdir / "vcf" / f"{spec.sample}.fil.vcf"
-            gvcf_path = workdir / "gvcf" / f"{spec.sample}.g.vcf"
-            if not vcf_path.exists() or not gvcf_path.exists():
-                continue
-            outcome = precall_sample(
-                spec,
-                vcf_path,
-                gvcf_path,
-                refs[spec.chrom],
-                ne_threshold=ne_threshold,
-                quantification_window_size=quantification_window_size,
-                quantification_window_cov_perc=quantification_window_cov_perc,
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=out.name + ".", suffix=".tmp", dir=out.parent)
+    try:
+        with os.fdopen(fd, "w") as oh:
+            oh.write(
+                "#sample_name\tediting_outcome\tdesigned_variants\t"
+                "synthetic_errors\tspontaneous_variants\tambiguous_genotypes\n"
             )
-            results.append(outcome)
-            oh.write(outcome.to_row() + "\n")
+            for spec in specs:
+                outcome = precall_sample(
+                    spec, workdir / "vcf" / f"{spec.sample}.fil.vcf",
+                    workdir / "gvcf" / f"{spec.sample}.g.vcf", refs[spec.chrom],
+                    ne_threshold=ne_threshold,
+                    quantification_window_size=quantification_window_size,
+                    quantification_window_cov_perc=quantification_window_cov_perc,
+                )
+                results.append(outcome)
+                oh.write(outcome.to_row() + "\n")
+        os.replace(temporary, out)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
     return results
 
 

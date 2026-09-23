@@ -3,16 +3,18 @@ trace_crispr.wgs.sv_plasmid
 ===========================
 
 Structural-variant (SV) and plasmid-integration detection on a **combined-
-reference** coordinate-sorted BAM of pooled MAGESTIC WGS data.
+reference** coordinate-sorted BAM of single-sample MAGESTIC WGS data.
 
 The combined reference is the genome **plus** per-oligo ``plasmid_{oligo}`` and
 ``integrated_plasmid_{oligo}`` contigs (see :func:`build_integrated_plasmid_contig`).
 On that reference this module does three complementary things at each target
 (donor) window:
 
-* **Half B — donor-read filter + chimeric/translocation SV** (the heart):
-  :func:`clean_donor_reads` reproduces Shengdi Li's ``clean_donor_reads.pl``
-  bit-for-bit. It partitions the read pairs overlapping the donor window into
+* **Half B — donor-read filter + chimeric/translocation evidence**:
+  :func:`clean_donor_reads` derives from Shengdi Li's ``clean_donor_reads.pl``.
+  Standard mode corrects coordinate, filtering and category ambiguities; explicit
+  ``dup_mode="parity"`` retains historical counting semantics. It partitions
+  read pairs overlapping the donor window into
   *genome* (real target reads), *plasmid* (donor-template / intact-plasmid reads
   that must be discarded before variant calling) and *chimeric* (potential
   REDI-barcode-locus → target translocations), writes the per-sample
@@ -21,8 +23,8 @@ On that reference this module does three complementary things at each target
 
 * **Half A — plasmid-integration detection** (Kevin R. Roy): :func:`detect_plasmid_integration`
   counts primary reads that span the genome↔integration junctions of each
-  ``integrated_plasmid_{oligo}`` contig — direct evidence that the whole plasmid
-  integrated at the cut site rather than being resolved as a clean edit.
+  ``integrated_plasmid_{oligo}`` contig. These are candidate integration-support
+  counts; junction reads alone do not establish complete plasmid integration.
 
 * **Half C — mate-geometry large deletion** (Kevin R. Roy):
   :func:`one_read_inside_large_deletion` flags read pairs whose fragment span
@@ -40,11 +42,11 @@ reference builder are ports of **Kevin R. Roy**'s
 ``construct_circular_and_integrated_plasmid_fasta.py`` /
 ``pysam_helper_functions.combine_aligned_segments_and_metrics``.
 
-Parity fidelity (Half B)
+Historical parity (Half B, explicit ``dup_mode="parity"`` only)
 ------------------------
-Validated bit-for-bit against Shengdi's reference ``*.target_filtering.anno``
-outputs. The port reproduces the Perl semantics **exactly**, including several
-deliberate quirks that matter for parity:
+The parity path preserves the Perl semantics below for replication. Production
+standard mode uses reference-validated blacklist coordinates, primary/QC/MAPQ
+filters, aligned-base overlap and mutually exclusive fragment categories instead.
 
 * read reference span is **M+D only** (``length_CIGAR``); ``N``/``I``/``S``/``H``
   do not extend it (see :func:`ref_span_md`), unlike pysam ``reference_end``;
@@ -64,11 +66,15 @@ deliberate quirks that matter for parity:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple, TypedDict, Union
+from contextlib import contextmanager
+from typing import Dict, Hashable, Iterable, Iterator, List, NamedTuple, Optional, Sequence, Set, Tuple, TypedDict, Union
 
 from ..core.cigar import get_deletions_from_cigar
 
@@ -199,21 +205,32 @@ def _coerce_int(token: str) -> int:
         return 0
 
 
-def load_blacklist(path: str) -> Blacklist:
+def load_blacklist(path: str, mode: str = "standard") -> Blacklist:
     """Load ``REDI_reads_mapped_regions.txt`` into ``{chrom: [(start, end), ...]}``.
 
-    Rows are ``chrom<TAB>start<TAB>end`` with an optional trailing label column
-    (ignored, as in the Perl). Parsing is intentionally permissive to match
-    Shengdi's ``split("\\t")`` exactly, including the file's one inert
-    space-delimited row (see :func:`_coerce_int`).
+    Standard mode requires tab-separated, 1-based inclusive intervals. Historical
+    permissive Perl parsing is available only with ``mode="parity"``.
     """
+    if mode not in ("standard", "parity"):
+        raise ValueError(f"unknown blacklist mode {mode!r}")
     bl: Blacklist = {}
     with open(path) as fh:
-        for line in fh:
+        for line_number, line in enumerate(fh, 1):
             line = line.rstrip("\n")
             if not line:
                 continue
             cols = line.split("\t")
+            if mode == "standard":
+                if len(cols) < 3 or not cols[0].strip():
+                    raise ValueError(f"{path}:{line_number}: expected chrom<TAB>start<TAB>end")
+                try:
+                    start, end = int(cols[1]), int(cols[2])
+                except ValueError as exc:
+                    raise ValueError(f"{path}:{line_number}: non-integer blacklist interval") from exc
+                if start < 1 or end < start:
+                    raise ValueError(f"{path}:{line_number}: invalid 1-based blacklist interval")
+                bl.setdefault(cols[0], []).append((start, end))
+                continue
             chrom = cols[0]
             start = _coerce_int(cols[1]) if len(cols) > 1 else 0
             end = _coerce_int(cols[2]) if len(cols) > 2 else 0
@@ -239,7 +256,8 @@ class SamRecord:
     """The SAM columns Half B needs, parsed exactly as the Perl ``split("\\t")``.
 
     ``pos``/``pnext`` are 1-based (SAM ``POS``/``PNEXT`` verbatim); ``rnext`` keeps
-    the literal ``=`` used for a same-reference mate.
+    the literal ``=`` used for a same-reference mate. ``rg`` is the ``RG:Z`` read
+    group, or ``""`` when the record declares none (Stage4's missing-RG namespace).
     """
 
     qname: str
@@ -250,11 +268,29 @@ class SamRecord:
     rnext: str
     pnext: int
     tlen: int
+    mapq: int = 60
+    rg: str = ""
 
 
 def parse_sam_line(line: str) -> SamRecord:
-    """Parse one alignment line of ``samtools view`` output into a :class:`SamRecord`."""
+    """Parse one alignment line of ``samtools view`` output into a :class:`SamRecord`.
+
+    The read group is part of fragment identity, so a record with more than one
+    ``RG`` tag, a non-``Z`` type or an empty ID is rejected rather than resolved
+    by picking one. This applies in parity mode too: such a line is invalid SAM.
+    """
     c = line.rstrip("\n").split("\t")
+    if len(c) < 11:
+        raise ValueError("SAM alignment must have at least 11 tab-separated columns")
+    tags = [f for f in c[11:] if f.startswith("RG:")]
+    rg = ""
+    if len(tags) > 1:
+        raise ValueError(f"alignment {c[0]!r} declares {len(tags)} RG read-group tags; exactly one or none is allowed")
+    if tags:
+        parts = tags[0].split(":", 2)
+        if len(parts) != 3 or parts[1] != "Z" or not parts[2]:
+            raise ValueError(f"alignment {c[0]!r} has a malformed RG read-group tag {tags[0]!r}; expected RG:Z:<id>")
+        rg = parts[2]
     return SamRecord(
         qname=c[0],
         flag=int(c[1]),
@@ -264,22 +300,50 @@ def parse_sam_line(line: str) -> SamRecord:
         rnext=c[6],
         pnext=int(c[7]),
         tlen=int(c[8]),
+        mapq=int(c[4]),
+        rg=rg,
     )
+
+
+class FragmentKey(NamedTuple):
+    """Standard-mode Half B fragment identity, the same namespace Stage4 counts.
+
+    A paired fragment is ``(read_group, qname)`` with ``record=None``, so both
+    mates and their supplementary records share one disposition; mate number is
+    deliberately not part of it. An unpaired alignment is its own observation, so
+    ``record`` holds its ``(rname, pos, cigar, reverse)``: a rejected single read
+    cannot remove a valid same-name pair, or an unrelated same-name record.
+    """
+
+    read_group: str
+    qname: str
+    record: Optional[Tuple[str, int, str, bool]] = None
+
+
+def fragment_key(rec: SamRecord) -> FragmentKey:
+    """The :class:`FragmentKey` of one record (standard mode, both BAM passes)."""
+    if rec.flag & 0x1:
+        return FragmentKey(rec.rg, rec.qname)
+    return FragmentKey(rec.rg, rec.qname, (rec.rname, rec.pos, rec.cigar, bool(rec.flag & 0x10)))
 
 
 @dataclass
 class CleanResult:
-    """Outcome of classifying a sample's donor-overlapping reads (Half B pass 1)."""
+    """Outcome of classifying a sample's donor-overlapping reads (Half B pass 1).
 
-    overlapped: Set[str] = field(default_factory=set)
-    discarded: Set[str] = field(default_factory=set)
-    included: Set[str] = field(default_factory=set)
-    redi_translocation: Set[str] = field(default_factory=set)
-    flag: Dict[str, int] = field(default_factory=dict)
+    Set members identify fragments: bare query names in explicit parity mode
+    (the historical QNAME-only namespace) and :class:`FragmentKey` in standard mode.
+    """
+
+    overlapped: Set[Hashable] = field(default_factory=set)
+    discarded: Set[Hashable] = field(default_factory=set)
+    included: Set[Hashable] = field(default_factory=set)
+    redi_translocation: Set[Hashable] = field(default_factory=set)
+    flag: Dict[Hashable, int] = field(default_factory=dict)
     variant_cov: int = 0
-    unique_genome: Set[str] = field(default_factory=set)
-    unique_plasmid: Set[str] = field(default_factory=set)
-    unique_chimeric: Set[str] = field(default_factory=set)
+    unique_genome: Set[Hashable] = field(default_factory=set)
+    unique_plasmid: Set[Hashable] = field(default_factory=set)
+    unique_chimeric: Set[Hashable] = field(default_factory=set)
 
     @property
     def frags_genome(self) -> int:
@@ -304,7 +368,7 @@ class CleanResult:
 ANNO_HEADER = "read_count_mid_point\tfrags_genome\tfrags_plasmid\tfrags_chimeric"
 
 
-def classify_donor_reads(
+def _classify_donor_reads_parity(
     records: Iterable[SamRecord],
     chrom: str,
     donor_start: int,
@@ -393,6 +457,120 @@ def classify_donor_reads(
     return res
 
 
+def _cigar_blocks(pos: int, cigar: str) -> tuple[list[tuple[int, int]], int, bool, bool]:
+    """Aligned 1-based inclusive blocks, inclusive end, terminal soft clips.
+
+    D/N advance the reference but never contribute aligned-base coverage. =/X
+    have the same coordinate semantics as M. H/P may surround terminal S.
+    """
+    if cigar == "*":
+        return [], pos - 1, False, False
+    parts = re.findall(r"(\d+)([MIDNSHP=X])", cigar)
+    if not parts or "".join(n + op for n, op in parts) != cigar or any(int(n) <= 0 for n, _ in parts):
+        raise ValueError(f"invalid CIGAR {cigar!r}")
+    blocks: list[tuple[int, int]] = []
+    cursor = pos
+    for n, op in parts:
+        size = int(n)
+        if op in "M=X":
+            blocks.append((cursor, cursor + size - 1))
+        if op in "MDN=X":
+            cursor += size
+    terminal = [op for _, op in parts if op not in "HP"]
+    return blocks, cursor - 1, terminal[0] == "S", terminal[-1] == "S"
+
+
+def _primary_sam(rec: SamRecord, min_mapq: int) -> bool:
+    return not (rec.flag & (0x4 | 0x100 | 0x200 | 0x800)) and min_mapq <= rec.mapq < 255
+
+
+def classify_donor_reads(
+    records: Iterable[SamRecord], chrom: str, donor_start: int, donor_end: int,
+    blacklist: Blacklist, flexible_bases: int = FLEXIBLE_BASES,
+    dup_mode: str = "standard", min_mapq: int = 20,
+) -> CleanResult:
+    """Classify donor-overlapping alignments, with explicit historical parity.
+
+    Standard mode uses aligned-base overlap, primary/QC/MAPQ gates and valid
+    mapped-mate coordinates. Fragment categories are exclusive: donor-template
+    discard takes precedence over chimeric, then genome. Midpoint coverage counts
+    qualifying retained genome alignment records, not D/N spans or molecules.
+    MAPQ 20 is a conservative policy default, not a calibrated accuracy threshold.
+    Standard fragments are :class:`FragmentKey` values, the (RG, QNAME) pairing
+    Stage4 uses, so a disposition in one read group never reaches another.
+    """
+    if (any(type(value) is not int for value in (donor_start, donor_end, flexible_bases, min_mapq))
+            or donor_start < 1 or donor_end < donor_start or flexible_bases < 0 or not 0 <= min_mapq <= 254):
+        raise ValueError("invalid donor interval, flexible bases or MAPQ threshold")
+    if dup_mode == "parity":
+        return _classify_donor_reads_parity(records, chrom, donor_start, donor_end, blacklist, flexible_bases, dup_mode)
+    if dup_mode != "standard":
+        raise ValueError(f"unknown duplicate mode {dup_mode!r}")
+    res = CleanResult()
+    midpoint = (donor_start + donor_end) / 2
+    coverage: Dict[FragmentKey, int] = {}
+    for rec in records:
+        if rec.rname != chrom or rec.pos < 1:
+            continue
+        blocks, read_end, leading_soft, trailing_soft = _cigar_blocks(rec.pos, rec.cigar)
+        if not any(_is_overlapped(donor_start, donor_end, left, right) for left, right in blocks):
+            continue
+        # Non-primary records cannot override the disposition of a valid pair.
+        if rec.flag & (0x4 | 0x100 | 0x800):
+            continue
+        if not rec.qname or rec.qname == "*":
+            raise ValueError("a donor-overlapping primary alignment needs a query name to identify its fragment")
+        key = fragment_key(rec)
+        if not _primary_sam(rec, min_mapq):
+            res.overlapped.add(key)
+            res.discarded.add(key)
+            continue
+        res.overlapped.add(key)
+        res.flag[key] = rec.flag
+        duplicate = decode_duplicate(rec.flag)
+        if (not rec.flag & 0x1 or rec.flag & 0x8 or rec.rnext == "*" or rec.pnext < 1
+                or bool(rec.flag & 0x40) == bool(rec.flag & 0x80)
+                or (rec.rnext in ("=", rec.rname) and rec.tlen == 0)):
+            res.discarded.add(key)
+            continue
+        near = rec.rnext in ("=", rec.rname) and 0 < abs(rec.tlen) < 1000
+        if near:
+            frag_start = min(rec.pos, rec.pnext)
+            frag_end = frag_start + abs(rec.tlen) - 1
+            # TLEN must actually contain the represented read and mate start.
+            if frag_end < max(read_end, rec.pnext):
+                res.discarded.add(key)
+                continue
+            template = _is_contained(frag_start, frag_end, donor_start - flexible_bases, donor_end + flexible_bases)
+            chimeric = ((leading_soft and abs(rec.pos - donor_start) <= flexible_bases)
+                        or (trailing_soft and abs(read_end - donor_end) <= flexible_bases))
+        else:
+            mate_chr = rec.rname if rec.rnext == "=" else rec.rnext
+            cassette_mate = any(start <= rec.pnext <= end for start, end in blacklist.get(mate_chr, ()))
+            template = cassette_mate and _is_contained(rec.pos, read_end, donor_start - flexible_bases, donor_end + flexible_bases)
+            chimeric = cassette_mate and not template
+        if template:
+            res.discarded.add(key)
+            if not duplicate:
+                res.unique_plasmid.add(key)
+        else:
+            res.included.add(key)
+            if chimeric:
+                res.redi_translocation.add(key)
+                if not duplicate:
+                    res.unique_chimeric.add(key)
+            elif not duplicate:
+                res.unique_genome.add(key)
+                if any(left <= midpoint <= right for left, right in blocks):
+                    coverage[key] = coverage.get(key, 0) + 1
+    res.included -= res.discarded
+    res.redi_translocation -= res.discarded
+    res.unique_chimeric -= res.discarded
+    res.unique_genome -= res.discarded | res.unique_chimeric
+    res.variant_cov = sum(coverage.get(key, 0) for key in res.unique_genome)
+    return res
+
+
 def _iter_sam(bam_path: str, samtools: str = "samtools") -> Iterator[str]:
     """Yield SAM lines (incl. ``@`` header) from ``samtools view -h <bam>``.
 
@@ -403,7 +581,7 @@ def _iter_sam(bam_path: str, samtools: str = "samtools") -> Iterator[str]:
     ``GeneratorExit`` and skips the check (no spurious error on a broken pipe).
     """
     proc = subprocess.Popen(
-        [samtools, "view", "-h", bam_path],
+        [samtools, "view", "--no-PG", "-h", bam_path],
         stdout=subprocess.PIPE,
         text=True,
     )
@@ -426,7 +604,86 @@ def write_anno(result: CleanResult, path: str) -> None:
         oh.write(result.anno_row() + "\n")
 
 
+_REFERENCE_SIGNATURES: Dict[tuple, Dict[str, tuple[int, str]]] = {}
+
+
+def _reference_signature(path: str) -> Dict[str, tuple[int, str]]:
+    """Sequence identity by named contig, cached across samples of one cohort."""
+    import pysam
+    stat, fai = os.stat(path), os.stat(path + ".fai")
+    key = (os.path.realpath(path), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns,
+           fai.st_size, fai.st_mtime_ns, fai.st_ctime_ns)
+    if key not in _REFERENCE_SIGNATURES:
+        result = {}
+        with pysam.FastaFile(path) as fasta:
+            for contig, length in zip(fasta.references, fasta.lengths):
+                digest = hashlib.sha256()
+                for start in range(0, length, 1048576):
+                    digest.update(fasta.fetch(contig, start, min(length, start + 1048576)).upper().encode("ascii"))
+                result[contig] = (length, digest.hexdigest())
+        _REFERENCE_SIGNATURES[key] = result
+    return _REFERENCE_SIGNATURES[key]
+
+
+def bam_index_suffix(reference_lengths: Iterable[int]) -> str:
+    """BAI for ordinary contigs, CSI when a reference reaches BAI's 2^29 limit."""
+    return ".csi" if any(length >= (1 << 29) for length in reference_lengths) else ".bai"
+
+
+def _remove_bam_indexes(path: str) -> None:
+    """Remove every htslib-discoverable old index when replacing its BAM."""
+    for prefix in (path, os.path.splitext(path)[0]):
+        for suffix in (".bai", ".csi"):
+            try:
+                os.unlink(prefix + suffix)
+            except FileNotFoundError:
+                pass
+
+
+@contextmanager
+def output_lock(path: str):
+    """Serialize writers of one output bundle using a persistent advisory lock.
+
+    Lock files are intentionally retained: unlinking a released lock can let an
+    existing waiter and a new caller lock different inodes. A process exit releases
+    the OS lock automatically; file existence does not indicate an active writer.
+    All writers must honor this protocol. Supported execution hosts are POSIX.
+    """
+    import fcntl
+    parent = os.path.realpath(os.path.dirname(os.path.abspath(path)))
+    os.makedirs(parent, exist_ok=True)
+    lock_path = os.path.join(parent, os.path.basename(path) + ".lock")
+    with open(lock_path, "a") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def clean_donor_reads(
+    in_bam: str, out_bam: str, chrom: str, donor_start: int, donor_end: int,
+    blacklist_path: str, flexible_bases: int = FLEXIBLE_BASES,
+    dup_mode: str = "standard", samtools: str = "samtools", min_mapq: int = 20,
+    reference_path: Optional[str] = None, blacklist_reference: Optional[str] = None,
+) -> CleanResult:
+    """Publish a filtered, indexed full BAM and fragment annotation under one lock.
+
+    Standard mode requires identical declared sample/blacklist reference sequences.
+    Filtering preserves coordinate order and original headers. Conversion, indexing
+    and validation complete before publication; concurrent callers for the same
+    output wait for the current generation. Explicit ``dup_mode="parity"`` retains
+    historical counting semantics. The annotation describes retained genome,
+    discarded donor-template and candidate chimeric fragments at one donor window.
+    """
+    with output_lock(out_bam):
+        return _clean_donor_reads_unlocked(
+            in_bam, out_bam, chrom, donor_start, donor_end, blacklist_path,
+            flexible_bases, dup_mode, samtools, min_mapq, reference_path, blacklist_reference,
+        )
+
+
+def _clean_donor_reads_unlocked(
     in_bam: str,
     out_bam: str,
     chrom: str,
@@ -436,6 +693,9 @@ def clean_donor_reads(
     flexible_bases: int = FLEXIBLE_BASES,
     dup_mode: str = "standard",
     samtools: str = "samtools",
+    min_mapq: int = 20,
+    reference_path: Optional[str] = None,
+    blacklist_reference: Optional[str] = None,
 ) -> CleanResult:
     """Filter donor/plasmid/unresolved reads from a target site (Half B driver).
 
@@ -446,38 +706,103 @@ def clean_donor_reads(
     2. write ``out_bam`` keeping all non-target reads plus the donor-overlapping
        reads that were *included* and not *discarded* (**discard beats include**).
 
-    Cleaned-BAM membership is independent of ``dup_mode``; only the ``.anno``
-    fragment counts depend on it (use ``dup_mode="parity"`` to reproduce Shengdi's
-    reference counts).
+    Standard mode additionally requires ``reference_path`` and
+    ``blacklist_reference`` to have identical named-contig sequences. An explicitly
+    declared renamed FASTA is accepted; coordinates are never lifted by name.
+    Mode affects both evidence eligibility and cleaned-BAM membership. The
+    BAM, index and annotation are published only after conversion and indexing
+    succeed. Input coordinate order is preserved; an unindexable unsorted input
+    fails rather than becoming a success-looking cleaned artifact. Parity is for historical
+    replication and is not the production filtering policy.
 
     Returns the :class:`CleanResult` from pass 1.
     """
-    blacklist = load_blacklist(blacklist_path)
+    import pysam
 
-    records = (parse_sam_line(ln) for ln in _iter_sam(in_bam, samtools) if not ln.startswith("@"))
-    result = classify_donor_reads(
-        records, chrom, donor_start, donor_end, blacklist, flexible_bases, dup_mode
-    )
-    write_anno(result, out_bam + ".target_filtering.anno")
+    if shutil.which(samtools) is None:
+        raise FileNotFoundError(f"samtools executable not found: {samtools}")
+    if os.path.realpath(in_bam) == os.path.realpath(out_bam):
+        raise ValueError("cleaned BAM must differ from input BAM")
+    blacklist = load_blacklist(blacklist_path, mode=dup_mode)
+    with pysam.AlignmentFile(in_bam, "rb") as bam:
+        lengths = dict(zip(bam.references, bam.lengths))
+    if chrom not in lengths or not 1 <= donor_start <= donor_end <= lengths[chrom]:
+        raise ValueError(f"donor interval is absent or outside BAM reference: {chrom}:{donor_start}-{donor_end}")
+    if dup_mode != "parity":
+        if reference_path is None or blacklist_reference is None:
+            raise ValueError("standard donor cleaning requires reference_path and blacklist_reference provenance")
+        reference_signature = _reference_signature(reference_path)
+        if {ref: signature[0] for ref, signature in reference_signature.items()} != lengths:
+            raise ValueError("BAM and supplied reference contig dictionaries disagree")
+        if reference_signature != _reference_signature(blacklist_reference):
+            raise ValueError("blacklist reference sequence identity differs from sample reference; coordinate lifting is required")
+        if not blacklist:
+            raise ValueError("blacklist contains no reference intervals")
+        for ref, intervals in blacklist.items():
+            if ref not in lengths or any(end > lengths[ref] for _, end in intervals):
+                raise ValueError(f"blacklist interval absent or outside BAM reference: {ref}")
 
-    tmp_sam = out_bam + ".tmp.sam"
-    with open(tmp_sam, "w") as out:
-        for ln in _iter_sam(in_bam, samtools):
-            if ln.startswith("@"):
-                out.write(ln)
+    def records():
+        for line in _iter_sam(in_bam, samtools):
+            if line.startswith("@"):
                 continue
-            name = ln.split("\t", 1)[0]
-            if name in result.overlapped:
-                if name in result.discarded:
+            rec = parse_sam_line(line)
+            mate_chr = rec.rname if rec.rnext == "=" else rec.rnext
+            if dup_mode != "parity" and (mate_chr not in lengths or rec.pnext > lengths[mate_chr]):
+                rec.flag |= 0x8
+            yield rec
+
+    result = classify_donor_reads(records(), chrom, donor_start, donor_end, blacklist, flexible_bases, dup_mode, min_mapq)
+    # Pass 2 must look records up in the namespace pass 1 recorded them under.
+    # The bare-name prefilter only skips building a key for untouched records.
+    if dup_mode == "parity":
+        identity = lambda rec: rec.qname  # noqa: E731 - historical QNAME-only namespace
+        touched_names = result.overlapped
+    else:
+        identity = fragment_key
+        touched_names = {key.qname for key in result.overlapped}
+    parent = os.path.dirname(os.path.abspath(out_bam))
+    os.makedirs(parent, exist_ok=True)
+    # Publish only after both samtools passes, conversion and BAM validation have
+    # succeeded. A failed subprocess cannot leave a success-looking .anno file.
+    with tempfile.TemporaryDirectory(prefix=".donor_clean_", dir=parent) as tmp:
+        tmp_sam = os.path.join(tmp, "clean.sam")
+        tmp_bam = os.path.join(tmp, "clean.bam")
+        tmp_anno = os.path.join(tmp, "clean.anno")
+        index_suffix = bam_index_suffix(lengths.values())
+        tmp_index = tmp_bam + index_suffix
+        with open(tmp_sam, "w") as out:
+            for line in _iter_sam(in_bam, samtools):
+                if line.startswith("@"):
+                    out.write(line)
                     continue
-                if name in result.included:
-                    out.write(ln)
-                # else: unknown / unresolved → drop
-            else:
-                out.write(ln)
-    with open(out_bam, "wb") as out_fh:
-        subprocess.run([samtools, "view", "-bS", tmp_sam], stdout=out_fh, check=True)
-    os.remove(tmp_sam)
+                rec = parse_sam_line(line)
+                if dup_mode != "parity" and rec.rname == chrom and rec.pos > 0:
+                    blocks, _, _, _ = _cigar_blocks(rec.pos, rec.cigar)
+                    at_target = any(_is_overlapped(donor_start, donor_end, left, right) for left, right in blocks)
+                    if at_target and not _primary_sam(rec, min_mapq):
+                        continue
+                if rec.qname not in touched_names:
+                    out.write(line)
+                    continue
+                key = identity(rec)
+                if key not in result.overlapped or (key in result.included and key not in result.discarded):
+                    out.write(line)
+        with open(tmp_bam, "wb") as out_fh:
+            # Temporary paths must not become nondeterministic @PG header data.
+            # The stage cache/provenance records filtering inputs and source.
+            subprocess.run([samtools, "view", "--no-PG", "-bS", tmp_sam], stdout=out_fh, check=True)
+        with pysam.AlignmentFile(tmp_bam, "rb") as checked:
+            for _ in checked:
+                pass
+        pysam.index(*(("-c", tmp_bam) if index_suffix == ".csi" else (tmp_bam,)))
+        with pysam.AlignmentFile(tmp_bam, "rb") as checked:
+            checked.check_index()
+        write_anno(result, tmp_anno)
+        _remove_bam_indexes(out_bam)
+        os.replace(tmp_bam, out_bam)
+        os.replace(tmp_index, out_bam + index_suffix)
+        os.replace(tmp_anno, out_bam + ".target_filtering.anno")
     return result
 
 
@@ -493,52 +818,66 @@ def _integrated_contigs(references: Sequence[str]) -> List[str]:
 def detect_plasmid_integration(
     bam_path: str,
     integrated_contigs: Optional[Sequence[str]] = None,
-    junction_distance: Union[int, Dict[str, int]] = 1129,
+    junction_distance: Optional[Union[int, Dict[str, int]]] = None,
     window: int = 200,
+    min_mapq: int = 20,
+    min_anchor: int = 1,
 ) -> Dict[str, int]:
     """Count primary reads spanning the genome↔integration junctions of a sample.
 
-    Faithful port of Kevin R. Roy's ``screen_bam_for_plasmid_integration.py``. For
-    each ``integrated_plasmid_{oligo}`` contig, primary reads (not unmapped,
-    secondary or supplementary; **no** dedup, **no** ``NM`` filter) whose alignment
-    spans the upstream junction (at ``junction_distance``) or the downstream
-    junction (at ``contig_length - junction_distance``) within a ``±window`` fetch
-    window are counted as plasmid-integration evidence.
-
-    ``junction_distance`` is the parity literal (1129); for production it should be
-    derived per contig as ``upstream_arm_length + donor_length`` (see
-    :func:`integrated_plasmid_junction`). Pass a ``{contig: distance}`` mapping to
-    set it per contig.
+    Requires aligned reference bases on both sides of a known junction. D/N spans
+    and reads starting exactly at a junction do not qualify. Primary, QC-passing
+    records with MAPQ >= ``min_mapq`` count; duplicates remain raw read records.
+    MAPQ 20 and one aligned base per side are policy defaults, not calibrated
+    integration sensitivity. A per-contig distance must be supplied, derived as
+    ``upstream_arm_length + donor_length``. An explicit scalar is allowed for
+    known uniform layouts; there is no implicit 1129 assumption. Missing target
+    contigs, missing distances and zero eligible contigs raise, never return a
+    biological-negative zero for an unmeasured target.
 
     Returns ``{"upstream_count", "downstream_count"}`` summed over all contigs for
     this (single-sample) BAM.
     """
     import pysam
 
+    if (any(type(value) is not int for value in (window, min_anchor, min_mapq))
+            or window <= 0 or min_anchor < 1 or not 0 <= min_mapq <= 254):
+        raise ValueError("invalid junction window, minimum anchor or MAPQ threshold")
     bam = pysam.AlignmentFile(bam_path, "rb")
     try:
         refs = bam.references
         contigs = list(integrated_contigs) if integrated_contigs is not None else _integrated_contigs(refs)
+        if not contigs:
+            raise ValueError("no eligible integrated-plasmid contigs; integration is unmeasured")
+        if len(set(contigs)) != len(contigs):
+            raise ValueError("duplicate integrated-plasmid contigs")
+        distances: Dict[str, int] = {}
+        for ref in contigs:
+            if ref not in refs:
+                raise ValueError(f"integrated contig absent from BAM reference: {ref}")
+            jd = junction_distance.get(ref) if isinstance(junction_distance, dict) else junction_distance
+            length = bam.get_reference_length(ref)
+            if isinstance(jd, bool) or not isinstance(jd, int) or not min_anchor <= jd < length - jd:
+                raise ValueError(f"missing or invalid junction distance for {ref}: {jd!r} (length {length})")
+            if jd + min_anchor > length - jd:
+                raise ValueError(f"junction anchors overlap on {ref}")
+            distances[ref] = jd
         up = 0
         down = 0
         for ref in contigs:
-            if ref not in refs:
-                continue
-            if isinstance(junction_distance, dict):
-                jd = junction_distance.get(ref)
-                if jd is None:
-                    continue
-            else:
-                jd = junction_distance
+            jd = distances[ref]
             up_junction = jd
             down_junction = bam.get_reference_length(ref) - jd
             for junction, side in ((up_junction, "up"), (down_junction, "down")):
                 start = max(0, junction - window)
-                end = junction + window
+                end = min(bam.get_reference_length(ref), junction + window)
                 for read in bam.fetch(ref, start, end):
-                    if read.is_unmapped or read.is_secondary or read.is_supplementary:
+                    if not _eligible_sv_read(read, min_mapq):
                         continue
-                    if read.reference_start <= junction < read.reference_end:
+                    # Merge abutting M/= /X blocks, including those separated by
+                    # an insertion; a D/N leaves a reference gap and cannot merge.
+                    blocks = _merged_aligned_blocks(read)
+                    if any(left <= junction - min_anchor and right >= junction + min_anchor for left, right in blocks):
                         if side == "up":
                             up += 1
                         else:
@@ -552,15 +891,16 @@ class PlasmidIntegrationRow(TypedDict):
     """One row of the plasmid-integration summary (the ``plasmid_integration_summary.tsv`` schema)."""
 
     sample_name: str
-    upstream_count: int
-    downstream_count: int
-    total_count: int
+    upstream_count: Optional[int]
+    downstream_count: Optional[int]
+    total_count: Optional[int]
+    half_a_status: str
 
 
 def summarize_plasmid_integration(
     sample_bams: Dict[str, str],
     integrated_contigs: Optional[Sequence[str]] = None,
-    junction_distance: Union[int, Dict[str, int]] = 1129,
+    junction_distance: Optional[Union[int, Dict[str, int]]] = None,
     window: int = 200,
 ) -> List[PlasmidIntegrationRow]:
     """Run :func:`detect_plasmid_integration` over ``{sample_name: bam_path}``.
@@ -570,7 +910,14 @@ def summarize_plasmid_integration(
     """
     rows: List[PlasmidIntegrationRow] = []
     for sample, bam_path in sample_bams.items():
-        counts = detect_plasmid_integration(bam_path, integrated_contigs, junction_distance, window)
+        import pysam
+        with pysam.AlignmentFile(bam_path, "rb") as bam:
+            contigs = list(integrated_contigs) if integrated_contigs is not None else _integrated_contigs(bam.references)
+        if not contigs:
+            rows.append({"sample_name": sample, "upstream_count": None, "downstream_count": None,
+                         "total_count": None, "half_a_status": "not_run_no_integrated_contigs"})
+            continue
+        counts = detect_plasmid_integration(bam_path, contigs, junction_distance, window)
         total = counts["upstream_count"] + counts["downstream_count"]
         rows.append(
             {
@@ -578,9 +925,10 @@ def summarize_plasmid_integration(
                 "upstream_count": counts["upstream_count"],
                 "downstream_count": counts["downstream_count"],
                 "total_count": total,
+                "half_a_status": "run",
             }
         )
-    rows.sort(key=lambda r: r["total_count"], reverse=True)
+    rows.sort(key=lambda r: -1 if r["total_count"] is None else r["total_count"], reverse=True)
     return rows
 
 
@@ -606,6 +954,10 @@ def one_read_inside_large_deletion(
     Port of the ``one_read_inside_large_deletion`` branch of Kevin R. Roy's
     ``pysam_helper_functions.combine_aligned_segments_and_metrics``.
     """
+    if type(min_gap) is not int or min_gap < 0:
+        raise ValueError("min_gap must be nonnegative")
+    if min(r1_start, r2_start) < 0 or r1_end < r1_start or r2_end < r2_start:
+        return False
     region_length = max(r1_end, r2_end) - min(r1_start, r2_start) + 1
     r1_length = r1_end - r1_start + 1
     r2_length = r2_end - r2_start + 1
@@ -616,27 +968,65 @@ def one_read_inside_large_deletion(
     return False
 
 
-def mate_pair_large_deletion(read_1, read_2, min_gap: int = 1000) -> bool:
+def _eligible_sv_read(read, min_mapq: int = 20) -> bool:
+    return (not (read.is_unmapped or read.is_secondary or read.is_supplementary or read.is_qcfail)
+            and min_mapq <= read.mapping_quality < 255 and read.reference_id >= 0)
+
+
+def _merged_aligned_blocks(read) -> list[tuple[int, int]]:
+    blocks: list[tuple[int, int]] = []
+    for left, right in read.get_blocks():
+        if blocks and blocks[-1][1] == left:
+            blocks[-1] = (blocks[-1][0], right)
+        else:
+            blocks.append((left, right))
+    return blocks
+
+
+def mate_pair_large_deletion(read_1, read_2, min_gap: int = 1000, min_mapq: int = 20) -> bool:
     """pysam wrapper for :func:`one_read_inside_large_deletion`.
 
     Uses each read's first/last aligned reference position
     (``get_reference_positions()[0]`` / ``[-1]``), matching the original.
     """
-    p1 = read_1.get_reference_positions()
-    p2 = read_2.get_reference_positions()
+    if any(type(v) is not int for v in (min_gap, min_mapq)) or min_gap < 0 or not 0 <= min_mapq <= 254:
+        raise ValueError("invalid deletion gap or MAPQ threshold")
+    if not all(_eligible_sv_read(r, min_mapq) and r.is_paired and not r.mate_is_unmapped for r in (read_1, read_2)):
+        return False
+    if any(op == 3 for read in (read_1, read_2) for op, _ in (read.cigartuples or ())):
+        return False
+    if (not read_1.query_name or read_1.query_name == "*" or read_1.query_name != read_2.query_name
+            or read_1.reference_id != read_2.reference_id
+            or read_1.reference_name != read_2.reference_name
+            or not ((read_1.is_read1 and read_2.is_read2) or (read_1.is_read2 and read_2.is_read1))
+            or read_1.is_read1 == read_1.is_read2 or read_2.is_read1 == read_2.is_read2
+            or read_1.next_reference_id != read_2.reference_id
+            or read_2.next_reference_id != read_1.reference_id
+            or read_1.next_reference_start != read_2.reference_start
+            or read_2.next_reference_start != read_1.reference_start):
+        return False
+    p1 = read_1.get_blocks()
+    p2 = read_2.get_blocks()
     if not p1 or not p2:
         return False
-    return one_read_inside_large_deletion(p1[0], p1[-1], p2[0], p2[-1], min_gap)
+    return one_read_inside_large_deletion(p1[0][0], p1[-1][1] - 1, p2[0][0], p2[-1][1] - 1, min_gap)
 
 
-def within_read_large_deletions(read, cutoff: int = 50):
+def within_read_large_deletions(read, cutoff: int = 50, min_mapq: int = 20):
     """Within-read deletions strictly larger than ``cutoff`` bp.
 
     Reuses :func:`trace_crispr.core.cigar.get_deletions_from_cigar`. The original
     classifies a deletion as "large" when ``len(deleted_bases) > cutoff`` (strict),
     i.e. size ``>= cutoff + 1``.
     """
-    return get_deletions_from_cigar(read, min_size=cutoff + 1)
+    if any(type(v) is not int for v in (cutoff, min_mapq)) or cutoff < 0 or not 0 <= min_mapq <= 254:
+        raise ValueError("invalid deletion cutoff or MAPQ threshold")
+    if not _eligible_sv_read(read, min_mapq):
+        return []
+    blocks = read.get_blocks()
+    return [deletion for deletion in get_deletions_from_cigar(read, min_size=cutoff + 1)
+            if any(left <= deletion.ref_start - 1 < right for left, right in blocks)
+            and any(left <= deletion.ref_end < right for left, right in blocks)]
 
 
 # --------------------------------------------------------------------------- #
@@ -661,6 +1051,8 @@ def build_plasmid_contig(donor: str, backbone: str, guide: str, insert: str) -> 
 def build_shifted_plasmid_contig(plasmid_sequence: str, backbone_length: int) -> str:
     """Rotate a circular plasmid by half its backbone so the backbone-internal
     junction is mappable (the ``plasmid_sequence_shifted`` of the original)."""
+    if not plasmid_sequence or type(backbone_length) is not int or not 0 <= backbone_length <= len(plasmid_sequence):
+        raise ValueError("backbone length must lie within a nonempty plasmid sequence")
     half = backbone_length // 2
     return plasmid_sequence[half:] + plasmid_sequence[:half]
 
@@ -683,6 +1075,10 @@ def build_integrated_plasmid_contig(
     the donor is on the minus strand). Port of
     ``construct_integrated_plasmid_sequence``.
     """
+    if donor_strand not in ("+", "-"):
+        raise ValueError("donor_strand must be '+' or '-'")
+    if type(bp_to_extend) is not int or bp_to_extend < 1 or not donor or not integrated_segment or len(extended_donor) < 2 * bp_to_extend + len(donor):
+        raise ValueError("integrated contig requires two complete positive-length arms, donor and inserted segment")
     upstream = extended_donor[:bp_to_extend]
     downstream = extended_donor[-bp_to_extend:]
     segment = rev_comp(integrated_segment) if donor_strand == "-" else integrated_segment
@@ -696,6 +1092,8 @@ def integrated_plasmid_junction(donor: str, bp_to_extend: int = 1000) -> int:
     junction is symmetric at ``contig_length - junction``. For the parity library
     (``bp_to_extend=1000``, 129 bp donor) this is 1129.
     """
+    if type(bp_to_extend) is not int or bp_to_extend < 1 or not donor or not re.fullmatch(r"[ACGTRYSWKMBDHVNacgtryswkmbdhvn]+", donor):
+        raise ValueError("junction derivation requires positive arm length and a nonempty DNA donor")
     return bp_to_extend + len(donor)
 
 
@@ -724,6 +1122,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="'parity' reproduces Shengdi's fragment counts bit-for-bit.",
     )
     p.add_argument("--samtools", default="samtools")
+    p.add_argument("--min-mapq", type=int, default=20)
+    p.add_argument("--reference", dest="reference_path", help="sample alignment reference FASTA (required in standard mode)")
+    p.add_argument("--blacklist-reference", help="source reference FASTA for blacklist coordinates (required in standard mode)")
     return p
 
 
@@ -739,6 +1140,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         flexible_bases=args.flexible_bases,
         dup_mode=args.dup_mode,
         samtools=args.samtools,
+        min_mapq=args.min_mapq,
+        reference_path=args.reference_path,
+        blacklist_reference=args.blacklist_reference,
     )
     return 0
 
