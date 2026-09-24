@@ -251,7 +251,8 @@ def extract_barcode(read: "pysam.AlignedSegment", track: TrackConfig) -> Optiona
     configured width and no observed opposing-flank evidence contradicts it.
     Without an identifiable opposite flank, the molecule's actual spacer length
     cannot be independently established. Flanks and orientation come from this
-    track, not an era-wide motif.
+    track, not an era-wide motif. A slice that runs into Nextera read-through is
+    refused (`_barcode_runs_into_mosaic_end`).
     """
     if not read.query_sequence or read.reference_start is None or track.bc_len <= 0:
         return None
@@ -296,6 +297,8 @@ def extract_barcode(read: "pysam.AlignedSegment", track: TrackConfig) -> Optiona
     query_barcode = seq[q:q_end]
     if any(base not in 'ACGT' for base in query_barcode):
         return None
+    if _barcode_runs_into_mosaic_end(read, q, q_end):
+        return None
     canonical = track.to_canonical(query_barcode)
     return Extraction(
         barcode=canonical,
@@ -308,6 +311,28 @@ def extract_barcode(read: "pysam.AlignedSegment", track: TrackConfig) -> Optiona
         barcode_has_n=("N" in canonical),
         dedup_key=_dedup_key(read),
     )
+
+
+def _barcode_runs_into_mosaic_end(read: "pysam.AlignedSegment", q: int, q_end: int) -> bool:
+    """True if the barcode slice `query[q:q_end]` contains the start of Nextera read-through.
+
+    On untrimmed input a Tn5 fragment that ends inside the N20 reads on into the mosaic end,
+    exactly where the anchored slice is cut (plate 5031 called `CTGTCTCTTATACACATCTC`, all
+    adapter, and `AGAGACAG` + 12 genuine bases). A genuine barcode is followed by its constant
+    flank, never by the mosaic end, so only a mosaic end that runs through the slice
+    refuses the read. It may start up to 12 bases before the slice, because bwa aligns
+    adapter bases that happen to match the flank (plate 5031 s35: the mosaic end's `C`
+    aligned to the flank's `G`, so the whole slice was adapter). Scored against both real
+    flanks, that margin needs a random barcode to match 15+ mosaic-end bases to misfire.
+    Tested in sequencing orientation.
+    """
+    seq = (read.query_sequence or "").upper()
+    length = len(seq)
+    if read.is_reverse:
+        seq, lo, hi = revcomp(seq), length - q_end, length - q
+    else:
+        lo, hi = q, q_end
+    return any(_mosaic_end_at(seq, a) for a in range(max(0, lo - 12), hi))
 
 
 def _flank_mismatches(read: "pysam.AlignedSegment", track: TrackConfig, anchor: str) -> int:
@@ -416,13 +441,23 @@ def _reads_into_mosaic_end(read: "pysam.AlignedSegment") -> bool:
     else:
         clip3 = _terminal_soft_clip(read, leading=False)
     clip_start = len(seq) - clip3
+    return any(_mosaic_end_at(seq, a)
+               for a in range(max(0, clip_start - 12), min(len(seq) - 2, clip_start + 3)))
+
+
+def _mosaic_end_at(seq: str, a: int) -> bool:
+    """True if `seq` (sequencing orientation) reads as the Nextera mosaic end from index `a`.
+
+    Compared over the mosaic end, or its prefix where the read ends first (at least three
+    bases). Up to 20% mismatches once 10 or more bases are compared, none below that. One
+    rule for both read-through tests: the amplicon-filter exemption and barcode extraction.
+    """
     me = _NEXTERA_MOSAIC_END
-    for a in range(max(0, clip_start - 12), min(len(seq) - 2, clip_start + 3)):
-        n = min(len(me), len(seq) - a)
-        mismatches = sum(1 for x, y in zip(seq[a:a + n], me[:n]) if x != y)
-        if mismatches <= (n // 5 if n >= 10 else 0):
-            return True
-    return False
+    n = min(len(me), len(seq) - a)
+    if n < 3:
+        return False
+    mismatches = sum(1 for x, y in zip(seq[a:a + n], me[:n]) if x != y)
+    return mismatches <= (n // 5 if n >= 10 else 0)
 
 
 def is_amplicon_read(read: "pysam.AlignedSegment", track: TrackConfig) -> bool:
