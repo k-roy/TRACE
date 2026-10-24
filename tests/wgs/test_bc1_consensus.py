@@ -40,8 +40,16 @@ from trace_crispr.wgs.bc1_consensus import (
 CONTIG = "yT177_after_bc1_integration"
 HOP_CONTIG = "chrIV"
 BC_START, BC_END = 10270, 10289  # 1-based inclusive (matches input.yaml)
-LEFT_JUNC = "A" * 150
+LEFT_JUNC = "A" * 150  # placeholder flanks, for the synthetic reads only
 RIGHT_JUNC = "C" * 150
+# The real yT177 genome-contig flanks next to the N20, read off the sample_13 reads
+# below: HOP_A's 37M gives 10233-10269 (AMPLICON_LEFT, HOP_B and GENUINE's soft clip
+# agree), GENUINE's 33M gives 10290-10322 (AMPLICON_RIGHT and both hops agree).
+# Extraction validates read bases against the configured junctions (d54d9ce, "derive
+# bc1 query boundaries from configured constant flanks"), so a real read is no longer
+# called against the placeholders; outside these spans the padding is inert.
+REAL_LEFT_JUNC = "A" * 113 + "AGCATACATTATACGAAGTTATGCACGTATCCTAGGG"
+REAL_RIGHT_JUNC = "GAGCATGACCTGTCGACGTCGTAGGAGCTCATC" + "C" * 117
 
 # Real sample_13 genome-track reads (FLAG, 1-based POS, MAPQ, CIGAR, mate-contig, SEQ).
 GENUINE = (147, 10290, 40, "42S33M", "=",
@@ -59,10 +67,11 @@ TRUTH = "ATAAAAATGTTGCGATATCT"  # canonical bc1 (orthogonal REDI truth)
 GENOME_FWD = "AGATATCGCAACATTTTTAT"  # == revcomp(TRUTH); how the genome contig reads it
 
 
-def genome_track(amplicon: bool = True) -> TrackConfig:
+def genome_track(amplicon: bool = True, left: str = REAL_LEFT_JUNC,
+                 right: str = REAL_RIGHT_JUNC, min_mapq: int = 20) -> TrackConfig:
     return TrackConfig(
         name="genome", contig=CONTIG, bc_start=BC_START, bc_end=BC_END,
-        left_junction=LEFT_JUNC, right_junction=RIGHT_JUNC, revcomp=True,
+        left_junction=left, right_junction=right, revcomp=True, min_mapq=min_mapq,
         amplicon_left_window=(10224, 10235) if amplicon else None,
         amplicon_right_window=(10318, 10326) if amplicon else None,
     )
@@ -157,7 +166,7 @@ def test_extract_barcode_left_anchor_synthetic():
     a.query_sequence = query
     a.next_reference_id = 0
     a.next_reference_start = a.reference_start
-    ext = extract_barcode(a, genome_track())
+    ext = extract_barcode(a, genome_track(left=LEFT_JUNC, right=RIGHT_JUNC))
     assert ext is not None
     assert ext.anchor == "left"
     assert ext.query_barcode == bc_fwd
@@ -210,7 +219,12 @@ def test_extract_track_golden_recovers_truth_and_drops_contaminants(tmp_path):
     reads = [HOP_A, AMPLICON_LEFT, HOP_B, AMPLICON_RIGHT, GENUINE]
     bam = _write_bam(tmp_path, reads)
     with pysam.AlignmentFile(bam, "rb") as af:
-        call = extract_track(af, genome_track(amplicon=True))
+        shipped = extract_track(af, genome_track(amplicon=True))
+        # The contaminants are MAPQ 0/1, so the default MAPQ-20 gate (n_ambiguous)
+        # removes them before the amplicon filter runs. MAPQ 0 exercises the filter.
+        call = extract_track(af, genome_track(amplicon=True, min_mapq=0))
+    assert shipped.barcode_support() == {TRUTH: 1}
+    assert shipped.n_ambiguous == 4 and shipped.n_amplicon == 0
     support = call.barcode_support()
     # the genuine read survives; the two on-contig amplicons + two hops are dropped
     assert set(support) == {TRUTH}
@@ -225,7 +239,7 @@ def test_extract_track_without_amplicon_filter_lets_contaminant_win(tmp_path):
     reads = [HOP_A, AMPLICON_LEFT, HOP_B, AMPLICON_RIGHT, GENUINE]
     bam = _write_bam(tmp_path, reads)
     with pysam.AlignmentFile(bam, "rb") as af:
-        call = extract_track(af, genome_track(amplicon=False))
+        call = extract_track(af, genome_track(amplicon=False, min_mapq=0))
     support = call.barcode_support()
     assert call.n_amplicon == 0
     assert TRUTH in support  # genuine still extracted...
@@ -240,7 +254,7 @@ def test_window_shift_breaks_the_call(tmp_path):
     bam = _write_bam(tmp_path, reads)
     shifted = TrackConfig(
         name="genome", contig=CONTIG, bc_start=BC_START + 1, bc_end=BC_END + 1,
-        left_junction=LEFT_JUNC, right_junction=RIGHT_JUNC, revcomp=True,
+        left_junction=REAL_LEFT_JUNC, right_junction=REAL_RIGHT_JUNC, revcomp=True,
     )
     with pysam.AlignmentFile(bam, "rb") as af:
         call = extract_track(af, shifted)
