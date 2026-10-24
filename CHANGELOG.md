@@ -5,6 +5,25 @@ All notable changes to TRACE will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **WGS editing-outcome backend (`trace_crispr.wgs`)** — extends TRACE from
+  amplicon data to whole-genome sequencing of pooled MAGESTIC libraries, ported
+  from Shengdi Li's MAGESTIC-SCORE pipeline with bit-for-bit parity tests against
+  the reference outputs:
+  - `donor_outcome` — four-Levenshtein bucketing of donor-window variants into
+    designed / synthetic-error / spontaneous, aggregated to a per-sample editing
+    outcome.
+  - `sv_plasmid` — donor-template / plasmid / chimeric read filtering and
+    structural-variant detection on a combined (genome + plasmid + integrated-
+    plasmid) reference: `clean_donor_reads` writes the per-sample fragment-count
+    table and a cleaned BAM; `detect_plasmid_integration` counts reads spanning
+    the genome↔integration junctions; `one_read_inside_large_deletion` flags
+    mate-geometry large deletions. The donor-read filter (`--dup-mode parity`)
+    reproduces the reference pipeline's fragment counts exactly.
+
 ## [0.6.3] - 2026-03-20
 
 ### Fixed

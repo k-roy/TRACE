@@ -19,7 +19,6 @@ Usage:
 """
 
 import argparse
-import sys
 from pathlib import Path
 
 from trace_crispr.wgs.donor_outcome import (
