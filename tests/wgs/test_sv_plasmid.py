@@ -150,12 +150,16 @@ def test_load_blacklist_permissive_parsing(tmp_path):
         "yT177_before_bc1_integration\t1\t15295\n"
         "yT177_after_bc1_integration 1   14710\n"  # space-delimited -> inert
     )
-    bl = load_blacklist(str(f))
+    # Permissive Perl parsing has been the parity mode's contract since a096be0; the
+    # standard mode refuses the space-delimited row instead (checked last).
+    bl = load_blacklist(str(f), mode="parity")
     assert bl["chrXV"] == [(721500, 723000)]  # NAME column ignored
     assert bl["yT177_before_bc1_integration"] == [(1, 15295)]
     # the mangled row is kept under the whole-string key with an inert (0,0) range
     assert bl["yT177_after_bc1_integration 1   14710"] == [(0, 0)]
     assert not _is_mapped_to_cassette("yT177_after_bc1_integration 1   14710", 5000, bl)
+    with pytest.raises(ValueError, match="expected chrom<TAB>start<TAB>end"):
+        load_blacklist(str(f))
 
 
 def test_is_mapped_to_cassette_strict_bounds():
@@ -264,9 +268,11 @@ def test_duplicate_excluded_from_counts_but_kept_in_sets():
     assert res.variant_cov == 0
 
 
-def test_duplicate_standard_mode_counts_non_0x400_read():
-    # flag 2050 has NO 0x400 bit, so the correct test treats it as not-a-duplicate
-    # and it IS counted -- the parity-vs-standard contrast on the same flag.
+def test_duplicate_standard_mode_excludes_the_supplementary_record():
+    # WITHDRAWN (June claim): "standard mode counts this flag-2050 read". 2050 is
+    # 0x800|0x2, a SUPPLEMENTARY record, and since a096be0 standard mode skips non-primary records
+    # so they cannot override a pair's disposition. The parity-vs-standard contrast on
+    # the same flag survives, as "classified but not counted" vs "not classified".
     res = classify_donor_reads(
         [_rec("r", 2050, CHROM, 120, "60M", "=", 120, 300)],
         CHROM,
@@ -275,8 +281,9 @@ def test_duplicate_standard_mode_counts_non_0x400_read():
         BL,
         dup_mode="standard",
     )
-    assert res.unique_genome == {"r"}
-    assert res.variant_cov == 1
+    assert res.overlapped == set() and res.included == set()
+    assert res.unique_genome == set()
+    assert res.variant_cov == 0
 
 
 def test_cross_category_double_count():
@@ -327,6 +334,20 @@ class _FakeRead:
         self.cigartuples = cigartuples
         self.reference_start = reference_start
         self.query_sequence = None
+        # the eligibility gate (primary, mapped, QC-pass, 20 <= MAPQ < 255) reads these
+        self.is_unmapped = self.is_secondary = self.is_supplementary = self.is_qcfail = False
+        self.mapping_quality = 60
+        self.reference_id = 0
+
+    def get_blocks(self):
+        """Aligned reference blocks, as pysam returns them (M/=/X only)."""
+        blocks, pos = [], self.reference_start
+        for op, length in self.cigartuples:
+            if op in (0, 7, 8):
+                blocks.append((pos, pos + length))
+            if op in (0, 2, 3, 7, 8):
+                pos += length
+        return blocks
 
 
 def test_within_read_large_deletions_strict_cutoff():
@@ -351,13 +372,15 @@ def test_rev_comp_iupac():
 
 
 def test_build_integrated_plasmid_contig_plus_strand():
-    extended = "AAAA" + "xx" + "TTTT"  # bp_to_extend=4 -> flanks AAAA / TTTT
+    # extended_donor = arm + donor + arm; the 2-base "xx" stand-in for a 3-base donor
+    # is now refused as an incomplete arm, so the fixture carries the donor itself.
+    extended = "AAAA" + "CCC" + "TTTT"  # bp_to_extend=4 -> flanks AAAA / TTTT
     contig = build_integrated_plasmid_contig(extended, "CCC", "GG", "+", bp_to_extend=4)
     assert contig == "AAAA" + "CCC" + "GG" + "CCC" + "TTTT"
 
 
 def test_build_integrated_plasmid_contig_minus_strand_revcomps_segment():
-    extended = "AAAA" + "xx" + "TTTT"
+    extended = "AAAA" + "CCC" + "TTTT"
     contig = build_integrated_plasmid_contig(extended, "CCC", "GG", "-", bp_to_extend=4)
     assert contig == "AAAA" + "CCC" + "CC" + "CCC" + "TTTT"  # rev_comp("GG") == "CC"
 

@@ -26,7 +26,8 @@ DSTART, DEND = 11, 20
 
 
 def _spec(sample="s1", wt=WT, design=DESIGN, step2=STEP2):
-    return DonorSpec(sample, "chrT", DSTART, DEND, wt, design, step2)
+    # This palindromic WT needs the strand already specified by the authored edits.
+    return DonorSpec(sample, "chrT", DSTART, DEND, wt, design, step2, donor_strand="+")
 
 
 # --------------------------- primitives ----------------------------------- #
@@ -161,7 +162,7 @@ def test_precall_unedited_when_window_covered(tmp_path):
     gvcf = tmp_path / "s.g.vcf"
     _write_vcf(vcf, [])  # no variants
     # quantification window for 11..20 is [11,20]; cover all 10 with ref depth >=1
-    _write_gvcf(gvcf, [("chrT", p, "A", "<NON_REF>", 8) for p in range(11, 21)])
+    _write_gvcf(gvcf, [("chrT", p, WT[p - DSTART], "<NON_REF>", 8) for p in range(11, 21)])
     out = precall_sample(_spec(), vcf, gvcf, REF)
     assert out.editing_outcome == "designed_variant_unedited"
 
@@ -183,7 +184,7 @@ def test_precall_partial(tmp_path):
     wt = "AAAAATTTTT"
     design = "ACAAATTTAT"  # two SNVs: pos1 A->C and pos8 T->A
     step2 = design
-    spec = DonorSpec("s", "chrT", DSTART, DEND, wt, design, step2)
+    spec = DonorSpec("s", "chrT", DSTART, DEND, wt, design, step2, donor_strand="+")
     vcf = tmp_path / "s.fil.vcf"
     gvcf = tmp_path / "s.g.vcf"
     _write_vcf(vcf, [("chrT", 12, "A", "C")])  # only the first designed SNV (pos1)

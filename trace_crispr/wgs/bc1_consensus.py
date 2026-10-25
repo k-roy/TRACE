@@ -9,25 +9,24 @@ whole-genome BAM, so each cell can be bridged to its designed donor via the
 Design (2026-06-04) — *not* a port of Shengdi Li's trie caller
 -------------------------------------------------------------
 The barcode is a 20 bp degenerate locus flanked by two long **constant** junction
-sequences, on an integrated contig (and an episomal-plasmid copy). With 75 bp Tn5
-reads a single read captures the barcode plus part of **one** flank, never both,
-and coverage is near-singleton (most calls rest on a single read). So multi-read
-consensus machinery (Shengdi's prefix trie + ``Tscore``/``Uscore``) is moot and
-buggy at this depth. Verified on the real BAMs: the aligner **soft-clips** the
-random barcode (CIGARs like ``3S38M34S`` — ~38 bp anchored in the flank, the
-barcode in the soft-clip), so a reference-column pileup would recover nothing.
+sequences, on an integrated contig (and an episomal-plasmid copy). Reads can
+capture one or both constant flanks; coverage can be near-singleton. The aligner
+can soft-clip the random barcode or place arbitrary indels inside its reference
+N-run. Soft-clipped barcode bases are absent from an aligned-column pileup.
 
 This module instead does robust, deterministic, **per-read** work:
 
 1. anchor on the **constant flank** (never align against the random barcode);
-2. map the flank↔barcode boundary to a query offset via the CIGAR and slice the
-   20 bp directly by query index, **recovering soft-clipped barcode bases**;
+2. derive query boundaries from alignment to the constant flanks, validate their
+   adjacent sequence, and require a unique barcode interval; never use alignment
+   inside the variable N-run to choose a boundary;
 3. drop read-2 amplicon-hop contaminants (mate off the barcode contig);
 4. dedup, then bridge the extracted 20-mer to the designed ``bc1 -> donor`` set.
 
-Confidence is feature-based (bridge tier + anchor cleanliness + support), never a
-read count. The genome/plasmid tracks are called independently and reported
-separately (their flanks differ, so two-track agreement is genuine, not circular).
+Caller confidence uses anchor labels and deduplicated molecule support; combined
+confidence also uses the bridge tier. Genome/plasmid tracks are called and
+reported separately in their configured orientations. Their agreement is an
+internal-consistency measurement, not independent expected well identity.
 The double-edit-vs-contamination call and the edit-VAF corroboration live in a
 **separate reconciliation step** (they need the variant calls), per Kevin's call.
 
@@ -89,10 +88,16 @@ class TrackConfig:
     # read whose aligned start is in amplicon_left_window with a defect in the first
     # amplicon_left_defect query bases, OR whose aligned end is in amplicon_right_window with
     # a defect in the last amplicon_right_defect bases, is dropped. None => filter disabled.
+    # A defect at the read's 3' edge that is Nextera read-through is exempt (see
+    # is_amplicon_read). Windows are cohort- and reference-specific: they sit at the
+    # outer (5') ends of the bc1-amplicon inner primers in that reference.
     amplicon_left_window: Optional[Tuple[int, int]] = None  # 1-based inclusive start window
     amplicon_right_window: Optional[Tuple[int, int]] = None  # 1-based inclusive end window
     amplicon_left_defect: int = 5
     amplicon_right_defect: int = 7
+    min_mapq: int = 20
+    # Prespecified conservative locus-assignment policy, not calibrated precision.
+    # Set 0 explicitly for historical sensitivity comparisons. MAPQ255 is unknown.
 
     @property
     def bc_len(self) -> int:
@@ -164,9 +169,9 @@ def ref_to_query_offset(read: "pysam.AlignedSegment", ref0: int) -> Optional[int
 class Extraction:
     """A barcode extracted from one read, with raw per-read features.
 
-    ``barcode`` is the **canonical** bc1 (genome-forward; bridge/agreement use this).
-    ``query_barcode`` is the raw forward-on-contig slice (== barcode for the genome
-    track; == revcomp(barcode) for the inverted plasmid track) — kept for QC/debug.
+    ``barcode`` is the canonical bc1 used for bridge/agreement.
+    ``query_barcode`` is the forward-on-contig slice; ``TrackConfig.to_canonical``
+    applies the configured orientation exactly once.
     """
 
     barcode: str  # canonical bc1 orientation
@@ -180,39 +185,121 @@ class Extraction:
     dedup_key: Tuple
 
 
-def extract_barcode(read: "pysam.AlignedSegment", track: TrackConfig) -> Optional[Extraction]:
-    """Extract the 20 bp barcode from one spanning read by flank-boundary query
-    slicing. Returns ``None`` if the read does not anchor a flank cleanly.
+def _flank_boundaries(read: "pysam.AlignedSegment", track: TrackConfig, anchor: str,
+                     *, validate_sequence: bool = True, min_bases: int = 4) -> set:
+    """Query boundaries supported by alignment outside the variable barcode.
 
-    Routing: a read aligned starting left of the barcode anchors the LEFT flank
-    (barcode in the trailing soft-clip); one aligned within/after the barcode
-    anchors the RIGHT flank (barcode in the leading soft-clip).
+    A match block touching the configured constant flank proposes a boundary.
+    Validate up to ten adjacent constant bases in SEQ, with at least four when
+    the read ends within the flank. This also validates extrapolation through a
+    soft-clipped *constant* sequence; variable-region CIGAR operations do not
+    participate. Multiple surviving boundaries remain ambiguous. Unvalidated
+    boundaries only flag observed opposing-flank evidence; they cannot call.
+    A shorter validated flank may corroborate a strong anchor on the other
+    side, but cannot initiate extraction itself.
     """
-    if read.query_sequence is None or read.reference_start is None:
+    seq = read.query_sequence.upper()
+    left = anchor == "left"
+    boundary = track.bc_start - 1 if left else track.bc_end
+    flank = (track.left_junction if left else track.right_junction).upper()
+    lo, hi = (boundary - len(flank), boundary) if left else (boundary, boundary + len(flank))
+    candidates = set()
+    for op in parse_cigar_to_operations(read):
+        if op.op_code not in (0, 7, 8) or op.ref_end <= lo or op.ref_start >= hi:
+            continue
+        q = op.query_start + boundary - op.ref_start
+        if not 0 <= q <= len(seq):
+            continue
+        available = q if left else len(seq) - q
+        k = min(10, len(flank), available)
+        if k < min_bases:
+            continue
+        observed = seq[q-k:q] if left else seq[q:q+k]
+        expected = flank[-k:] if left else flank[:k]
+        if not validate_sequence or observed == expected:
+            candidates.add(q)
+    return candidates
+
+
+def _sequence_boundaries(seq: str, flank: str, left: bool) -> set:
+    """Full adjacent-flank occurrences, used to detect conflicting geometry.
+
+    Sequence alone may corroborate or contradict an aligned anchor but cannot
+    introduce a call without alignment to a configured constant flank.
+    """
+    motif = flank[-10:].upper() if left else flank[:10].upper()
+    if len(motif) < 4:
+        return set()
+    found = set()
+    start = 0
+    while True:
+        pos = seq.find(motif, start)
+        if pos < 0:
+            return found
+        found.add(pos + len(motif) if left else pos)
+        start = pos + 1
+
+
+def extract_barcode(read: "pysam.AlignedSegment", track: TrackConfig) -> Optional[Extraction]:
+    """Decode one unique configured cassette interval from constant flanks.
+
+    CIGAR alignment *within* N20 cannot define molecular boundaries: aligners
+    place insertions/deletions there arbitrarily. Instead validate boundaries
+    derived from constant-flank blocks. If both flanks occur, require the
+    configured barcode length between them; contradictory frames are no-calls.
+    One-flank reads remain callable when a unique aligned anchor spans the full
+    configured width and no observed opposing-flank evidence contradicts it.
+    Without an identifiable opposite flank, the molecule's actual spacer length
+    cannot be independently established. Flanks and orientation come from this
+    track, not an era-wide motif. A slice that runs into Nextera read-through is
+    refused (`_barcode_runs_into_mosaic_end`).
+    """
+    if not read.query_sequence or read.reference_start is None or track.bc_len <= 0:
         return None
-    bc_start0 = track.bc_start - 1  # 0-based first barcode base
-    bc_end0 = track.bc_end  # 0-based one-past-last barcode base
+    seq = read.query_sequence.upper()
     n = track.bc_len
-
-    if read.reference_start < bc_start0:
-        anchor = "left"
-        q = ref_to_query_offset(read, bc_start0)  # first barcode base
-        if q is None or q < 0:  # guard: a negative slice start wraps to the read 3' end
-            return None
-        barcode = read.query_sequence[q : q + n]
-    else:
-        anchor = "right"
-        q_end = ref_to_query_offset(read, bc_end0)  # first base past barcode
-        if q_end is None or q_end - n < 0:  # guard against a negative slice start
-            return None
-        barcode = read.query_sequence[q_end - n : q_end]
-
-    if len(barcode) != n:
-        return None  # read did not reach a full barcode width
-    query_barcode = barcode.upper()
+    aligned_left = _flank_boundaries(read, track, "left")
+    aligned_right = _flank_boundaries(read, track, "right")
+    if not aligned_left and not aligned_right:
+        return None
+    sequence_left = _sequence_boundaries(seq, track.left_junction, True)
+    sequence_right = _sequence_boundaries(seq, track.right_junction, False)
+    # A failed opposing-flank check must not silently turn a two-flank record
+    # into a one-flank call (which could include a flank base in a short barcode).
+    corroborated_left = _flank_boundaries(read, track, "left", min_bases=1)
+    corroborated_right = _flank_boundaries(read, track, "right", min_bases=1)
+    left_evidence = corroborated_left or _flank_boundaries(read, track, "left", validate_sequence=False, min_bases=1)
+    right_evidence = corroborated_right or _flank_boundaries(read, track, "right", validate_sequence=False, min_bases=1)
+    left_width = min(10, len(track.left_junction))
+    right_width = min(10, len(track.right_junction))
+    intervals = set()
+    for q in aligned_left:
+        # An incidental opposite motif wholly inside N20 is barcode sequence,
+        # not evidence of a second flank. A motif crossing its boundary still
+        # matters, including genuine 19-base or other wrong-width cassettes.
+        opposite = corroborated_right | {r for r in sequence_right
+                                    if r >= q and r + right_width > q + n}
+        if q + n <= len(seq) and (q + n in opposite or (not opposite and not right_evidence)):
+            intervals.add((q, q+n))
+    for end in aligned_right:
+        opposite = corroborated_left | {l for l in sequence_left
+                                   if l <= end and l - left_width < end - n}
+        if end >= n and (end - n in opposite or (not opposite and not left_evidence)):
+            intervals.add((end-n, end))
+    if len(intervals) != 1:
+        return None
+    q, q_end = next(iter(intervals))
+    if q < 0 or q_end > len(seq):
+        return None
+    # Label the aligned flank that supports this interval. A single two-flank
+    # read is not counted as two molecules or two separate anchors.
+    anchor = "left" if q in aligned_left else "right"
+    query_barcode = seq[q:q_end]
+    if any(base not in 'ACGT' for base in query_barcode):
+        return None
+    if _barcode_runs_into_mosaic_end(read, q, q_end):
+        return None
     canonical = track.to_canonical(query_barcode)
-
-    flank_mm = _flank_mismatches(read, track, anchor)
     return Extraction(
         barcode=canonical,
         query_barcode=query_barcode,
@@ -220,10 +307,32 @@ def extract_barcode(read: "pysam.AlignedSegment", track: TrackConfig) -> Optiona
         read_name=read.query_name,
         is_reverse=bool(read.is_reverse),
         mapq=read.mapping_quality,
-        flank_mismatches=flank_mm,
+        flank_mismatches=_flank_mismatches(read, track, anchor),
         barcode_has_n=("N" in canonical),
         dedup_key=_dedup_key(read),
     )
+
+
+def _barcode_runs_into_mosaic_end(read: "pysam.AlignedSegment", q: int, q_end: int) -> bool:
+    """True if the barcode slice `query[q:q_end]` contains the start of Nextera read-through.
+
+    On untrimmed input a Tn5 fragment that ends inside the N20 reads on into the mosaic end,
+    exactly where the anchored slice is cut (plate 5031 called `CTGTCTCTTATACACATCTC`, all
+    adapter, and `AGAGACAG` + 12 genuine bases). A genuine barcode is followed by its constant
+    flank, never by the mosaic end, so only a mosaic end that runs through the slice
+    refuses the read. It may start up to 12 bases before the slice, because bwa aligns
+    adapter bases that happen to match the flank (plate 5031 s35: the mosaic end's `C`
+    aligned to the flank's `G`, so the whole slice was adapter). Scored against both real
+    flanks, that margin needs a random barcode to match 15+ mosaic-end bases to misfire.
+    Tested in sequencing orientation.
+    """
+    seq = (read.query_sequence or "").upper()
+    length = len(seq)
+    if read.is_reverse:
+        seq, lo, hi = revcomp(seq), length - q_end, length - q
+    else:
+        lo, hi = q, q_end
+    return any(_mosaic_end_at(seq, a) for a in range(max(0, lo - 12), hi))
 
 
 def _flank_mismatches(read: "pysam.AlignedSegment", track: TrackConfig, anchor: str) -> int:
@@ -294,22 +403,87 @@ def _boundary_defect(read: "pysam.AlignedSegment", n_bp: int, from_end: bool) ->
     return False
 
 
+# The Nextera (Tn5) mosaic end as a read meets it after running off a short fragment.
+# Shengdi's pipeline trims it with cutadapt before bwa (his Snakefile rule `cutadapt`), so
+# in his input a genuine fragment end carries no soft clip. Untrimmed input (the v11 cohort
+# recipe) does, and a Tn5 fragment end that falls in an amplicon window then looks exactly
+# like a randomer defect: on plate 5031 the unexempted test dropped 29 genuine reads beside
+# 27 amplicon reads.
+_NEXTERA_MOSAIC_END = "CTGTCTCTTATACACATCT"
+
+
+def _terminal_soft_clip(read: "pysam.AlignedSegment", leading: bool) -> int:
+    """Length of the soft clip at the leading (or trailing) end, looking past hard clips."""
+    ops = read.cigartuples or []
+    for op, length in (ops if leading else reversed(ops)):
+        if op == 5:  # H does not consume SEQ
+            continue
+        return length if op == 4 else 0
+    return 0
+
+
+def _reads_into_mosaic_end(read: "pysam.AlignedSegment") -> bool:
+    """True if the read's 3' end reads through into the Nextera mosaic end.
+
+    Tested in sequencing orientation: the mosaic end, or a prefix of it of at least three
+    bases where the read ends first, must start between 12 bases before and 2 bases after
+    the start of the 3' soft clip. The 12-base margin covers adapter bases that bwa aligns
+    because they happen to match the reference (chrII carries CTGTCTC at 638903-638909); the
+    2 bases cover a mismatching genomic base clipped ahead of the adapter. Up to 20%
+    mismatches are allowed once 10 or more bases are compared, none below that, so short
+    random matches stay rare while ordinary 3'-end sequencing errors are tolerated.
+    """
+    seq = (read.query_sequence or "").upper()
+    if not seq:
+        return False
+    if read.is_reverse:
+        seq, clip3 = revcomp(seq), _terminal_soft_clip(read, leading=True)
+    else:
+        clip3 = _terminal_soft_clip(read, leading=False)
+    clip_start = len(seq) - clip3
+    return any(_mosaic_end_at(seq, a)
+               for a in range(max(0, clip_start - 12), min(len(seq) - 2, clip_start + 3)))
+
+
+def _mosaic_end_at(seq: str, a: int) -> bool:
+    """True if `seq` (sequencing orientation) reads as the Nextera mosaic end from index `a`.
+
+    Compared over the mosaic end, or its prefix where the read ends first (at least three
+    bases). Up to 20% mismatches once 10 or more bases are compared, none below that. One
+    rule for both read-through tests: the amplicon-filter exemption and barcode extraction.
+    """
+    me = _NEXTERA_MOSAIC_END
+    n = min(len(me), len(seq) - a)
+    if n < 3:
+        return False
+    mismatches = sum(1 for x, y in zip(seq[a:a + n], me[:n]) if x != y)
+    return mismatches <= (n // 5 if n >= 10 else 0)
+
+
 def is_amplicon_read(read: "pysam.AlignedSegment", track: TrackConfig) -> bool:
     """bc1-amplicon contaminant telltale (Shengdi's ``filter_barcode_region.pl``):
     an aligned outer boundary at a fixed amplicon-primer coordinate **plus** a randomer
-    soft-clip/indel at that boundary. Disabled (returns False) when no window is set."""
+    soft-clip/indel at that boundary. Disabled (returns False) when no window is set.
+
+    One exemption keeps the port faithful on untrimmed input: a defect at the read's 3'
+    edge (the right edge of a forward read, the left edge of a reverse read) does not
+    count when that end reads into the Nextera mosaic end, because it is Tn5 read-through
+    that Shengdi's cutadapt step would have removed. The 5' edge, where an amplicon read's
+    randomer sits, is always tested, so a spurious 3' match cannot hide a real randomer."""
     if read.reference_start is None or read.reference_end is None:
         return False
     if track.amplicon_left_window is not None:
         lo, hi = track.amplicon_left_window
         start1 = read.reference_start + 1  # 1-based aligned start
         if lo <= start1 <= hi and _boundary_defect(read, track.amplicon_left_defect, from_end=False):
-            return True
+            if not (read.is_reverse and _reads_into_mosaic_end(read)):
+                return True
     if track.amplicon_right_window is not None:
         lo, hi = track.amplicon_right_window
         end1 = read.reference_end  # 1-based inclusive aligned end (pysam end is 0-based exclusive)
         if lo <= end1 <= hi and _boundary_defect(read, track.amplicon_right_defect, from_end=True):
-            return True
+            if not (not read.is_reverse and _reads_into_mosaic_end(read)):
+                return True
     return False
 
 
@@ -322,6 +496,7 @@ class TrackCall:
     n_reads_seen: int = 0
     n_contaminant: int = 0
     n_amplicon: int = 0  # subset of n_contaminant dropped by the amplicon telltale
+    n_ambiguous: int = 0  # insufficient/unknown mapping confidence, not contamination
 
     def barcode_support(self) -> Dict[str, int]:
         """Distinct-molecule (deduped) support per extracted barcode."""
@@ -354,11 +529,23 @@ def extract_track(
         # right-anchored read aligning the right flank starts AT bc_end with the barcode
         # entirely in its leading soft-clip — an aligned-span overlap test wrongly drops it.
         cig = read.cigartuples or []
-        lead_s = cig[0][1] if cig and cig[0][0] == 4 else 0
-        trail_s = cig[-1][1] if cig and cig[-1][0] == 4 else 0
+        # H/P do not consume SEQ. Look past them for terminal soft clips.
+        ends = []
+        for operations in (cig, reversed(cig)):
+            for op, length in operations:
+                if op in (5, 6):
+                    continue
+                ends.append(length if op == 4 else 0)
+                break
+            else:
+                ends.append(0)
+        lead_s, trail_s = ends
         if read.reference_end + trail_s <= bc0 or read.reference_start - lead_s >= bc_end0:
             continue
         call.n_reads_seen += 1
+        if read.mapping_quality == 255 or read.mapping_quality < track.min_mapq:
+            call.n_ambiguous += 1
+            continue
         # Genuine barcode read = PROPER PAIR with mate on-contig. Drop (a) non-proper-pair
         # and cross-contig read-2 hops, and (b) on-contig bc1-amplicon proper pairs via the
         # amplicon-primer telltale (only active when the track has amplicon windows set).
@@ -548,22 +735,32 @@ class TopBarcode:
     min_flank_mm: int  # cleanest anchored-flank mismatch count
 
 
-def top_barcode(call: TrackCall) -> Optional[TopBarcode]:
-    """Deterministic winner of a track: max deduped support, then fewest flank
-    mismatches, then lexicographic barcode."""
+def _barcode_features(call: TrackCall) -> Dict[str, Tuple[int, bool, int]]:
+    """Per-barcode ``(deduped_support, both_anchors, min_flank_mm)`` for one track —
+    the shared feature basis for both :func:`top_barcode` (the single winner) and
+    :func:`confident_barcodes` (the full multi-bc1 set), so the two cannot drift."""
     support = call.barcode_support()
-    if not support:
-        return None
     best_mm: Dict[str, int] = {}
     anchors: Dict[str, set] = {}
     for e in call.extractions:
         best_mm[e.barcode] = min(best_mm.get(e.barcode, 999), e.flank_mismatches)
         anchors.setdefault(e.barcode, set()).add(e.anchor)
-    bc, sup = sorted(support.items(), key=lambda kv: (-kv[1], best_mm[kv[0]], kv[0]))[0]
-    return TopBarcode(
-        barcode=bc, support=sup, n_distinct=len(support),
-        both_anchors={"left", "right"} <= anchors[bc], min_flank_mm=best_mm[bc],
-    )
+    return {
+        bc: (sup, {"left", "right"} <= anchors[bc], best_mm[bc])
+        for bc, sup in support.items()
+    }
+
+
+def top_barcode(call: TrackCall) -> Optional[TopBarcode]:
+    """Deterministic winner of a track: max deduped support, then fewest flank
+    mismatches, then lexicographic barcode."""
+    feats = _barcode_features(call)
+    if not feats:
+        return None
+    bc = sorted(feats.items(), key=lambda kv: (-kv[1][0], kv[1][2], kv[0]))[0][0]
+    sup, both, mm = feats[bc]
+    return TopBarcode(barcode=bc, support=sup, n_distinct=len(feats),
+                      both_anchors=both, min_flank_mm=mm)
 
 
 def caller_confidence(top: TopBarcode) -> str:
@@ -620,15 +817,28 @@ def call_sample(
     (the plasmid track has no amplicon filter, so a low-confidence plasmid call is
     usually contamination — validated: naive genome-else-plasmid hurts precision)."""
     gcall = extract_track(bam, genome_track)
+    pcall = None
+    if top_barcode(gcall) is None and plasmid_track is not None:
+        pcall = extract_track(bam, plasmid_track)
+    return call_from_tracks(sample, gcall, pcall, bridge)
+
+
+def call_from_tracks(sample: str, gcall: TrackCall, pcall: Optional[TrackCall] = None,
+                     bridge: Optional[BridgeIndex] = None) -> Bc1Call:
+    """Apply the same winning-track decision to already extracted evidence."""
     top = top_barcode(gcall)
     track, used = "genome", gcall
-    if top is None and plasmid_track is not None:
-        pcall = extract_track(bam, plasmid_track)
+    if top is None and pcall is not None:
         ptop = top_barcode(pcall)
         if ptop is not None and caller_confidence(ptop) == "high":
             top, track, used = ptop, "plasmid", pcall
     if top is None:
-        return Bc1Call.empty(sample)
+        empty = Bc1Call.empty(sample)
+        tracks = [gcall] + ([pcall] if pcall is not None else [])
+        empty.n_reads_seen = sum(t.n_reads_seen for t in tracks)
+        empty.n_contaminant = sum(t.n_contaminant for t in tracks)
+        empty.n_amplicon = sum(t.n_amplicon for t in tracks)
+        return empty
 
     conf = caller_confidence(top)
     br = bridge.bridge(top.barcode) if bridge is not None else BridgeResult(
@@ -644,6 +854,74 @@ def call_sample(
 
 
 # --------------------------------------------------------------------------- #
+# Multi-bc1 enumeration (Stage 3 reconciliation input)                         #
+# --------------------------------------------------------------------------- #
+#
+# call_sample collapses a track to its single winner (Bc1Call). Reconciliation
+# instead needs the FULL set of confident barcodes in a cell: a clean single-
+# lineage cell yields one, a mixed/contaminated cell yields >=2. Two distinct bc1
+# at the single haploid integration locus (yT177) cannot coexist in one clone, so
+# >=2 confident barcodes is itself the primary contamination signal (validated
+# against colony_purity in bc1_consensus); the edit-VAF axis then separates a
+# genuine multi-edit (one bc1 -> two donor windows, both ~100%) from a mixture.
+
+
+@dataclass
+class BarcodeCall:
+    """One confident bc1 within a sample — the multi-bc1 unit consumed by Stage-3
+    reconciliation. Same feature/bridge fields as :class:`Bc1Call`, but a sample
+    yields a *list* of these (typically 1; >=2 flags a multi-lineage cell)."""
+
+    barcode: str  # canonical
+    support: int  # deduped molecules
+    both_anchors: bool
+    min_flank_mm: int
+    caller_confidence: str  # "high" / "low"
+    bridge_tier: str
+    oligo: Optional[str]
+    bridge_support: int
+    n_oligos: int
+    bridge_flags: Tuple[str, ...]
+    confidence: str  # combined caller x bridge
+
+
+def confident_barcodes(
+    call: TrackCall,
+    bridge: Optional[BridgeIndex] = None,
+    *,
+    min_support: int = 1,
+    high_only: bool = False,
+) -> List[BarcodeCall]:
+    """Enumerate *all* barcodes on a track (not just the winner), each scored and
+    bridged — the multi-bc1 input to reconciliation. ``min_support`` drops singleton
+    PCR/sequencing noise; ``high_only`` keeps only two-orientation or support>=2
+    barcodes. Returned sorted by deduped support desc (then cleanest flank, then
+    barcode), so ``confident_barcodes(call, bridge)[0]`` matches ``top_barcode``."""
+    out: List[BarcodeCall] = []
+    for bc, (sup, both, mm) in _barcode_features(call).items():
+        if sup < min_support:
+            continue
+        cc = "high" if (both or sup >= 2) else "low"
+        if high_only and cc != "high":
+            continue
+        br = (
+            bridge.bridge(bc)
+            if bridge is not None
+            else BridgeResult(bc, BRIDGE_NONE, None, 0, None, 0, False, ())
+        )
+        out.append(
+            BarcodeCall(
+                barcode=bc, support=sup, both_anchors=both, min_flank_mm=mm,
+                caller_confidence=cc, bridge_tier=br.tier, oligo=br.oligo,
+                bridge_support=br.support, n_oligos=br.n_oligos, bridge_flags=br.flags,
+                confidence=_combine_confidence(cc, br.tier),
+            )
+        )
+    out.sort(key=lambda b: (-b.support, b.min_flank_mm, b.barcode))
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Config -> tracks, batch runner, CLI                                          #
 # --------------------------------------------------------------------------- #
 
@@ -654,19 +932,33 @@ def load_locus_config(path: str) -> Dict[str, str]:
     equivalents). No PyYAML dependency."""
     cfg: Dict[str, str] = {}
     with open(path) as fh:
-        for line in fh:
+        for lineno, line in enumerate(fh, 1):
             line = line.rstrip("\n")
-            if not line or line.lstrip().startswith("#") or ":" not in line:
+            if not line.strip() or line.lstrip().startswith("#"):
                 continue
+            if line != line.lstrip() or ':' not in line:
+                raise ValueError(f'{path}:{lineno}: expected flat key: value, not nested YAML')
             key, val = line.split(":", 1)
-            cfg[key.strip()] = val.strip().strip("'\"")
+            key, val = key.strip(), val.strip()
+            if not re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*', key) or not val or key in cfg:
+                raise ValueError(f'{path}:{lineno}: missing value, invalid or duplicate key {key!r}')
+            if val[0] in "'\"":
+                if len(val) < 2 or val[-1] != val[0]:
+                    raise ValueError(f'{path}:{lineno}: unmatched scalar quotes')
+                val = val[1:-1]
+            if not val or val.startswith(('[', '{')):
+                raise ValueError(f'{path}:{lineno}: expected a nonempty scalar')
+            cfg[key] = val
     return cfg
 
 
 def _parse_locus(s: str) -> Tuple[str, int, int]:
-    contig, rng = s.split(":")
+    contig, rng = s.rsplit(":", 1)
     a, b = rng.split("-")
-    return contig, int(a), int(b)
+    start, end = int(a), int(b)
+    if not contig or start < 1 or end < start:
+        raise ValueError(f'Invalid 1-based inclusive locus: {s!r}')
+    return contig, start, end
 
 
 def _parse_window(s: Optional[str]) -> Optional[Tuple[int, int]]:
@@ -681,22 +973,35 @@ def tracks_from_config(
     *,
     amplicon_left_window: Optional[Tuple[int, int]] = None,
     amplicon_right_window: Optional[Tuple[int, int]] = None,
-) -> Tuple[TrackConfig, TrackConfig]:
+    use_plasmid: Optional[bool] = None,
+    min_mapq: Optional[int] = None,
+) -> Tuple[TrackConfig, Optional[TrackConfig]]:
     """Build the (genome, plasmid) tracks from a locus config. Genome bc1 is read
     out as revcomp(canonical) so genome ``revcomp=True``; the plasmid cassette is
     inverted so plasmid-forward is already canonical (``revcomp=False``)."""
     gchr, gs, ge = _parse_locus(cfg["barcode_locus"])
-    pchr, ps, pe = _parse_locus(cfg["plasmid_bc_locus"])
     genome = TrackConfig(
         name="genome", contig=gchr, bc_start=gs, bc_end=ge,
         left_junction=cfg["barcode_left_sequence"], right_junction=cfg["barcode_right_sequence"],
         revcomp=True, amplicon_left_window=amplicon_left_window, amplicon_right_window=amplicon_right_window,
     )
+    if min_mapq is not None:
+        if type(min_mapq) is not int or not 0 <= min_mapq <= 254:
+            raise ValueError('min_mapq must be an integer from 0 to 254')
+        genome.min_mapq = min_mapq
+    keys = ('plasmid_bc_locus', 'plasmid_bc_left_sequence', 'plasmid_bc_right_sequence')
+    present = [bool(cfg.get(k)) for k in keys]
+    if use_plasmid is False or (use_plasmid is None and not any(present)):
+        return genome, None
+    if not all(present):
+        raise ValueError('Plasmid track requires locus and both flanking sequences')
+    pchr, ps, pe = _parse_locus(cfg["plasmid_bc_locus"])
     plasmid = TrackConfig(
         name="plasmid", contig=pchr, bc_start=ps, bc_end=pe,
         left_junction=cfg["plasmid_bc_left_sequence"], right_junction=cfg["plasmid_bc_right_sequence"],
         revcomp=False,
     )
+    plasmid.min_mapq = genome.min_mapq
     return genome, plasmid
 
 
@@ -735,16 +1040,20 @@ def run(
     amplicon_right_window: Optional[str] = None,
     use_plasmid: bool = False,
     bam_suffix: str = ".sort.dedup.recal2.bam",
+    min_mapq: Optional[int] = None,
 ) -> int:
     cfg = load_locus_config(config)
     genome, plasmid = tracks_from_config(
         cfg,
         amplicon_left_window=_parse_window(amplicon_left_window),
         amplicon_right_window=_parse_window(amplicon_right_window),
+        use_plasmid=use_plasmid,
+        min_mapq=min_mapq,
     )
     with pysam.FastaFile(fasta) as fa:
         genome.validate_against_reference(fa)
-        plasmid.validate_against_reference(fa)
+        if plasmid is not None:
+            plasmid.validate_against_reference(fa)
     bridge = None
     if bridge_table:
         sys.stderr.write(f"[bridge] loading {bridge_table} ...\n")
@@ -753,8 +1062,11 @@ def run(
         )
         sys.stderr.write(f"[bridge] {len(bridge)} distinct bc1\n")
     bams = sorted(glob.glob(os.path.join(bam_dir, "*" + bam_suffix)))
+    if not bams:
+        raise ValueError(f'No BAMs match {bam_dir!r} with suffix {bam_suffix!r}')
     sys.stderr.write(f"[run] {len(bams)} bams\n")
-    with open(out, "w") as o:
+    from ._io import atomic_text
+    with atomic_text(out) as o:
         o.write("\t".join(EMIT_COLUMNS) + "\n")
         for i, bampath in enumerate(bams, 1):
             sample = _sample_from_bam(bampath, bam_suffix)
@@ -784,6 +1096,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--amplicon-right-window", default=None, help="e.g. 10318-10326")
     p.add_argument("--use-plasmid", action="store_true", help="allow high-confidence plasmid-track fallback")
     p.add_argument("--bam-suffix", default=".sort.dedup.recal2.bam")
+    p.add_argument('--min-mapq', type=int, default=None,
+                   help='minimum mapping quality; default20, explicit0 for legacy sensitivity')
     return p
 
 
@@ -794,7 +1108,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         bridge_table=args.bridge_table, bridge_bc1_col=args.bridge_bc1_col,
         bridge_oligo_col=args.bridge_oligo_col, bridge_count_col=args.bridge_count_col,
         amplicon_left_window=args.amplicon_left_window, amplicon_right_window=args.amplicon_right_window,
-        use_plasmid=args.use_plasmid, bam_suffix=args.bam_suffix,
+        use_plasmid=args.use_plasmid, bam_suffix=args.bam_suffix, min_mapq=args.min_mapq,
     )
 
 
