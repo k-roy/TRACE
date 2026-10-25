@@ -88,7 +88,10 @@ def windows(f, alleles, *, name='oligo_1'):
         + name+'\tchrII\t301\t320\t'+json.dumps([dict(zip(('pos','ref','alt'), a)) for a in alleles])+'\n')
 
 
-@pytest.mark.parametrize('alts,total,status', [(0,4,'wt'),(1,4,'partial'),(2,4,'partial'),(4,4,'full'),(3,3,'nocov'),(0,0,'nocov')])
+# 2026-10-25 (Kevin, depth-conditional floor, "even a single read is OK"): 3/3 is evidence of presence, so it
+# is 'full'. WITHDRAWN: "3 reads are below min_cov=4, so 3/3 is nocov". Absence still needs depth (UNCALLABLE):
+# 0/3 stays 'nocov'.
+@pytest.mark.parametrize('alts,total,status', [(0,4,'wt'),(1,4,'partial'),(2,4,'partial'),(4,4,'full'),(3,3,'full'),(0,3,'nocov'),(0,0,'nocov')])
 def test_exact_snp_denominators(fixture_factory, alts, total, status):
     f=fixture_factory(records=[read(f'r{i}', ('C' if i<alts else 'A')+'A'*19) for i in range(total)])
     call=score(f,site((301,'A','C')))
@@ -566,3 +569,24 @@ def test_conflicting_rows_for_one_oligo_are_rejected(tmp_path):
                  'a\tchrII\t301\t310\na\tchrII\t301\t311\n')
     with pytest.raises(ValueError,match='conflicting donor windows'):
         r.load_oligo_windows(str(p))
+
+
+# 2026-10-25 rulings: the depth-conditional allele floor (planning/268 §4, 284 §8 ruling 1).
+@pytest.mark.parametrize('depth,k', [(0, 1), (1, 1), (20, 1), (51, 1), (52, 2), (355, 2), (356, 3)])
+def test_min_alt_reads_is_the_binomial_error_floor(depth, k):
+    assert r.min_alt_reads(depth) == k
+
+
+@pytest.mark.parametrize('alt,depth,status', [(2, 20, 'partial'), (1, 20, 'partial'), (3, 3, 'full'), (1, 1, 'full'),
+                                              (1, 100, 'wt'), (2, 100, 'partial'), (0, 12, 'wt'), (0, 4, 'wt'),
+                                              (0, 3, 'nocov'), (0, 1, 'nocov'), (0, 0, 'nocov')])
+def test_classify_counts_calls_a_minority_allele_partial_not_wt(alt, depth, status):
+    # presence from a single read up (FLOOR); absence only at min_cov=4 reads or more (UNCALLABLE)
+    assert r.classify_counts(alt, depth) == status
+
+
+@pytest.mark.parametrize('kwargs', [{'alt': 3, 'depth': 2}, {'alt': -1, 'depth': 2}, {'alt': 1, 'depth': 2, 'min_cov': 0},
+                                    {'alt': 1, 'depth': 2, 'tau_full': 0}])
+def test_classify_counts_rejects_impossible_inputs(kwargs):
+    with pytest.raises(ValueError):
+        r.classify_counts(**kwargs)

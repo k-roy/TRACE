@@ -132,6 +132,61 @@ def classify_site(vaf, cov, *, tau_full=0.85, tau_wt=0.15, min_cov=4):
     return SITE_PARTIAL
 
 
+#: Depth-conditional allele floor (Kevin, 2026-10-25: "even a single read is OK"). `DEFAULT_ERROR_RATE` is the
+#: per-read probability that a base reads as the counted allele by error: a Q30 base error, used undivided, so for
+#: TRACE's allele-specific counts (one particular base, about e/3) it is conservative, and for the window route's
+#: any-non-reference counts it is about right. `DEFAULT_ALPHA` is the per-position false-positive rate the floor
+#: allows. At these values one alt read is significant up to 51x, two up to 355x.
+DEFAULT_ERROR_RATE = 1e-3
+DEFAULT_ALPHA = 0.05
+
+
+def min_alt_reads(depth, *, error_rate=DEFAULT_ERROR_RATE, alpha=DEFAULT_ALPHA):
+    """Smallest k >= 1 with P(Binom(depth, error_rate) >= k) <= alpha.
+
+    The number of alt-supporting reads that sequencing error alone explains no more often than `alpha` at this
+    depth, so `k` or more is evidence of a real allele. It is 1 at ordinary WGS depth: a single read counts.
+    """
+    if (not isinstance(depth, Integral) or isinstance(depth, bool) or depth < 0
+            or not 0 < error_rate < 1 or not 0 < alpha < 1):
+        raise ValueError("require depth >= 0, 0 < error_rate < 1 and 0 < alpha < 1")
+    if depth == 0:
+        return 1
+    pmf = (1 - error_rate) ** depth          # P(X = 0)
+    tail = 1.0                               # P(X >= 0)
+    k = 0
+    while True:
+        tail -= pmf                          # now P(X >= k + 1)
+        k += 1
+        if tail <= alpha or k >= depth:
+            return k
+        pmf *= (depth - k + 1) / k * error_rate / (1 - error_rate)
+
+
+def classify_counts(alt, depth, *, tau_full=0.85, min_cov=4, error_rate=DEFAULT_ERROR_RATE,
+                    alpha=DEFAULT_ALPHA):
+    """Classify one intended allele from its read COUNTS (2026-10-25 rulings).
+
+    PRESENCE needs only evidence (FLOOR ruling): `full` at an alt fraction >= tau_full and `partial` when the alt
+    count reaches `min_alt_reads(depth)`, both from a single read up, so 3/3 is `full` and a 2/20 minority allele
+    is mixture evidence rather than wild type. ABSENCE needs depth (UNCALLABLE ruling: too shallow is excluded,
+    never "no edit"): `wt` only at `min_cov` reads or more, else `nocov`. `min_cov` therefore gates the
+    wild-type call alone.
+    """
+    if (not isinstance(alt, Integral) or isinstance(alt, bool) or alt < 0
+            or not isinstance(depth, Integral) or isinstance(depth, bool) or alt > depth):
+        raise ValueError("require integer counts with 0 <= alt <= depth")
+    if not 0 < tau_full <= 1 or not isinstance(min_cov, Integral) or isinstance(min_cov, bool) or min_cov < 1:
+        raise ValueError("require 0 < tau_full <= 1 and min_cov >= 1")
+    if depth == 0:
+        return SITE_NOCOV
+    if alt / depth >= tau_full:
+        return SITE_FULL
+    if alt >= min_alt_reads(depth, error_rate=error_rate, alpha=alpha):
+        return SITE_PARTIAL
+    return SITE_WT if depth >= min_cov else SITE_NOCOV
+
+
 def bc_confidence_from(calls):
     """Barcode observation confidence is independent of bridge availability."""
     return "high" if calls and all(c.caller_confidence == "high" for c in calls) else "low"
@@ -436,8 +491,16 @@ def intended_allele_evidence(bam, fasta, chrom, allele, *, min_base_qual=13, min
     return AlleleEvidence(declared_allele, alt, ref, len(values) - alt - ref, len(values), low_mapq_reads, unknown_mapq_reads)
 
 
-def score_edit_site(bam, fasta, site, *, tau_full=0.85, tau_wt=0.15, min_cov=4, min_base_qual=13, min_mapq=20):
+def score_edit_site(bam, fasta, site, *, tau_full=0.85, tau_wt=0.15, min_cov=4, min_base_qual=13, min_mapq=20,
+                    error_rate=DEFAULT_ERROR_RATE, alpha=DEFAULT_ALPHA):
+    """Score a site's declared intended alleles from fragment counts.
+
+    Each allele is classified by `classify_counts`: presence from a single read up (a depth-conditional floor on
+    the alt count), absence (`wt`) only at `min_cov` fragments or more. `tau_wt` now governs only the
+    `other`-allele call.
+    """
     classify_site(0, 0, tau_full=tau_full, tau_wt=tau_wt, min_cov=min_cov)
+    min_alt_reads(0, error_rate=error_rate, alpha=alpha)
     if not isinstance(min_mapq, Integral) or isinstance(min_mapq, bool) or not 0 <= min_mapq <= 254:
         raise ValueError("minimum mapping quality must be an integer from 0 to 254")
     if not isinstance(min_base_qual, Integral) or min_base_qual < 0:
@@ -448,7 +511,8 @@ def score_edit_site(bam, fasta, site, *, tau_full=0.85, tau_wt=0.15, min_cov=4, 
         return SiteCall(site, vaf, cov, SITE_UNASSESSED)
     evidence = tuple(intended_allele_evidence(bam, fasta, site.chrom, allele,
                                              min_base_qual=min_base_qual, min_mapq=min_mapq) for allele in site.intended_alleles)
-    statuses = [classify_site(e.vaf, e.depth, tau_full=tau_full, tau_wt=tau_wt, min_cov=min_cov) for e in evidence]
+    statuses = [classify_counts(e.alt_count, e.depth, tau_full=tau_full, min_cov=min_cov,
+                                error_rate=error_rate, alpha=alpha) for e in evidence]
     if SITE_PARTIAL in statuses:
         status = SITE_PARTIAL
     elif SITE_NOCOV in statuses:
