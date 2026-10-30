@@ -347,10 +347,19 @@ class CleanResult:
     unique_genome: Set[Hashable] = field(default_factory=set)
     unique_plasmid: Set[Hashable] = field(default_factory=set)
     unique_chimeric: Set[Hashable] = field(default_factory=set)
+    # Donor-contained fragments RETAINED because the caller declared the plasmids purged
+    # (``keep_contained=True``). Kept apart from ``unique_genome`` so a genome count never
+    # silently includes them, and absent from the historical ``.anno`` row.
+    contained_kept: Set[Hashable] = field(default_factory=set)
+    unique_contained_kept: Set[Hashable] = field(default_factory=set)
 
     @property
     def frags_genome(self) -> int:
         return len(self.unique_genome)
+
+    @property
+    def frags_contained_kept(self) -> int:
+        return len(self.unique_contained_kept)
 
     @property
     def frags_plasmid(self) -> int:
@@ -490,7 +499,8 @@ def _primary_sam(rec: SamRecord, min_mapq: int) -> bool:
 def classify_donor_reads(
     records: Iterable[SamRecord], chrom: str, donor_start: int, donor_end: int,
     blacklist: Blacklist, flexible_bases: int = FLEXIBLE_BASES,
-    dup_mode: str = "standard", min_mapq: int = 20,
+    dup_mode: str = "standard", min_mapq: int = 20, *, keep_contained: bool = False,
+    plasmid_contigs: Iterable[str] = (),
 ) -> CleanResult:
     """Classify donor-overlapping alignments, with explicit historical parity.
 
@@ -501,10 +511,31 @@ def classify_donor_reads(
     MAPQ 20 is a conservative policy default, not a calibrated accuracy threshold.
     Standard fragments are :class:`FragmentKey` values, the (RG, QNAME) pairing
     Stage4 uses, so a disposition in one read group never reaches another.
+
+    ``keep_contained=True`` is for a sample whose plasmids are known to be purged
+    (see :func:`plasmid_load`). A same-chromosome fragment lying wholly inside the
+    donor +/- ``flexible_bases`` can then only be genomic, so it is RETAINED (in the
+    cleaned BAM, counted in ``contained_kept``) instead of discarded as a possible
+    plasmid donor template. Two cases stay discarded even then: a contained fragment
+    soft-clipped at a donor edge (the clip is a junction to something else) and a
+    read whose mate is on a cassette contig. Contained fragments never enter
+    ``unique_genome`` or ``variant_cov``. Standard mode only.
+
+    ``plasmid_contigs`` (opt-in, default none) names plasmid contigs whose mates count like cassette mates: a
+    donor read with its mate anywhere on one is plasmid template when contained and chimeric otherwise. Without
+    it, a mate on a plasmid outside the REDI blacklist intervals falls through to genome (planning/328t found
+    no such read in the NNS cohort, so the default is left unchanged).
     """
     if (any(type(value) is not int for value in (donor_start, donor_end, flexible_bases, min_mapq))
             or donor_start < 1 or donor_end < donor_start or flexible_bases < 0 or not 0 <= min_mapq <= 254):
         raise ValueError("invalid donor interval, flexible bases or MAPQ threshold")
+    if type(keep_contained) is not bool:
+        raise ValueError("keep_contained must be a bool")
+    if keep_contained and dup_mode != "standard":
+        raise ValueError("keep_contained is a standard-mode policy; parity mode reproduces the historical discard")
+    plasmid_contigs = frozenset(plasmid_contigs)
+    if plasmid_contigs and dup_mode != "standard":
+        raise ValueError("plasmid_contigs is a standard-mode policy")
     if dup_mode == "parity":
         return _classify_donor_reads_parity(records, chrom, donor_start, donor_end, blacklist, flexible_bases, dup_mode)
     if dup_mode != "standard":
@@ -555,10 +586,17 @@ def classify_donor_reads(
                         or (trailing_soft and abs(read_end - donor_end) <= flexible_bases))
         else:
             mate_chr = rec.rname if rec.rnext == "=" else rec.rnext
-            cassette_mate = any(start <= rec.pnext <= end for start, end in blacklist.get(mate_chr, ()))
+            cassette_mate = (mate_chr in plasmid_contigs
+                             or any(start <= rec.pnext <= end for start, end in blacklist.get(mate_chr, ())))
             template = cassette_mate and _is_contained(rec.pos, read_end, donor_start - flexible_bases, donor_end + flexible_bases)
             chimeric = cassette_mate and not template
-        if template:
+        if template and keep_contained and near and not chimeric:
+            # Plasmids purged: a contained same-chromosome fragment can only be genomic.
+            res.included.add(key)
+            res.contained_kept.add(key)
+            if not duplicate:
+                res.unique_contained_kept.add(key)
+        elif template:
             res.discarded.add(key)
             if not duplicate:
                 res.unique_plasmid.add(key)
@@ -575,9 +613,164 @@ def classify_donor_reads(
     res.included -= res.discarded
     res.redi_translocation -= res.discarded
     res.unique_chimeric -= res.discarded
-    res.unique_genome -= res.discarded | res.unique_chimeric
+    res.contained_kept -= res.discarded
+    res.unique_contained_kept -= res.discarded
+    res.unique_genome -= res.discarded | res.unique_chimeric | res.contained_kept
     res.variant_cov = sum(coverage.get(key, 0) for key in res.unique_genome)
     return res
+
+
+# --------------------------------------------------------------------------- #
+# Plasmid load: when may donor-contained fragments be kept? (planning/328)     #
+# --------------------------------------------------------------------------- #
+#
+# Kevin R. Roy, 2026-10-30: "count contained read pairs when the backbone is empty. This is safe when we know
+# that we have removed plasmids, so it needs to be a per clone/per dataset option for trace, that when it is
+# high confidence that the plasmids have been purged, we don't need to restrict to segments that span the
+# donor-genome junction." A guide-donor plasmid present at k copies per genome leaves reads across its
+# backbone at k times nuclear depth and pairs a donor read with a backbone mate; both are measured here.
+# Measured on the NNS cohort (planning/328s, 328t): 24 backbone reads over 523 clones, no donor-backbone pair.
+
+_NUCLEAR_RE = re.compile(r"chr[IVX]+")
+Interval = Tuple[str, int, int]
+
+
+def poisson_upper(n: int, tail: float = 0.025) -> float:
+    """Exact upper confidence limit for a Poisson mean given ``n`` observed events.
+
+    The lambda at which P(X <= n) equals ``tail`` (0.025 gives the one-sided 97.5% limit, 3.689 for n = 0),
+    solved by bisection so the module needs no scipy.
+    """
+    import math
+
+    if type(n) is not int or n < 0 or not 0 < tail < 1:
+        raise ValueError("n must be a non-negative int and tail in (0, 1)")
+
+    def cdf(lam: float) -> float:
+        return sum(math.exp(k * math.log(lam) - lam - math.lgamma(k + 1)) for k in range(n + 1)) if lam > 0 else 1.0
+
+    lo, hi = 0.0, n + 20.0 * math.sqrt(n + 1) + 20.0
+    for _ in range(200):
+        mid = (lo + hi) / 2
+        if cdf(mid) > tail:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+@dataclass(frozen=True)
+class PlasmidLoad:
+    """Evidence for or against a plasmid in one sample.
+
+    ``plasmid_reads`` are primary, non-QC-fail reads with MAPQ >= ``min_mapq`` on the declared plasmid contigs,
+    outside the masked intervals (duplicates included, as in the index statistics the nuclear count comes
+    from). ``donor_backbone_pairs`` counts fragments with a read inside a donor window +/- slack and its mate on
+    a declared plasmid contig. ``copies`` is plasmid read density over nuclear read density; ``copies_upper95``
+    its exact Poisson 97.5% upper limit, infinite when nuclear depth is zero.
+    """
+
+    plasmid_reads: int
+    unmasked_length: int
+    nuclear_reads: int
+    nuclear_length: int
+    donor_backbone_pairs: int
+    expected_reads_per_copy: float
+    copies: float
+    copies_upper95: float
+
+
+def plasmid_load(
+    bam_path: str,
+    plasmid_contigs: Sequence[str],
+    *,
+    mask: Iterable[Interval] = (),
+    donor_windows: Iterable[Interval] = (),
+    nuclear_contigs: Optional[Sequence[str]] = None,
+    min_mapq: int = 1,
+    flexible_bases: int = FLEXIBLE_BASES,
+) -> PlasmidLoad:
+    """Measure plasmid load in one indexed BAM (see :class:`PlasmidLoad`).
+
+    ``plasmid_contigs`` should be the plasmids that CARRY the donor; a plasmid without donor sequence cannot make
+    a donor-contained fragment and only dilutes the test. ``mask`` excludes 1-based inclusive intervals that
+    collect reads without any plasmid present, such as a bc1 cassette that amplicon product maps to.
+    ``nuclear_contigs`` defaults to every ``chr<roman>`` contig in the header.
+    """
+    import pysam
+
+    plasmid_contigs = list(plasmid_contigs)
+    if not plasmid_contigs:
+        raise ValueError("plasmid_load needs at least one plasmid contig")
+    if type(min_mapq) is not int or not 0 <= min_mapq <= 254:
+        raise ValueError("min_mapq must be an int from 0 to 254")
+    mask_by: Dict[str, List[Tuple[int, int]]] = {}
+    for contig, start, end in mask:
+        if start < 1 or end < start:
+            raise ValueError(f"invalid mask interval {contig}:{start}-{end}")
+        mask_by.setdefault(contig, []).append((start, end))
+    with pysam.AlignmentFile(bam_path, "rb") as bam:
+        lengths = dict(zip(bam.references, bam.lengths))
+        missing = [c for c in plasmid_contigs if c not in lengths]
+        if missing:
+            raise ValueError(f"plasmid contig(s) absent from the BAM header: {missing}")
+        for contig, spans in mask_by.items():
+            if contig not in lengths or any(end > lengths[contig] for _, end in spans):
+                raise ValueError(f"mask interval absent or outside the BAM reference: {contig}")
+        nuclear = list(nuclear_contigs) if nuclear_contigs is not None else [c for c in lengths if _NUCLEAR_RE.fullmatch(c)]
+        if not nuclear or any(c not in lengths for c in nuclear):
+            raise ValueError("nuclear contigs are missing from the BAM header; pass nuclear_contigs explicitly")
+        stats = {s.contig: s.mapped for s in bam.get_index_statistics()}
+        nuclear_reads = sum(stats.get(c, 0) for c in nuclear)
+        nuclear_length = sum(lengths[c] for c in nuclear)
+
+        plasmid_reads = 0
+        masked_length = 0
+        for contig in plasmid_contigs:
+            spans = mask_by.get(contig, [])
+            covered = set()
+            for start, end in spans:
+                covered.update(range(start, end + 1))
+            masked_length += len(covered)
+            for read in bam.fetch(contig):
+                if read.flag & (0x4 | 0x100 | 0x200 | 0x800) or read.mapping_quality < min_mapq:
+                    continue
+                left, right = read.reference_start + 1, read.reference_end
+                if any(left <= end and start <= right for start, end in spans):
+                    continue
+                plasmid_reads += 1
+
+        pairs = set()
+        declared = set(plasmid_contigs)
+        for chrom, start, end in donor_windows:
+            if chrom not in lengths:
+                raise ValueError(f"donor window contig absent from the BAM header: {chrom}")
+            for read in bam.fetch(chrom, max(0, start - 1 - flexible_bases), end + flexible_bases):
+                if read.flag & (0x4 | 0x100 | 0x200 | 0x800) or read.reference_end is None:
+                    continue
+                if not read.is_paired or read.mate_is_unmapped or read.next_reference_name not in declared:
+                    continue
+                if read.reference_start + 1 >= start - flexible_bases and read.reference_end <= end + flexible_bases:
+                    pairs.add((read.get_tag("RG") if read.has_tag("RG") else "", read.query_name))
+
+    unmasked = sum(lengths[c] for c in plasmid_contigs) - masked_length
+    per_bp = nuclear_reads / nuclear_length if nuclear_length else 0.0
+    expected = per_bp * unmasked
+    copies = plasmid_reads / expected if expected else float("inf")
+    upper = poisson_upper(plasmid_reads) / expected if expected else float("inf")
+    return PlasmidLoad(plasmid_reads, unmasked, nuclear_reads, nuclear_length, len(pairs), expected, copies, upper)
+
+
+def plasmids_purged(load: PlasmidLoad, max_copies: float = 0.05) -> bool:
+    """High-confidence purge: no donor-backbone pair and the copy number's upper limit at or below ``max_copies``.
+
+    The default 0.05 copies per genome bounds the share of donor-contained fragments that could be template near
+    5%, the same order as the foreign-genome share measured at the bc1 locus (planning/328u). A sample too shallow
+    to bound its copy number fails the test and keeps the historical discard.
+    """
+    if not max_copies > 0:
+        raise ValueError("max_copies must be positive")
+    return load.donor_backbone_pairs == 0 and load.copies_upper95 <= max_copies
 
 
 def _iter_sam(bam_path: str, samtools: str = "samtools") -> Iterator[str]:
@@ -675,6 +868,7 @@ def clean_donor_reads(
     blacklist_path: str, flexible_bases: int = FLEXIBLE_BASES,
     dup_mode: str = "standard", samtools: str = "samtools", min_mapq: int = 20,
     reference_path: Optional[str] = None, blacklist_reference: Optional[str] = None,
+    *, keep_contained: bool = False, plasmid_contigs: Iterable[str] = (),
 ) -> CleanResult:
     """Publish a filtered, indexed full BAM and fragment annotation under one lock.
 
@@ -689,6 +883,7 @@ def clean_donor_reads(
         return _clean_donor_reads_unlocked(
             in_bam, out_bam, chrom, donor_start, donor_end, blacklist_path,
             flexible_bases, dup_mode, samtools, min_mapq, reference_path, blacklist_reference,
+            keep_contained=keep_contained, plasmid_contigs=plasmid_contigs,
         )
 
 
@@ -705,6 +900,9 @@ def _clean_donor_reads_unlocked(
     min_mapq: int = 20,
     reference_path: Optional[str] = None,
     blacklist_reference: Optional[str] = None,
+    *,
+    keep_contained: bool = False,
+    plasmid_contigs: Iterable[str] = (),
 ) -> CleanResult:
     """Filter donor/plasmid/unresolved reads from a target site (Half B driver).
 
@@ -761,7 +959,8 @@ def _clean_donor_reads_unlocked(
                 rec.flag |= 0x8
             yield rec
 
-    result = classify_donor_reads(records(), chrom, donor_start, donor_end, blacklist, flexible_bases, dup_mode, min_mapq)
+    result = classify_donor_reads(records(), chrom, donor_start, donor_end, blacklist, flexible_bases, dup_mode, min_mapq,
+                                  keep_contained=keep_contained, plasmid_contigs=plasmid_contigs)
     # Pass 2 must look records up in the namespace pass 1 recorded them under.
     # The bare-name prefilter only skips building a key for untouched records.
     if dup_mode == "parity":
