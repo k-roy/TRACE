@@ -552,6 +552,16 @@ def precall_sample(
             identity = (pos, span_end, ref, tuple(alts), tuple(sorted(info.items())), tuple(sorted(fmt.items())))
             if identity in seen_gvcf:
                 continue
+            # planning/328: with -ERC BP_RESOLUTION, GATK still emits a single-base <NON_REF> record at every base
+            # a called deletion's REF spans (ATC->A at 995605, then T at 995606 and C at 995607). Those records
+            # restate bases the deletion record already describes; they are not a second, conflicting call. A
+            # dense MNV design is exactly what GATK writes as such an insertion/deletion pair. Skipped entirely:
+            # they add no variant (symbolic ALT) and no reference coverage that the deletion has not settled.
+            if (symbolic and len(ref) == 1 and end == pos
+                    and any(previous[0] < pos <= previous[1] and len(previous[2]) > 1
+                            and any(a not in (".", "<NON_REF>", "<*>") for a in previous[3])
+                            for previous in seen_gvcf)):
+                continue
             if any(pos <= previous[1] and span_end >= previous[0] for previous in seen_gvcf):
                 raise ValueError(f"overlapping non-identical gVCF records in donor interval: {chrom}:{pos}")
             seen_gvcf.append(identity)
