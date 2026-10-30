@@ -270,6 +270,7 @@ class SamRecord:
     tlen: int
     mapq: int = 60
     rg: str = ""
+    mate_cigar: str = ""  # MC:Z, the mate's CIGAR when the aligner wrote one
 
 
 def parse_sam_line(line: str) -> SamRecord:
@@ -291,6 +292,7 @@ def parse_sam_line(line: str) -> SamRecord:
         if len(parts) != 3 or parts[1] != "Z" or not parts[2]:
             raise ValueError(f"alignment {c[0]!r} has a malformed RG read-group tag {tags[0]!r}; expected RG:Z:<id>")
         rg = parts[2]
+    mc = [f[5:] for f in c[11:] if f.startswith("MC:Z:")]
     return SamRecord(
         qname=c[0],
         flag=int(c[1]),
@@ -302,6 +304,7 @@ def parse_sam_line(line: str) -> SamRecord:
         tlen=int(c[8]),
         mapq=int(c[4]),
         rg=rg,
+        mate_cigar=mc[0] if len(mc) == 1 else "",
     )
 
 
@@ -537,6 +540,12 @@ def classify_donor_reads(
         if near:
             frag_start = min(rec.pos, rec.pnext)
             frag_end = frag_start + abs(rec.tlen) - 1
+            if rec.mate_cigar and rec.mate_cigar != "*":
+                # planning/328: in a DOVETAILED short fragment the reverse mate starts left of the forward mate,
+                # and bwa's TLEN (measured from the forward mate) does not span the reverse read's alignment, so
+                # the TLEN test below discarded a genomic fragment that runs past the donor into the chromosome.
+                # With the mate's CIGAR the fragment's aligned extent is known exactly.
+                frag_end = max(read_end, _cigar_blocks(rec.pnext, rec.mate_cigar)[1])
             # TLEN must actually contain the represented read and mate start.
             if frag_end < max(read_end, rec.pnext):
                 res.discarded.add(key)
