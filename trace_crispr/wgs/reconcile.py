@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import dataclasses
 import json
 import math
 from numbers import Integral
@@ -99,6 +100,7 @@ class SiteCall:
     status: str
     allele_evidence: Tuple[AlleleEvidence, ...] = ()
     flags: Tuple[str, ...] = ()
+    target_call: Optional[object] = None   # target_calls.TargetCall when scored with calling="v7"
 
 
 @dataclass
@@ -458,9 +460,10 @@ def _aligned_read_observation(read, fasta, chrom, allele, normalized, min_base_q
     return obs
 
 
-def realigned_intended_evidence(bam, fasta, chrom, alleles, *, min_base_qual=13, min_mapq=20):
+def realigned_intended_evidence(bam, fasta, chrom, alleles, *, min_base_qual=13, min_mapq=20, fragments_out=None):
     """`AlleleEvidence` per intended allele from local realignment (`local_realign`), with the aligned-base
-    reading of each read as the fallback where the realignment is displaced or uninformative."""
+    reading of each read as the fallback where the realignment is displaced or uninformative. `fragments_out`
+    (a list) receives each fragment's per-allele observations, for haplotype-level calling."""
     from .local_realign import realigned_allele_counts
     trimmed, normalized_by_k, normalizations = [], [], {}
     for allele in alleles:
@@ -482,7 +485,7 @@ def realigned_intended_evidence(bam, fasta, chrom, alleles, *, min_base_qual=13,
 
     counts, n_unmapped, tally = realigned_allele_counts(
         bam, fasta, chrom, [(a.pos, a.ref, a.alt) for a in alleles],
-        min_base_qual=min_base_qual, min_mapq=min_mapq, fallback=fallback)
+        min_base_qual=min_base_qual, min_mapq=min_mapq, fallback=fallback, fragments_out=fragments_out)
     evidence = tuple(AlleleEvidence(a, c["alt"], c["ref"], c["other"], c["depth"], c["low_mapq_reads"],
                                     c["unknown_mapq_reads"], n_unmapped)
                      for a, c in zip(alleles, counts))
@@ -539,9 +542,17 @@ def intended_allele_evidence(bam, fasta, chrom, allele, *, min_base_qual=13, min
 #: kept for parity. On dense designs `aligned` sees no evidence where bwa soft-clipped the edited segment.
 EVIDENCE_MODES = ("realign", "aligned")
 
+#: Calling modes for `score_edit_site`. `floors` is the per-allele count floors (presence from one read, absence
+#: at `min_cov`). `v7` adds the haplotype-level calls Kevin R. Roy ruled on 2026-10-30 (`target_calls`): read-pair
+#: floors from a contamination rate, IE for a read pair that is part design and part wild type, and a target-level
+#: call that judges the target codon apart from its synonymous helpers. `v7` needs `evidence="realign"` and a
+#: `target` (`target_calls.TargetSpec`); the per-allele `status` is still computed and emitted alongside.
+CALLING_MODES = ("floors", "v7")
+
 
 def score_edit_site(bam, fasta, site, *, tau_full=0.85, tau_wt=0.15, min_cov=4, min_base_qual=13, min_mapq=20,
-                    error_rate=DEFAULT_ERROR_RATE, alpha=DEFAULT_ALPHA, evidence="realign"):
+                    error_rate=DEFAULT_ERROR_RATE, alpha=DEFAULT_ALPHA, evidence="realign", calling="floors",
+                    target=None, contamination_rate=None, minority_alpha=None):
     """Score a site's declared intended alleles from fragment counts.
 
     Each allele is classified by `classify_counts`: presence from a single read up (a depth-conditional floor on
@@ -550,6 +561,10 @@ def score_edit_site(bam, fasta, site, *, tau_full=0.85, tau_wt=0.15, min_cov=4, 
     """
     if evidence not in EVIDENCE_MODES:
         raise ValueError(f"evidence must be one of {EVIDENCE_MODES}")
+    if calling not in CALLING_MODES:
+        raise ValueError(f"calling must be one of {CALLING_MODES}")
+    if calling == "v7" and (evidence != "realign" or target is None):
+        raise ValueError('calling="v7" needs evidence="realign" and a target_calls.TargetSpec')
     classify_site(0, 0, tau_full=tau_full, tau_wt=tau_wt, min_cov=min_cov)
     min_alt_reads(0, error_rate=error_rate, alpha=alpha)
     if not isinstance(min_mapq, Integral) or isinstance(min_mapq, bool) or not 0 <= min_mapq <= 254:
@@ -561,9 +576,11 @@ def score_edit_site(bam, fasta, site, *, tau_full=0.85, tau_wt=0.15, min_cov=4, 
                                    min_base_qual=min_base_qual, min_cov=min_cov, min_mapq=min_mapq)
         return SiteCall(site, vaf, cov, SITE_UNASSESSED)
     mode = evidence
+    fragments = [] if calling == "v7" else None
     if mode == "realign":
         evidence, _tally = realigned_intended_evidence(bam, fasta, site.chrom, site.intended_alleles,
-                                                       min_base_qual=min_base_qual, min_mapq=min_mapq)
+                                                       min_base_qual=min_base_qual, min_mapq=min_mapq,
+                                                       fragments_out=fragments)
     else:
         evidence = tuple(intended_allele_evidence(bam, fasta, site.chrom, allele,
                                                  min_base_qual=min_base_qual, min_mapq=min_mapq)
@@ -591,7 +608,17 @@ def score_edit_site(bam, fasta, site, *, tau_full=0.85, tau_wt=0.15, min_cov=4, 
         flags.append("LOCAL_REALIGNMENT")
         if any(e.unmapped_at_locus for e in evidence):
             flags.append("UNMAPPED_READS_AT_LOCUS")
-    return SiteCall(site, min(e.vaf for e in evidence), min(e.depth for e in evidence), status, evidence, tuple(flags))
+    target_call = None
+    if calling == "v7":
+        from . import target_calls as tc
+        model = tc.build_target_model(fasta, site.intended_alleles, target)
+        target_call = tc.call_haplotypes(
+            tc.fragment_haplotypes(fragments), model,
+            c=tc.DEFAULT_CONTAMINATION if contamination_rate is None else contamination_rate,
+            alpha=tc.DEFAULT_MINORITY_ALPHA if minority_alpha is None else minority_alpha)
+        flags.append("HAPLOTYPE_CALLS_V7")
+    return SiteCall(site, min(e.vaf for e in evidence), min(e.depth for e in evidence), status, evidence, tuple(flags),
+                    target_call)
 
 
 def build_edit_sites(oligos, oligo_windows, *, fasta=None):
@@ -673,7 +700,8 @@ def load_oligo_windows(path, *, oligo_col="oligo_name", chrom_col="chrom",
 
 
 EMIT_COLUMNS = ["sample", "label", "confidence", "n_genome_bc", "n_plasmid_bc", "n_full",
-                "n_partial", "n_nocov", "edits", "flags", "n_unassessed", "n_incomplete", "allele_counts"]
+                "n_partial", "n_nocov", "edits", "flags", "n_unassessed", "n_incomplete", "allele_counts",
+                "haplotype_calls"]
 
 
 def reconciliation_to_row(c):
@@ -684,9 +712,12 @@ def reconciliation_to_row(c):
                "low_mapq_reads": e.low_mapq_reads, "unknown_mapq_reads": e.unknown_mapq_reads,
                "unmapped_at_locus": e.unmapped_at_locus}
               for s in c.sites for e in s.allele_evidence]
+    haplotype = [dict({"oligo": s.site.oligo}, **dataclasses.asdict(s.target_call))
+                 for s in c.sites if getattr(s, "target_call", None) is not None]
     return [c.sample, c.label, c.confidence, str(c.n_genome_bc), str(c.n_plasmid_bc), str(c.n_full),
             str(c.n_partial), str(c.n_nocov), edits, ",".join(c.flags), str(c.n_unassessed),
-            str(c.n_incomplete), json.dumps(counts, separators=(",", ":"))]
+            str(c.n_incomplete), json.dumps(counts, separators=(",", ":")),
+            json.dumps(haplotype, separators=(",", ":"))]
 
 
 @contextmanager

@@ -282,6 +282,7 @@ def realign_read(read, haps: "_Haplotypes", min_base_qual: int) -> Tuple[bool, L
 
 def realigned_allele_counts(bam, fasta, chrom: str, alleles: Sequence[Tuple[int, str, str]], *,
                             min_base_qual: int = 13, min_mapq: int = 20, fallback=None,
+                            fragments_out: Optional[list] = None,
                             ) -> Tuple[List[Dict[str, int]], int, Dict[str, int]]:
     """Fragment counts per intended allele from local realignment, in the order of `alleles`.
 
@@ -292,7 +293,8 @@ def realigned_allele_counts(bam, fasta, chrom: str, alleles: Sequence[Tuple[int,
     mapped, non-duplicate, QC-passing, MAPQ != 255 and >= min_mapq. Placed-unmapped reads in the fetch window
     are COUNTED, not used: without an alignment of their own they are not local evidence. `read_tally` counts
     reads by how they were read (anchored realignment, displaced and so fallen back, observations filled from
-    the fallback).
+    the fallback). If `fragments_out` is a list, one observation list per merged fragment (in `alleles` order:
+    "alt", "ref", another base, "conflict" or None) is appended to it, for haplotype-level calling.
     """
     order = sorted(range(len(alleles)), key=lambda k: tuple(alleles[k]))
     haps = _Haplotypes(fasta, chrom, [tuple(alleles[k]) for k in order])
@@ -343,6 +345,8 @@ def realigned_allele_counts(bam, fasta, chrom: str, alleles: Sequence[Tuple[int,
                     prev[k] = "conflict"
         else:
             fragments[key] = obs
+    if fragments_out is not None:
+        fragments_out.extend(list(f) for f in fragments.values())
     counts = []
     for k in range(n):
         values = [f[k] for f in fragments.values() if f[k] not in (None, "conflict")]
