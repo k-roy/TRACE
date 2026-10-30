@@ -39,6 +39,9 @@ reading a third amino acid (a half-installed helper making a missense) counts as
 * ``CE_unconfirmed_target``  design read only at helper bases; no read pair reached the target
 * ``UN``            otherwise
 
+A design with no designed base in the target codon (a helper-only design, such as a same-codon control) has
+no target change to judge, so its ``call_target`` is its ``call_nt``.
+
 A base that is neither the reference nor the designed one (``O``) is a third allele or an error, not a partial
 edit; such read pairs make IE only when wild-type read pairs do not outnumber them and none carries the design.
 
@@ -120,6 +123,7 @@ class TargetModel:
     target_wt_codon: str
     target_design_codon: str
     synonymous_target: bool
+    target_designed: bool = True   # False: no designed base in the target codon (a helper-only design)
 
 
 @functools.lru_cache(maxsize=64)
@@ -152,9 +156,9 @@ def build_target_model(fasta, alleles: Sequence, spec: TargetSpec) -> TargetMode
         co = cds.codon_of(a.pos)
         if co is not None:
             codons.setdefault(co[0], []).append((i, co[1], a.alt if cds.strand == "+" else a.alt.translate(_COMP)))
-    if tk not in codons:
-        raise ValueError("no designed base falls in the target codon")
+    target_designed = tk in codons
     wt_codon = {k: cds.codon(fasta, k) for k in codons}
+    wt_codon.setdefault(tk, cds.codon(fasta, tk))
     design_aa = {}
     for k, items in codons.items():
         c = list(wt_codon[k])
@@ -162,13 +166,14 @@ def build_target_model(fasta, alleles: Sequence, spec: TargetSpec) -> TargetMode
             c[off] = b
         design_aa[k] = GENETIC_CODE["".join(c)]
     target_design = list(wt_codon[tk])
-    for _i, off, b in codons[tk]:
+    for _i, off, b in codons.get(tk, ()):
         target_design[off] = b
     target_design = "".join(target_design)
-    helpers = frozenset(i for i in range(len(alleles)) if i not in {j for j, _, _ in codons[tk]})
+    design_aa.setdefault(tk, GENETIC_CODE[target_design])
+    helpers = frozenset(i for i in range(len(alleles)) if i not in {j for j, _, _ in codons.get(tk, ())})
     return TargetModel(len(alleles), {k: tuple(v) for k, v in codons.items()}, tk, helpers, wt_codon,
                        {k: GENETIC_CODE[c] for k, c in wt_codon.items()}, design_aa, wt_codon[tk], target_design,
-                       GENETIC_CODE[wt_codon[tk]] == GENETIC_CODE[target_design])
+                       GENETIC_CODE[wt_codon[tk]] == GENETIC_CODE[target_design], target_designed)
 
 
 def binom_tail(k: int, n: int, p: float) -> float:
@@ -217,7 +222,7 @@ def call_haplotypes(frags: Sequence[str], model: TargetModel, *, c: float = DEFA
     helpers_wt_in_design = False
     read_d, read_w = set(), set()
     tk = model.target
-    tgt = model.codons[tk]
+    tgt = model.codons.get(tk, ())
     for cs in frags:
         if len(cs) != model.n:
             raise ValueError("fragment haplotype length does not match the site's alleles")
@@ -279,7 +284,11 @@ def call_haplotypes(frags: Sequence[str], model: TargetModel, *, c: float = DEFA
     incomplete = ((call_nt in (CE, IE, MIX) and len(read_d | read_w) < model.n)
                   or (call_nt == NE and len(read_w) < model.n))
 
-    if pX:
+    if not model.target_designed:
+        # A helper-only design (e.g. a same-codon control): there is no target change to judge, so the
+        # nucleotide call stands for the target call.
+        call_target = call_nt
+    elif pX:
         call_target = IE
     elif pXo and pXo >= pW and not pD:
         call_target = IE

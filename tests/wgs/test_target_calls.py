@@ -113,3 +113,13 @@ def test_binomial_tail():
 
 def test_fragment_haplotypes_map_observations():
     assert tc.fragment_haplotypes([["alt", "ref", None, "conflict", "T"]]) == ["DW..O"]
+
+
+def test_helper_only_design_takes_the_nucleotide_call(fasta):
+    # target codon CAG left unchanged; only the helpers 16 T>C and 25 G>A are designed
+    alleles = [IntendedAllele(16, "T", "C"), IntendedAllele(25, "G", "A")]
+    m = tc.build_target_model(fasta, alleles, tc.TargetSpec(tc.CDS("chrP", 11, 31, "+"), 20, 22))
+    assert not m.target_designed
+    assert call(m, ["DD"]).call_target == "CE"
+    assert call(m, ["WW", "WW"]).call_target == "NE"
+    assert call(m, ["DW"]).call_target == "IE"
