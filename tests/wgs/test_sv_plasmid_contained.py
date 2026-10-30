@@ -140,3 +140,15 @@ def test_purged_rejects_a_nonpositive_threshold():
     load = PlasmidLoad(0, 1000, 100, 1000, 0, 100.0, 0.0, 0.0369)
     with pytest.raises(ValueError):
         plasmids_purged(load, max_copies=0)
+
+
+def test_plasmid_mate_is_genome_by_default_and_template_when_declared():
+    rec = [_rec("p", 97, 120, "50M", "pGD", 500, 0)]
+    assert _classify(rec).frags_genome == 1
+    declared = _classify(rec, plasmid_contigs=["pGD"])
+    assert {k.qname for k in declared.discarded} == {"p"} and declared.frags_plasmid == 1
+
+
+def test_declared_plasmid_mate_beyond_the_donor_is_chimeric():
+    res = _classify([_rec("x", 97, 150, "75M", "pGD", 500, 0)], plasmid_contigs=["pGD"])
+    assert res.frags_chimeric == 1 and res.frags_genome == 0

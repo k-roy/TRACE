@@ -500,6 +500,7 @@ def classify_donor_reads(
     records: Iterable[SamRecord], chrom: str, donor_start: int, donor_end: int,
     blacklist: Blacklist, flexible_bases: int = FLEXIBLE_BASES,
     dup_mode: str = "standard", min_mapq: int = 20, *, keep_contained: bool = False,
+    plasmid_contigs: Iterable[str] = (),
 ) -> CleanResult:
     """Classify donor-overlapping alignments, with explicit historical parity.
 
@@ -519,6 +520,11 @@ def classify_donor_reads(
     soft-clipped at a donor edge (the clip is a junction to something else) and a
     read whose mate is on a cassette contig. Contained fragments never enter
     ``unique_genome`` or ``variant_cov``. Standard mode only.
+
+    ``plasmid_contigs`` (opt-in, default none) names plasmid contigs whose mates count like cassette mates: a
+    donor read with its mate anywhere on one is plasmid template when contained and chimeric otherwise. Without
+    it, a mate on a plasmid outside the REDI blacklist intervals falls through to genome (planning/328t found
+    no such read in the NNS cohort, so the default is left unchanged).
     """
     if (any(type(value) is not int for value in (donor_start, donor_end, flexible_bases, min_mapq))
             or donor_start < 1 or donor_end < donor_start or flexible_bases < 0 or not 0 <= min_mapq <= 254):
@@ -527,6 +533,9 @@ def classify_donor_reads(
         raise ValueError("keep_contained must be a bool")
     if keep_contained and dup_mode != "standard":
         raise ValueError("keep_contained is a standard-mode policy; parity mode reproduces the historical discard")
+    plasmid_contigs = frozenset(plasmid_contigs)
+    if plasmid_contigs and dup_mode != "standard":
+        raise ValueError("plasmid_contigs is a standard-mode policy")
     if dup_mode == "parity":
         return _classify_donor_reads_parity(records, chrom, donor_start, donor_end, blacklist, flexible_bases, dup_mode)
     if dup_mode != "standard":
@@ -577,7 +586,8 @@ def classify_donor_reads(
                         or (trailing_soft and abs(read_end - donor_end) <= flexible_bases))
         else:
             mate_chr = rec.rname if rec.rnext == "=" else rec.rnext
-            cassette_mate = any(start <= rec.pnext <= end for start, end in blacklist.get(mate_chr, ()))
+            cassette_mate = (mate_chr in plasmid_contigs
+                             or any(start <= rec.pnext <= end for start, end in blacklist.get(mate_chr, ())))
             template = cassette_mate and _is_contained(rec.pos, read_end, donor_start - flexible_bases, donor_end + flexible_bases)
             chimeric = cassette_mate and not template
         if template and keep_contained and near and not chimeric:
@@ -858,7 +868,7 @@ def clean_donor_reads(
     blacklist_path: str, flexible_bases: int = FLEXIBLE_BASES,
     dup_mode: str = "standard", samtools: str = "samtools", min_mapq: int = 20,
     reference_path: Optional[str] = None, blacklist_reference: Optional[str] = None,
-    *, keep_contained: bool = False,
+    *, keep_contained: bool = False, plasmid_contigs: Iterable[str] = (),
 ) -> CleanResult:
     """Publish a filtered, indexed full BAM and fragment annotation under one lock.
 
@@ -873,7 +883,7 @@ def clean_donor_reads(
         return _clean_donor_reads_unlocked(
             in_bam, out_bam, chrom, donor_start, donor_end, blacklist_path,
             flexible_bases, dup_mode, samtools, min_mapq, reference_path, blacklist_reference,
-            keep_contained=keep_contained,
+            keep_contained=keep_contained, plasmid_contigs=plasmid_contigs,
         )
 
 
@@ -892,6 +902,7 @@ def _clean_donor_reads_unlocked(
     blacklist_reference: Optional[str] = None,
     *,
     keep_contained: bool = False,
+    plasmid_contigs: Iterable[str] = (),
 ) -> CleanResult:
     """Filter donor/plasmid/unresolved reads from a target site (Half B driver).
 
@@ -949,7 +960,7 @@ def _clean_donor_reads_unlocked(
             yield rec
 
     result = classify_donor_reads(records(), chrom, donor_start, donor_end, blacklist, flexible_bases, dup_mode, min_mapq,
-                                  keep_contained=keep_contained)
+                                  keep_contained=keep_contained, plasmid_contigs=plasmid_contigs)
     # Pass 2 must look records up in the namespace pass 1 recorded them under.
     # The bare-name prefilter only skips building a key for untouched records.
     if dup_mode == "parity":
