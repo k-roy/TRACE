@@ -65,7 +65,7 @@ def site():
 
 
 def counts(bam, fa, alleles=ALLELES, **kw):
-    c, unmapped = lr.realigned_allele_counts(bam, fa, CHROM, alleles, **kw)
+    c, unmapped, _ = lr.realigned_allele_counts(bam, fa, CHROM, alleles, **kw)
     return [(x["alt"], x["ref"], x["other"]) for x in c], unmapped
 
 
@@ -167,9 +167,9 @@ def test_nonprimary_duplicate_qcfail_reads_supply_no_evidence(tmp_path, flag):
 def test_mapq_floor_and_unknown_mapq_are_excluded_and_counted(tmp_path):
     bam, fa = bam_with(tmp_path, [dict(name="lo", start=561, seq=edited(561, 80), cigar="80M", mapq=5),
                                   dict(name="unk", start=561, seq=edited(561, 80), cigar="80M", mapq=255)])
-    c, _ = lr.realigned_allele_counts(bam, fa, CHROM, ALLELES, min_mapq=20)
+    c, _, _ = lr.realigned_allele_counts(bam, fa, CHROM, ALLELES, min_mapq=20)
     assert all((x["depth"], x["low_mapq_reads"], x["unknown_mapq_reads"]) == (0, 1, 1) for x in c)
-    c0, _ = lr.realigned_allele_counts(bam, fa, CHROM, ALLELES, min_mapq=0)
+    c0, _, _ = lr.realigned_allele_counts(bam, fa, CHROM, ALLELES, min_mapq=0)
     assert all((x["alt"], x["unknown_mapq_reads"]) == (1, 1) for x in c0)
 
 
@@ -183,3 +183,27 @@ def test_homopolymer_placement_keeps_the_original_alignment():
     target = "G" * 10 + "A" * 30 + "G" * 10
     s1, cols = lr.align("A" * 10, target, expect_end=29)
     assert s1 == 10 and [t for _, t in cols] == list(range(20, 30))
+
+
+def test_a_read_slid_onto_a_design_inside_a_repeat_is_not_realigned(tmp_path):
+    # a 200-A run with the design A500C inside it; the read lies wholly in the run and carries a sequencing-error
+    # C at 501. Sliding it one base left would put that C on the designed base at a perfect score, so the
+    # realignment moves the read; the anchor guard must refuse that and fall back to the aligned reading (ref).
+    ref = REF[:400] + "A" * 200 + REF[600:]
+    fa = tmp_path / "hp.fa"
+    fa.write_text(f">{CHROM}\n{ref}\n")
+    pysam.faidx(str(fa))
+    header = pysam.AlignmentHeader.from_references([CHROM], [len(ref)])
+    a = pysam.AlignedSegment(header)
+    seq = "A" * 30 + "C" + "A" * 49                       # 471..550, C at 501
+    a.query_name, a.query_sequence, a.flag, a.reference_id, a.reference_start = "noise", seq, 0, 0, 470
+    a.cigarstring, a.mapping_quality = "80M", 60
+    a.query_qualities = pysam.qualitystring_to_array("I" * len(seq))
+    path = tmp_path / "hp.bam"
+    with pysam.AlignmentFile(str(path), "wb", header=header) as f:
+        f.write(a)
+    pysam.index(str(path))
+    with pysam.AlignmentFile(str(path)) as bam, pysam.FastaFile(str(fa)) as fasta:
+        evidence, tally = r.realigned_intended_evidence(bam, fasta, CHROM, (r.IntendedAllele(500, "A", "C"),))
+    assert (evidence[0].alt_count, evidence[0].ref_count) == (0, 1)
+    assert tally["reads_realign_displaced"] == 1 and tally["observations_from_fallback"] == 1

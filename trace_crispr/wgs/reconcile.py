@@ -436,6 +436,59 @@ def _trim_allele_padding(allele):
     return IntendedAllele(pos, ref, alt)
 
 
+def _aligned_read_observation(read, fasta, chrom, allele, normalized, min_base_qual, normalizations):
+    """One read's exact haplotype across a (padding-trimmed) allele from its ALIGNED bases, or None.
+
+    Repeat-equivalent indel representations are resolved as `intended_allele_evidence` always has. Shared by
+    the aligned-base reader and, as its fallback, by the local-realignment reader.
+    """
+    obs = _read_allele(read, allele, min_base_qual)
+    if (normalized is not None and min(len(normalized[1]), len(normalized[2])) == 1
+            and read.reference_start <= allele.pos - 1
+            and read.reference_end is not None
+            and read.reference_end >= allele.pos - 1 + len(allele.ref)):
+        equivalent = _equivalent_indel(read, fasta, chrom, allele, normalized,
+                                       min_base_qual, normalizations)
+        if equivalent == "alt":
+            obs = allele.alt
+        elif equivalent == "other":
+            obs = "OTHER_INDEL_HAPLOTYPE"
+        elif equivalent == "unknown":
+            obs = None
+    return obs
+
+
+def realigned_intended_evidence(bam, fasta, chrom, alleles, *, min_base_qual=13, min_mapq=20):
+    """`AlleleEvidence` per intended allele from local realignment (`local_realign`), with the aligned-base
+    reading of each read as the fallback where the realignment is displaced or uninformative."""
+    from .local_realign import realigned_allele_counts
+    trimmed, normalized_by_k, normalizations = [], [], {}
+    for allele in alleles:
+        observed_ref = fasta.fetch(chrom, allele.pos - 1, allele.pos - 1 + len(allele.ref)).upper()
+        if observed_ref != allele.ref:
+            raise ValueError(f"{chrom}:{allele.pos}: intended REF {allele.ref!r} does not match reference {observed_ref!r}")
+        t = _trim_allele_padding(allele)
+        trimmed.append(t)
+        normalized_by_k.append(_normalize_allele(fasta, chrom, t) if len(t.ref) != len(t.alt) else None)
+
+    def fallback(read, k):
+        t = trimmed[k]
+        if read.reference_end is None or read.reference_start > t.pos - 1 + len(t.ref) or read.reference_end < t.pos:
+            return None
+        obs = _aligned_read_observation(read, fasta, chrom, t, normalized_by_k[k], min_base_qual, normalizations)
+        if obs is None:
+            return None
+        return "alt" if obs == t.alt else "ref" if obs == t.ref else "other"
+
+    counts, n_unmapped, tally = realigned_allele_counts(
+        bam, fasta, chrom, [(a.pos, a.ref, a.alt) for a in alleles],
+        min_base_qual=min_base_qual, min_mapq=min_mapq, fallback=fallback)
+    evidence = tuple(AlleleEvidence(a, c["alt"], c["ref"], c["other"], c["depth"], c["low_mapq_reads"],
+                                    c["unknown_mapq_reads"], n_unmapped)
+                     for a, c in zip(alleles, counts))
+    return evidence, tally
+
+
 def intended_allele_evidence(bam, fasta, chrom, allele, *, min_base_qual=13, min_mapq=20):
     """Count independent read fragments supporting exact intended REF/ALT.
 
@@ -465,19 +518,7 @@ def intended_allele_evidence(bam, fasta, chrom, allele, *, min_base_qual=13, min
         if read.mapping_quality < min_mapq:
             low_mapq_reads += 1
             continue
-        obs = _read_allele(read, allele, min_base_qual)
-        if (normalized is not None and min(len(normalized[1]), len(normalized[2])) == 1
-                and read.reference_start <= allele.pos - 1
-                and read.reference_end is not None
-                and read.reference_end >= allele.pos - 1 + len(allele.ref)):
-            equivalent = _equivalent_indel(read, fasta, chrom, allele, normalized,
-                                           min_base_qual, normalizations)
-            if equivalent == "alt":
-                obs = allele.alt
-            elif equivalent == "other":
-                obs = "OTHER_INDEL_HAPLOTYPE"
-            elif equivalent == "unknown":
-                obs = None
+        obs = _aligned_read_observation(read, fasta, chrom, allele, normalized, min_base_qual, normalizations)
         if obs is None:
             continue
         # Unpaired reads are distinct observations even when their names coincide.
@@ -521,13 +562,8 @@ def score_edit_site(bam, fasta, site, *, tau_full=0.85, tau_wt=0.15, min_cov=4, 
         return SiteCall(site, vaf, cov, SITE_UNASSESSED)
     mode = evidence
     if mode == "realign":
-        from .local_realign import realigned_allele_counts
-        counts, n_unmapped = realigned_allele_counts(
-            bam, fasta, site.chrom, [(a.pos, a.ref, a.alt) for a in site.intended_alleles],
-            min_base_qual=min_base_qual, min_mapq=min_mapq)
-        evidence = tuple(AlleleEvidence(a, c["alt"], c["ref"], c["other"], c["depth"], c["low_mapq_reads"],
-                                        c["unknown_mapq_reads"], n_unmapped)
-                         for a, c in zip(site.intended_alleles, counts))
+        evidence, _tally = realigned_intended_evidence(bam, fasta, site.chrom, site.intended_alleles,
+                                                       min_base_qual=min_base_qual, min_mapq=min_mapq)
     else:
         evidence = tuple(intended_allele_evidence(bam, fasta, site.chrom, allele,
                                                  min_base_qual=min_base_qual, min_mapq=min_mapq)

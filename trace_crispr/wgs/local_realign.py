@@ -15,8 +15,17 @@ stays clipped instead of being forced into an allele call.
 
 How an allele is read. A substitution allele is read by IDENTITY (alt, ref or other) from the better-scoring of
 the two alignments, never by which haplotype won, so partial incorporation (some designed bases installed, others
-wild type) stays visible. A length-changing allele is read by comparing the read's score against the background
-haplotype with and without that allele; a tie is uninformative.
+wild type) stays visible. A length-changing allele is uninformative for a read whose score does not change when
+that allele alone is removed (inside a repeat it does not span); otherwise it too is read by exact identity across
+the allele in the better alignment.
+
+Two guards keep the realignment from inventing evidence. (1) ANCHOR: a realignment is used only if every base the
+genome-wide aligner placed outside the designed span (more than `ANCHOR_MARGIN` bp from it) keeps its reference
+position, and at least `MIN_ANCHOR` such bases do; otherwise the read was moved, typically by sliding a nearby
+error onto a designed base inside a repeat, and its realignment is discarded. (2) FALLBACK: where the realignment
+is discarded, or reads an allele as uncovered or uninformative, the caller's aligned-base observation for that
+read and allele is used instead, so every read the aligned-base reader could read is still read. The realignment
+therefore only ever ADDS evidence the alignment hid, or replaces a reading with a better-scoring anchored one.
 
 All coordinates are 1-based inclusive at the interface, as in `reconcile`.
 """
@@ -30,6 +39,9 @@ BAND = 40
 #: Reads are fetched this far either side of the designed span, so a read aligned entirely outside it whose
 #: soft clip reaches into it is still found.
 FETCH_PAD = 300
+#: Anchor rule: originally aligned bases farther than this from the designed span must keep their position.
+ANCHOR_MARGIN = 5
+MIN_ANCHOR = 5
 _NEG = -10 ** 9
 
 
@@ -150,6 +162,18 @@ class _Haplotypes:
         parts.append(self.wt[cursor - self.start:])
         self.design = "".join(parts)
         self._shifts = [(p, len(a) - len(r)) for p, r, a in self.alleles]
+        # reference position (1-based) of every design-haplotype base; None for an inserted base
+        self.design_ref: List[Optional[int]] = []
+        cursor = self.start
+        for pos, ref, alt in self.alleles:
+            self.design_ref.extend(range(cursor, pos))
+            if len(ref) == len(alt):
+                self.design_ref.extend(range(pos, pos + len(ref)))
+            else:
+                self.design_ref.extend([pos] + [None] * (len(alt) - 1))
+            cursor = pos + len(ref)
+        self.design_ref.extend(range(cursor, self.end + 1))
+        assert len(self.design_ref) == len(self.design)
 
     def design_index(self, pos1: int) -> int:
         """Design-haplotype index of reference position `pos1` (for an unchanged base)."""
@@ -195,14 +219,80 @@ def _observe(cols, span, seq, quals, min_base_qual) -> Optional[str]:
     return "".join(out)
 
 
+def _anchored(read, cols, to_ref, lo: int, hi: int) -> bool:
+    """True if the realignment kept every originally aligned base outside the designed span in place."""
+    new = {q: to_ref(t) for q, t in cols if t is not None}
+    kept = 0
+    for q, r0 in read.get_aligned_pairs(matches_only=True):
+        r1 = r0 + 1
+        if lo - ANCHOR_MARGIN <= r1 <= hi + ANCHOR_MARGIN or q not in new:
+            continue
+        if new[q] != r1:
+            return False
+        kept += 1
+    return kept >= MIN_ANCHOR
+
+
+def realign_read(read, haps: "_Haplotypes", min_base_qual: int) -> Tuple[bool, List[Optional[str]]]:
+    """Realign one read to both haplotypes; `(anchored, observation per allele in haps.alleles order)`."""
+    s, e = _read_span(read)
+    seq, quals = read.query_sequence.upper(), read.query_qualities
+    w0 = max(0, s - BAND - haps.start)
+    w1 = min(len(haps.wt), e + BAND - haps.start + 1)
+    d0 = max(0, haps.design_index(max(haps.start, s - BAND)))
+    d1 = min(len(haps.design), haps.design_index(min(haps.end, e + BAND)) + 1)
+    wt_end, ds_end = e - haps.start - w0, haps.design_index(min(e, haps.end)) - d0
+    wt_score, wt_cols = align(seq, haps.wt[w0:w1], expect_end=wt_end)
+    ds_score, ds_cols = align(seq, haps.design[d0:d1], expect_end=ds_end)
+    use_design = ds_score > wt_score
+    if use_design:
+        cols = [(q, None if t is None else t + d0) for q, t in ds_cols]
+        to_ref = lambda t: haps.design_ref[t]
+    else:
+        cols = [(q, None if t is None else t + w0) for q, t in wt_cols]
+        to_ref = lambda t: t + haps.start
+    lo, hi = haps.span
+    obs: List[Optional[str]] = [None] * len(haps.alleles)
+    if not _anchored(read, cols, to_ref, lo, hi):
+        return False, obs
+    here = ds_score if use_design else wt_score
+    for k, (pos, ref, alt) in enumerate(haps.alleles):
+        span = (haps.design_spans if use_design else haps.wt_spans)[k]
+        if len(ref) == len(alt):
+            o = _observe(cols, span, seq, quals, min_base_qual)
+            if o is not None:
+                obs[k] = "alt" if o == alt else "ref" if o == ref else "other"
+            continue
+        if _observe(cols, (span[0], span[1] + 1), seq, quals, min_base_qual) is None:
+            continue
+        flipped = haps.single_allele(k, "design" if use_design else "wt")
+        delta = (len(ref) - len(alt)) if use_design else (len(alt) - len(ref))
+        lo_i, hi_i = (d0, d1) if use_design else (w0, w1)
+        other_score, _ = align(seq, flipped[lo_i: hi_i + delta], expect_end=(ds_end if use_design else wt_end))
+        if other_score == here:
+            continue                      # the read cannot tell this allele from its absence (e.g. inside a repeat)
+        # Exact identity across the allele in the chosen alignment, as the aligned-base reader requires: a read
+        # whose anchor base differs from the declared one is `other`, not the indel. A repeat-shifted
+        # representation of the same indel is the same haplotype and aligns to the design without a gap.
+        o = _observe(cols, span, seq, quals, min_base_qual)
+        if o is not None:
+            obs[k] = "alt" if o == alt else "ref" if o == ref else "other"
+    return True, obs
+
+
 def realigned_allele_counts(bam, fasta, chrom: str, alleles: Sequence[Tuple[int, str, str]], *,
-                            min_base_qual: int = 13, min_mapq: int = 20) -> Tuple[List[Dict[str, int]], int]:
+                            min_base_qual: int = 13, min_mapq: int = 20, fallback=None,
+                            ) -> Tuple[List[Dict[str, int]], int, Dict[str, int]]:
     """Fragment counts per intended allele from local realignment, in the order of `alleles`.
 
-    Returns `(counts, n_unmapped_at_locus)`. Each count is a dict with alt, ref, other, depth, low_mapq_reads,
-    unknown_mapq_reads. Read filters match `reconcile.intended_allele_evidence`: primary, mapped, non-duplicate,
-    QC-passing, MAPQ != 255 and >= min_mapq. Placed-unmapped reads in the fetch window are COUNTED, not used:
-    without an alignment of their own they are not local evidence.
+    `fallback(read, k)` returns the aligned-base observation ("alt", "ref", "other" or None) of allele k for a
+    read; it is used where the realignment is discarded (not anchored) or reads that allele as uncovered.
+    Returns `(counts, n_unmapped_at_locus, read_tally)`. Each count has alt, ref, other, depth,
+    low_mapq_reads, unknown_mapq_reads. Read filters match `reconcile.intended_allele_evidence`: primary,
+    mapped, non-duplicate, QC-passing, MAPQ != 255 and >= min_mapq. Placed-unmapped reads in the fetch window
+    are COUNTED, not used: without an alignment of their own they are not local evidence. `read_tally` counts
+    reads by how they were read (anchored realignment, displaced and so fallen back, observations filled from
+    the fallback).
     """
     order = sorted(range(len(alleles)), key=lambda k: tuple(alleles[k]))
     haps = _Haplotypes(fasta, chrom, [tuple(alleles[k]) for k in order])
@@ -210,6 +300,8 @@ def realigned_allele_counts(bam, fasta, chrom: str, alleles: Sequence[Tuple[int,
     n = len(alleles)
     fragments: Dict[tuple, List[Optional[str]]] = {}
     low = unknown = unmapped = 0
+    tally = {"reads_realigned_anchored": 0, "reads_realign_displaced": 0, "observations_from_fallback": 0,
+             "observations_from_realignment": 0}
     for index, read in enumerate(bam.fetch(chrom, max(0, lo - 1 - FETCH_PAD), hi + FETCH_PAD)):
         if read.flag & 0x4:
             unmapped += 1
@@ -225,36 +317,18 @@ def realigned_allele_counts(bam, fasta, chrom: str, alleles: Sequence[Tuple[int,
         if read.mapping_quality < min_mapq:
             low += 1
             continue
-        seq, quals = read.query_sequence.upper(), read.query_qualities
-        w0 = max(0, s - BAND - haps.start)
-        w1 = min(len(haps.wt), e + BAND - haps.start + 1)
-        d0 = max(0, haps.design_index(max(haps.start, s - BAND)))
-        d1 = min(len(haps.design), haps.design_index(min(haps.end, e + BAND)) + 1)
-        wt_score, wt_cols = align(seq, haps.wt[w0:w1], expect_end=e - haps.start - w0)
-        ds_score, ds_cols = align(seq, haps.design[d0:d1], expect_end=haps.design_index(e) - d0)
-        use_design = ds_score > wt_score
-        cols = [(q, None if t is None else t + (d0 if use_design else w0)) for q, t in (ds_cols if use_design else wt_cols)]
+        anchored, sorted_obs = realign_read(read, haps, min_base_qual)
+        tally["reads_realigned_anchored" if anchored else "reads_realign_displaced"] += 1
         obs: List[Optional[str]] = [None] * n
         for k_sorted, k in enumerate(order):
-            pos, ref, alt = haps.alleles[k_sorted]
-            span = (haps.design_spans if use_design else haps.wt_spans)[k_sorted]
-            if len(ref) == len(alt):
-                o = _observe(cols, span, seq, quals, min_base_qual)
+            o = sorted_obs[k_sorted]
+            if o is not None:
+                tally["observations_from_realignment"] += 1
+            elif fallback is not None:
+                o = fallback(read, k)
                 if o is not None:
-                    obs[k] = "alt" if o == alt else "ref" if o == ref else "other"
-                continue
-            if _observe(cols, (span[0], span[1] + 1), seq, quals, min_base_qual) is None:
-                continue
-            base = "design" if use_design else "wt"
-            here = ds_score if use_design else wt_score
-            flipped = haps.single_allele(k_sorted, base)
-            lo_i, hi_i = (d0, d1) if use_design else (w0, w1)
-            other_score, _ = align(seq, flipped[lo_i: hi_i + (len(ref) - len(alt) if use_design else len(alt) - len(ref))],
-                                   expect_end=(haps.design_index(e) - d0) if use_design else (e - haps.start - w0))
-            if other_score == here:
-                continue
-            carries_alt = (here > other_score) == use_design
-            obs[k] = "alt" if carries_alt else "ref"
+                    tally["observations_from_fallback"] += 1
+            obs[k] = o
         if all(o is None for o in obs):
             continue
         key = (read.get_tag("RG") if read.has_tag("RG") else "", read.query_name) if read.is_paired else (None, index)
@@ -275,4 +349,4 @@ def realigned_allele_counts(bam, fasta, chrom: str, alleles: Sequence[Tuple[int,
         alt_n, ref_n = values.count("alt"), values.count("ref")
         counts.append({"alt": alt_n, "ref": ref_n, "other": len(values) - alt_n - ref_n, "depth": len(values),
                        "low_mapq_reads": low, "unknown_mapq_reads": unknown})
-    return counts, unmapped
+    return counts, unmapped, tally
