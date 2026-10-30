@@ -79,8 +79,10 @@ def site(*alleles):
 
 
 def score(f, es):
+    # These fixtures specify the ALIGNED-base reader exactly (all-A references, CIGAR-level identity), so they pin
+    # `evidence="aligned"`. The local-realignment reader is specified in test_local_realign.py.
     with pysam.AlignmentFile(str(f['bam'])) as bam, pysam.FastaFile(str(f['fa'])) as fa:
-        return r.score_edit_site(bam, fa, es)
+        return r.score_edit_site(bam, fa, es, evidence="aligned")
 
 
 def windows(f, alleles, *, name='oligo_1'):
@@ -309,7 +311,7 @@ def test_forty_random_haplotypes_have_independent_three_of_five_support(fixture_
     f=fixture_factory(records=records,extra_refs=refs)
     with pysam.AlignmentFile(str(f['bam'])) as bam,pysam.FastaFile(str(f['fa'])) as fa:
         for es in cases:
-            call=r.score_edit_site(bam,fa,es)
+            call=r.score_edit_site(bam,fa,es,evidence='aligned')
             e=call.allele_evidence[0]
             assert (e.alt_count,e.ref_count,e.other_count,e.depth,call.status)==(3,2,0,5,'partial'),es
 
@@ -347,7 +349,7 @@ def test_variant_mapping_quality_policy_boundaries(fixture_factory,mapq,minimum,
     for record in records:record['mapq']=mapq
     f=fixture_factory(records=records)
     with pysam.AlignmentFile(str(f['bam'])) as bam,pysam.FastaFile(str(f['fa'])) as fa:
-        call=r.score_edit_site(bam,fa,site((301,'A','C')),min_mapq=minimum)
+        call=r.score_edit_site(bam,fa,site((301,'A','C')),min_mapq=minimum,evidence='aligned')
     e=call.allele_evidence[0]
     assert (call.status,e.depth,e.alt_count,e.low_mapq_reads,e.unknown_mapq_reads)==(status,depth,depth,low,unknown)
 
