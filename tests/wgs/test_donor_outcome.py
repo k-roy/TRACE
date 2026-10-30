@@ -192,3 +192,23 @@ def test_precall_partial(tmp_path):
     out = precall_sample(spec, vcf, gvcf, "N" * 10 + wt + "N" * 10)
     assert out.editing_outcome == "designed_variant_partially_installed"
     assert out.designed_variants == ["chrT_12_A_to_C"]
+
+
+def test_bp_resolution_records_inside_a_called_deletion_are_not_a_conflict(tmp_path):
+    # planning/328 (4D_sample_94): GATK writes a dense MNV design as an insertion/deletion pair, and with
+    # BP_RESOLUTION it ALSO emits a <NON_REF> record at each base the deletion spans. Those must not read as an
+    # overlapping, conflicting call; a genuinely different call overlapping the deletion still must.
+    vcf = tmp_path / "s.fil.vcf"
+    gvcf = tmp_path / "s.g.vcf"
+    _write_vcf(vcf, [])
+    ref3 = REF[13 - 1: 13 + 2]
+    with open(gvcf, "w") as fh:
+        fh.write("##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS\n")
+        fh.write(f"chrT\t13\t.\t{ref3}\t{ref3[0]},<NON_REF>\t500\t.\t.\tGT:AD:DP\t1:0,9,0:9\n")
+        fh.write(f"chrT\t14\t.\t{REF[13]}\t<NON_REF>\t.\t.\t.\tGT:AD:DP\t0:0,9:9\n")
+        fh.write(f"chrT\t15\t.\t{REF[14]}\t<NON_REF>\t.\t.\t.\tGT:AD:DP\t0:0,9:9\n")
+    precall_sample(_spec(), vcf, gvcf, REF)                # no "overlapping non-identical gVCF records"
+    with open(gvcf, "a") as fh:                             # a real second call inside the deletion still refuses
+        fh.write(f"chrT\t14\t.\t{REF[13]}\tG,<NON_REF>\t50\t.\t.\tGT:AD:DP\t1:0,9,0:9\n")
+    with pytest.raises(ValueError, match="overlapping"):
+        precall_sample(_spec(), vcf, gvcf, REF)
