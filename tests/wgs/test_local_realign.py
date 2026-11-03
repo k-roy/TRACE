@@ -207,3 +207,49 @@ def test_a_read_slid_onto_a_design_inside_a_repeat_is_not_realigned(tmp_path):
         evidence, tally = r.realigned_intended_evidence(bam, fasta, CHROM, (r.IntendedAllele(500, "A", "C"),))
     assert (evidence[0].alt_count, evidence[0].ref_count) == (0, 1)
     assert tally["reads_realign_displaced"] == 1 and tally["observations_from_fallback"] == 1
+
+
+# --- SGTC planning/385 -------------------------------------------------------------------------------------------
+# 328l item 0.2: "the realignment reader reproduces the aligned reader wherever the aligned reader could read",
+# as a named contract on a NON-degenerate reference (the parity fixtures in test_reconcile_functional.py run on
+# all-A references, where a realignment cannot move anything).
+
+def test_parity_realign_reproduces_aligned_wherever_aligned_reads(tmp_path):
+    recs = ([dict(name=f"w{i}", start=561, seq=REF[560:640], cigar="80M") for i in range(3)]
+            + [dict(name=f"d{i}", start=561, seq=edited(561, 80), cigar="80M") for i in range(2)]
+            + [dict(name=f"p{i}", start=561, seq=edited(561, 80, upto=608), cigar="80M") for i in range(2)]
+            + [dict(name="lq", start=561, seq=edited(561, 80), cigar="80M", lowq=(604 - 561,))])
+    bam, fa = bam_with(tmp_path, recs)
+    aligned = r.score_edit_site(bam, fa, site(), evidence="aligned")
+    realigned = r.score_edit_site(bam, fa, site(), evidence="realign")
+    as_tuple = lambda call: [(e.alt_count, e.ref_count, e.other_count, e.depth) for e in call.allele_evidence]
+    assert as_tuple(realigned) == as_tuple(aligned)
+    assert realigned.status == aligned.status
+
+
+# The PTC mini-library donors (SGTC planning/322 section 3a) are a stop cassette PLUS a 1-bp deletion, declared as
+# one left-anchored delins (20 genomic bases -> 19). Before TRACE re-calls that cohort with the realignment reader
+# this pins how such an allele is read when bwa soft-clips the cassette.
+PTC_POS = 800
+PTC_REF = REF[PTC_POS - 1: PTC_POS - 1 + 20]
+PTC_ALT = REF[PTC_POS - 1] + "TAATAGTGATAGTGATAA"          # anchor + 18-nt cassette: 20 -> 19
+
+
+def ptc_site():
+    return r.EditSite(CHROM, 790, 830, "oligo_ptc", (r.IntendedAllele(PTC_POS, PTC_REF, PTC_ALT),))
+
+
+def test_ptc_delins_soft_clipped_carrier_is_read_by_realignment(tmp_path):
+    carrier = REF[749:PTC_POS] + PTC_ALT[1:] + REF[PTC_POS + 19: PTC_POS + 69]   # 750..800, cassette, 820..869
+    wt = REF[749:869]                                                             # 750..869
+    bam, fa = bam_with(tmp_path, [
+        dict(name="c1", start=750, seq=carrier, cigar=f"51M{len(carrier) - 51}S"),
+        dict(name="c2", start=750, seq=carrier, cigar=f"51M{len(carrier) - 51}S"),
+        dict(name="w1", start=750, seq=wt, cigar="120M"),
+    ])
+    got, _ = counts(bam, fa, alleles=[(PTC_POS, PTC_REF, PTC_ALT)])
+    assert got == [(2, 1, 0)]
+    old = r.intended_allele_evidence(bam, fa, CHROM, r.IntendedAllele(PTC_POS, PTC_REF, PTC_ALT))
+    assert old.alt_count == 0                                # the aligned-base reader cannot see a clipped cassette
+    call = r.score_edit_site(bam, fa, ptc_site())
+    assert call.allele_evidence[0].alt_count == 2 and "LOCAL_REALIGNMENT" in call.flags
