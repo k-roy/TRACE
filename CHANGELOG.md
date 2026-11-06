@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-05
+
+First release carrying the WGS modules (`trace_crispr.wgs`: bc1_consensus, sv_plasmid, donor_outcome, reconcile, local realignment, target-level calls) that magestic's `[wgs]` extra calls. Python 3.9 is dropped (`requires-python >=3.10`); 0.6.3 on PyPI predates all of this.
+
 ### Added
 
 - **WGS editing-outcome backend (`trace_crispr.wgs`)** — extends TRACE from
